@@ -2,6 +2,9 @@ const $ = id => document.getElementById(id);
 // The review UI is also mounted below /plates/<slug>.  Keep API and image
 // requests inside that mounted application instead of escaping to the hub.
 const mountedAppBase = (window.location.pathname.match(/^\/plates\/[^/]+/) || [""])[0];
+const projectBackUrl = document.querySelector('meta[name="project-back-url"]')?.content || "";
+const backReviewList = $("backReviewList");
+if (backReviewList && projectBackUrl) backReviewList.href = projectBackUrl;
 const appUrl = url => {
   if (!url || /^(https?:|data:|blob:)/.test(url)) return url;
   const normalized = url.startsWith("/") ? url : `/${url}`;
@@ -185,6 +188,19 @@ function renderEmptyWorkspace() {
   $("selectedDetail").textContent = "";
 }
 
+function updateCurrentWellSummary() {
+  const detail = state.detail;
+  if (!detail) return;
+  const reviewed = detail.objects.filter(object => object.reviewed_label).length;
+  const reportLabel = detail.report?.final_category_label;
+  const reportReason = detail.report?.undetermined_reason_label;
+  $("currentWellState").textContent =
+    reportLabel || (reviewed === detail.objects.length ? "本孔已完成" : `${detail.objects.length} 个目标`);
+  $("currentWellDetail").textContent =
+    `已保存 ${reviewed}/${detail.objects.length}；本次修改 ${state.dirty.size}`
+    + (reportReason ? `；${reportReason}` : "");
+}
+
 async function loadWell(well) {
   if (state.busy) return;
   state.busy = true;
@@ -216,14 +232,7 @@ function renderWell() {
   const detail = state.detail;
   if (!detail) return;
   $("wellTitle").textContent = detail.well;
-  const reviewed = detail.objects.filter(object => object.reviewed_label).length;
-  const reportLabel = detail.report?.final_category_label;
-  const reportReason = detail.report?.undetermined_reason_label;
-  $("currentWellState").textContent =
-    reportLabel || (reviewed === detail.objects.length ? "本孔已完成" : `${detail.objects.length} 个目标`);
-  $("currentWellDetail").textContent =
-    `已保存 ${reviewed}/${detail.objects.length}；本次修改 ${state.dirty.size}`
-    + (reportReason ? `；${reportReason}` : "");
+  updateCurrentWellSummary();
   const grid = $("timepointGrid");
   const lateGrid = $("lateTimepointGrid");
   grid.innerHTML = "";
@@ -252,7 +261,6 @@ function renderTimepointCard(timepoint, container, annotatable) {
   const imageInfo = detail.images[timepoint];
   card.dataset.timepoint = timepoint;
   card.classList.toggle("late-timepoint-card", !annotatable);
-  card.classList.toggle("has-growth-overlay", Boolean(imageInfo?.growth_regions?.length));
   card.querySelector(".timepoint-name").textContent = imageInfo?.display_label || timepoint;
   card.querySelector(".timepoint-count").textContent = annotatable
     ? `${objects.length} 个目标`
@@ -426,36 +434,9 @@ function drawTimepoint(timepoint) {
   const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, canvas.width / dpr, canvas.height / dpr);
-  drawGrowthRegions(ctx, entry, timepoint);
   for (const object of objects) {
     drawObject(ctx, entry, object);
   }
-}
-
-function drawGrowthRegions(ctx, entry, timepoint) {
-  const regions = entry.imageInfo?.growth_regions || [];
-  if (!regions.length) return;
-  const view = state.views.get(timepoint) || { zoom: 1, panX: 0, panY: 0 };
-  const width = entry.image.clientWidth;
-  const height = entry.image.clientHeight;
-  ctx.save();
-  ctx.fillStyle = "rgba(37, 169, 140, .18)";
-  ctx.strokeStyle = "rgba(33, 224, 179, .92)";
-  ctx.lineWidth = 2;
-  for (const region of regions) {
-    const points = region.points || [];
-    if (points.length < 3) continue;
-    ctx.beginPath();
-    points.forEach(([rawX, rawY], index) => {
-      const x = Number(rawX) / entry.imageInfo.width_px * width * view.zoom + view.panX;
-      const y = Number(rawY) / entry.imageInfo.height_px * height * view.zoom + view.panY;
-      if (index === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
-    ctx.closePath();
-    ctx.fill();
-    ctx.stroke();
-  }
-  ctx.restore();
 }
 
 function hintGeometry(entry, hint) {
@@ -993,21 +974,56 @@ async function saveLateGrowthDecision(timepoint, decision) {
   state.busy = true;
   setMessage(`正在保存 ${well} ${timepoint} 生长判定…`);
   try {
-    await api("/api/late-growth-review", {
+    const result = await api("/api/late-growth-review", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         well, timepoint, decision, reviewer: "local_user"
       })
     });
-    state.busy = false;
-    await loadScreeningWells();
-    await loadWells(well);
+
+    const imageInfo = state.detail.images[timepoint];
+    if (imageInfo) {
+      imageInfo.late_growth_decision = decision;
+      imageInfo.late_growth_source = "human";
+      imageInfo.late_growth_search_stage = "";
+      imageInfo.growth_regions = [];
+      imageInfo.growth_overlay_style = "none";
+    }
+    if (result.report) state.detail.report = result.report;
+    applyLocalScreeningUpdate(result.screening);
+    updateLateGrowthCard(timepoint);
+    updateCurrentWellSummary();
     setMessage(`${well} ${timepoint} 已标记为${growthDecisionNames[decision]}`);
   } catch (error) {
-    state.busy = false;
     setMessage(`生长判定保存失败：${error.message}`, true);
+  } finally {
+    state.busy = false;
   }
+}
+
+function applyLocalScreeningUpdate(row) {
+  if (!row?.well) return;
+  const normalizedWell = String(row.well).toUpperCase();
+  for (const item of state.screeningWells) {
+    if (String(item.well).toUpperCase() === normalizedWell) Object.assign(item, row);
+  }
+  for (const item of state.wells) {
+    if (String(item.well).toUpperCase() === normalizedWell) Object.assign(item, row);
+  }
+  renderWellList();
+  renderPlateDialog();
+}
+
+function updateLateGrowthCard(timepoint) {
+  const imageInfo = state.detail?.images?.[timepoint];
+  const card = document.querySelector(`.timepoint-card[data-timepoint="${timepoint}"]`);
+  if (!imageInfo || !card) return;
+  card.querySelector(".timepoint-count").textContent = growthDecisionNames[imageInfo.late_growth_decision] || "待确认";
+  card.querySelector(".timepoint-breakdown").textContent = lateEvidenceText(imageInfo);
+  card.querySelectorAll(".late-growth-actions button").forEach(button => {
+    button.classList.toggle("active", button.dataset.growth === imageInfo.late_growth_decision);
+  });
 }
 
 async function loadScreeningWells() {

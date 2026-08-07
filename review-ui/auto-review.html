@@ -3,9 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="project-back-url" content="">
   <title>按孔快速审核</title>
   <link rel="stylesheet" href="assets/teach.css">
-  <link rel="stylesheet" href="assets/auto-review.css">
+  <link rel="stylesheet" href="assets/auto-review.css?v=20260807-growth-layout-v4">
 </head>
 <body>
   <header class="topbar">
@@ -15,6 +16,7 @@
       <p class="subtitle">同一孔三个时间点并排显示；逐个确认细胞、粘连细胞、杂质与待定目标。</p>
     </div>
     <div class="top-actions">
+      <a id="backReviewList" class="secondary" href="/">返回审核列表</a>
       <button id="plateReportButton" class="secondary" type="button">96孔板结果</button>
       <button id="newRoundButton" class="train">用本轮结果训练并生成下一轮</button>
     </div>
@@ -78,7 +80,7 @@
       <section id="lateTimepointSection" class="late-timepoint-section" hidden>
         <div class="late-section-heading">
           <div><p class="eyebrow dark">第一行 · 生长证据</p><h3>Day7 / Day14 生长情况</h3></div>
-          <p>Day7默认定位细胞较多区域；Day14用半透明阴影和轮廓标出生长区域。均可放大和拖动。</p>
+          <p>Day7 / Day14与T0～T2保持一致的视野比例；仅展示原图和生长判定，不叠加末点阴影。</p>
         </div>
         <div id="lateTimepointGrid" class="late-timepoint-grid"></div>
       </section>
@@ -183,6 +185,6 @@
     </form>
   </dialog>
 
-  <script src="assets/auto-review.js?v=20260806-growth-layout-v1"></script>
+  <script src="assets/auto-review.js?v=20260807-growth-layout-v2"></script>
 </body>
 </html>

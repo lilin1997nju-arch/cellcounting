@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import html
 import io
 import sqlite3
 from datetime import datetime, timezone
@@ -766,7 +767,11 @@ def save_lineage_review(path: str | Path, payload: dict[str, Any]) -> int:
     return review_id
 
 
-def create_app(config: dict[str, Any]) -> FastAPI:
+def create_app(
+    config: dict[str, Any],
+    *,
+    project_back_url: str | None = None,
+) -> FastAPI:
     database_path = artifact_path(config, "annotations", "annotations.db")
     images_manifest_path = artifact_path(config, "manifests", "images.csv")
     database = initialize_database(database_path)
@@ -795,6 +800,17 @@ def create_app(config: dict[str, Any]) -> FastAPI:
         Path(__file__).resolve().parents[2] / "review-ui" / "screening.html"
     )
     app = FastAPI(title="Cell Vision Local Review")
+    escaped_project_back_url = html.escape(project_back_url or "", quote=True)
+
+    def auto_review_page() -> str:
+        page = auto_review_html_path.read_text(encoding="utf-8")
+        if escaped_project_back_url:
+            page = page.replace(
+                '<meta name="project-back-url" content="">',
+                f'<meta name="project-back-url" content="{escaped_project_back_url}">',
+                1,
+            )
+        return page
     prediction_cache: dict[str, Any] = {
         "mtime": None,
         "source": None,
@@ -812,7 +828,6 @@ def create_app(config: dict[str, Any]) -> FastAPI:
         "key": None,
         "frame": pd.DataFrame(),
     }
-    growth_contour_cache: dict[tuple[str, int], list[dict[str, Any]]] = {}
 
     def gated_settings() -> dict[str, Any]:
         return config.get("gated_report", {})
@@ -1401,7 +1416,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def root() -> str:
-        return auto_review_html_path.read_text(encoding="utf-8")
+        return auto_review_page()
 
     @app.get("/teach", response_class=HTMLResponse)
     def teach() -> str:
@@ -1409,7 +1424,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
 
     @app.get("/auto-review", response_class=HTMLResponse)
     def auto_review() -> str:
-        return auto_review_html_path.read_text(encoding="utf-8")
+        return auto_review_page()
 
     @app.get("/doublet-teach", response_class=HTMLResponse)
     def doublet_teach() -> str:
@@ -1708,21 +1723,10 @@ def create_app(config: dict[str, Any]) -> FastAPI:
                     if day14_positive
                     else "no_growth"
                 )
+            # The endpoint CF mask is not sufficiently reliable for a visual
+            # overlay.  Keep the raw image and human growth decision, but do
+            # not calculate or return expensive/ambiguous shadow contours.
             growth_regions: list[dict[str, Any]] = []
-            if timepoint == "T4":
-                mask_path = Path(str(row.get("cf_image_path", "")))
-                metrics_path = Path(str(row.get("metrics_csv_path", "")))
-                if mask_path.exists():
-                    cache_key = (str(mask_path), mask_path.stat().st_mtime_ns)
-                    if cache_key not in growth_contour_cache:
-                        growth_contour_cache[cache_key] = _growth_region_contours(
-                            mask_path,
-                            metrics_path,
-                            normalized_well,
-                            config.get("review", {}).get("day14_overlay", {}),
-                            raw_image_path=Path(str(row.get("raw_image_path", ""))),
-                        )
-                    growth_regions = growth_contour_cache[cache_key]
             images[timepoint] = {
                 "available": True,
                 "display_label": str(display_names.get(timepoint, timepoint)),
@@ -1766,7 +1770,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
                 ) if timepoint in {"T3", "T4"} else "",
                 "representative_view": representative,
                 "growth_regions": growth_regions,
-                "growth_overlay_style": "translucent_fill_with_contour" if growth_regions else "none",
+                "growth_overlay_style": "none",
                 "default_zoom": (
                     3.0
                     if timepoint == "T3"
@@ -2382,7 +2386,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
                 """,
                 (well, payload.decision, payload.reviewer, payload.notes, updated),
             )
-        summary = build_well_screening(config, database)
+        summary = build_well_screening(config, database, selected_wells={well})
         return {"status": "saved", "well": well, "summary": summary}
 
     @app.post("/api/late-growth-review")
@@ -2411,7 +2415,7 @@ def create_app(config: dict[str, Any]) -> FastAPI:
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        summary = build_well_screening(config, database)
+        summary = build_well_screening(config, database, selected_wells={well})
         gated_summary, updated_report = refresh_gated_report()
         source = artifact_path(config, "predictions", "latest_well_screening.csv")
         frame = pd.read_csv(source)

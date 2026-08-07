@@ -13,7 +13,9 @@ import json
 import asyncio
 import os
 import re
+import sqlite3
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -25,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .config import PROJECT_ROOT, load_config
-from .review_server import create_app
+from .review_server import _visible_v2_review_instances, create_app
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
 
@@ -81,6 +83,207 @@ def _report_for_plate(plate: dict[str, Any]) -> tuple[dict[str, Any] | None, Pat
     return None, None
 
 
+_REVIEWABLE_LABELS = {
+    "single",
+    "touching_doublet",
+    "cluster_3plus",
+    "debris",
+    "uncertain",
+}
+_REVIEW_PROGRESS_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+
+
+def _empty_review_progress(*, available: bool) -> dict[str, Any]:
+    return {
+        "review_data_available": available,
+        "reviewable_well_count": 0,
+        "reviewed_well_count": 0,
+        "reviewable_object_count": 0,
+        "reviewed_object_count": 0,
+        "review_complete": bool(available),
+    }
+
+
+def _latest_prediction_path(config: dict[str, Any]) -> Path:
+    prediction_root = Path(config["paths"]["artifact_root"]) / "predictions"
+    base = prediction_root / "latest_integrated_predictions.csv"
+    source = base
+    for name in (
+        "latest_temporally_completed_predictions.csv",
+        "latest_v2_predictions.csv",
+    ):
+        candidate = prediction_root / name
+        if candidate.exists() and (
+            not source.exists() or candidate.stat().st_mtime_ns >= source.stat().st_mtime_ns
+        ):
+            source = candidate
+    return source
+
+
+def _review_progress_for_plate(plate: dict[str, Any]) -> dict[str, Any]:
+    """Read lightweight well-review progress without starting a plate app.
+
+    The project hub must not construct every review application just to render
+    a table.  The prediction table and annotation database already contain the
+    information needed to count reviewable wells, so use them directly and
+    invalidate the small cache when either file changes.
+    """
+
+    config_value = plate.get("config")
+    if not config_value:
+        return _empty_review_progress(available=False)
+    config_path = _resolve(config_value)
+    if not config_path.exists():
+        return _empty_review_progress(available=False)
+    try:
+        config = load_config(config_path)
+    except (OSError, ValueError, TypeError):
+        return _empty_review_progress(available=False)
+
+    prediction_path = _latest_prediction_path(config)
+    database_path = Path(config["paths"]["artifact_root"]) / "annotations" / "annotations.db"
+    signature = (
+        str(config_path),
+        prediction_path.stat().st_mtime_ns if prediction_path.exists() else None,
+        database_path.stat().st_mtime_ns if database_path.exists() else None,
+    )
+    cache_key = str(config_path)
+    cached = _REVIEW_PROGRESS_CACHE.get(cache_key)
+    if cached and cached[0] == signature:
+        return dict(cached[1])
+    if not prediction_path.exists() or not database_path.exists():
+        result = _empty_review_progress(available=False)
+        _REVIEW_PROGRESS_CACHE[cache_key] = (signature, result)
+        return dict(result)
+
+    try:
+        predictions = pd.read_csv(prediction_path, low_memory=False)
+        if predictions.empty or "integrated_label" not in predictions.columns:
+            result = _empty_review_progress(available=True)
+            _REVIEW_PROGRESS_CACHE[cache_key] = (signature, result)
+            return dict(result)
+
+        reviewable = predictions[
+            predictions["integrated_label"].isin(_REVIEWABLE_LABELS)
+            & (predictions["well"].astype(str).str.upper() != "A1")
+        ].copy()
+        if "v2_instance_id" in reviewable.columns:
+            try:
+                reviewable = _visible_v2_review_instances(reviewable)
+            except (KeyError, TypeError, ValueError):
+                # Keep the hub usable with older/incomplete prediction tables.
+                pass
+
+        round_id = (
+            str(reviewable.iloc[0]["integrated_round_id"])
+            if not reviewable.empty and "integrated_round_id" in reviewable.columns
+            else ""
+        )
+        with sqlite3.connect(database_path) as connection:
+            try:
+                reviews = pd.read_sql_query(
+                    """
+                    SELECT candidate_id, reviewed_label, updated_at
+                    FROM integrated_training_reviews
+                    WHERE round_id = ?
+                    ORDER BY updated_at, integrated_review_id
+                    """,
+                    connection,
+                    params=(round_id,),
+                )
+            except (sqlite3.OperationalError, pd.errors.DatabaseError):
+                reviews = pd.DataFrame()
+            try:
+                manual = pd.read_sql_query(
+                    """
+                    SELECT candidate_id, well, reviewed_label
+                    FROM quick_missed_objects
+                    WHERE round_id = ?
+                    """,
+                    connection,
+                    params=(round_id,),
+                )
+            except (sqlite3.OperationalError, pd.errors.DatabaseError):
+                manual = pd.DataFrame()
+
+        reviewed_ids: set[str] = set()
+        if not reviews.empty:
+            latest = reviews.drop_duplicates("candidate_id", keep="last")
+            reviewed_ids = set(
+                latest.loc[latest["reviewed_label"].notna(), "candidate_id"]
+                .astype(str)
+            )
+        reviewable["is_reviewed"] = reviewable["candidate_id"].astype(str).isin(reviewed_ids)
+
+        if not manual.empty:
+            existing_ids = set(reviewable["candidate_id"].astype(str))
+            manual = manual[~manual["candidate_id"].astype(str).isin(existing_ids)].copy()
+            if not manual.empty:
+                manual["is_reviewed"] = manual["reviewed_label"].notna()
+                manual = manual.rename(columns={"screen_well": "well"})
+                reviewable = pd.concat(
+                    [reviewable[["well", "is_reviewed"]], manual[["well", "is_reviewed"]]],
+                    ignore_index=True,
+                )
+        else:
+            reviewable = reviewable[["well", "is_reviewed"]]
+
+        if reviewable.empty:
+            result = _empty_review_progress(available=True)
+        else:
+            grouped = reviewable.groupby(reviewable["well"].astype(str).str.upper())["is_reviewed"]
+            well_progress = grouped.agg(["size", "sum"])
+            result = {
+                "review_data_available": True,
+                "reviewable_well_count": int(len(well_progress)),
+                "reviewed_well_count": int((well_progress["size"] == well_progress["sum"]).sum()),
+                "reviewable_object_count": int(len(reviewable)),
+                "reviewed_object_count": int(reviewable["is_reviewed"].sum()),
+                "review_complete": bool((well_progress["size"] == well_progress["sum"]).all()),
+            }
+    except (OSError, KeyError, ValueError, TypeError, pd.errors.ParserError, sqlite3.Error):
+        result = _empty_review_progress(available=False)
+
+    _REVIEW_PROGRESS_CACHE[cache_key] = (signature, result)
+    return dict(result)
+
+
+def _project_detection_dates(value: dict[str, Any]) -> tuple[str | None, str | None]:
+    """Return the first/last acquisition dates at day precision."""
+
+    candidates: list[Path] = []
+    source = value.get("source_sessions_csv")
+    if source:
+        candidates.append(_resolve(source))
+    for plate in value.get("plates", []):
+        if not isinstance(plate, dict) or not plate.get("images_manifest"):
+            continue
+        candidates.append(_resolve(plate["images_manifest"]))
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            frame = pd.read_csv(path, usecols=lambda column: column in {
+                "acquisition_date", "acquisition_datetime", "excluded"
+            })
+        except (OSError, ValueError, pd.errors.ParserError):
+            continue
+        if frame.empty:
+            continue
+        if "excluded" in frame.columns:
+            excluded = frame["excluded"].astype(str).str.strip().str.lower().isin(
+                {"1", "true", "yes", "y"}
+            )
+            frame = frame.loc[~excluded]
+        column = "acquisition_date" if "acquisition_date" in frame.columns else "acquisition_datetime"
+        if column not in frame.columns:
+            continue
+        parsed = pd.to_datetime(frame[column], errors="coerce", utc=True).dropna()
+        if not parsed.empty:
+            return parsed.min().date().isoformat(), parsed.max().date().isoformat()
+    return None, None
+
+
 def _plate_summary(plate: dict[str, Any]) -> dict[str, Any]:
     report, report_path = _report_for_plate(plate)
     counts: dict[str, int] = {}
@@ -100,6 +303,7 @@ def _plate_summary(plate: dict[str, Any]) -> dict[str, Any]:
     status = str(plate.get("status", "queued"))
     if report:
         status = "completed"
+    review_progress = _review_progress_for_plate(plate)
     return {
         "slug": str(plate.get("slug", "")),
         "group_id": str(plate.get("group_id", plate.get("board_id", ""))),
@@ -109,9 +313,11 @@ def _plate_summary(plate: dict[str, Any]) -> dict[str, Any]:
         "well_count": int(report.get("well_count", 0)) if report else 0,
         "positive_well_count": int(report.get("day14_positive_sample_wells", 0)) if report else 0,
         "skipped_well_count": int(report.get("day14_skipped_sample_wells", 0)) if report else 0,
+        "endpoint_day_label": report.get("endpoint_day_label", plate.get("endpoint_day_label", "Day14")) if report else plate.get("endpoint_day_label", "Day14"),
         "elapsed_seconds": elapsed,
         "report_path": str(report_path) if report_path else None,
         "config_path": str(_resolve(plate.get("config", ""))) if plate.get("config") else None,
+        **review_progress,
     }
 
 
@@ -256,14 +462,32 @@ def _parse_folder(path_value: str) -> dict[str, Any]:
         default_endpoint_day = None
         selection_valid = False
         selection_error = str(exc.detail)
+    day_values = sorted(
+        {str(value) for value in sessions["day_label"].dropna()},
+        key=lambda label: (
+            _day_number(label) is None,
+            _day_number(label) if _day_number(label) is not None else 10**9,
+            label.casefold(),
+        ),
+    )
+    timepoint_values = sorted(
+        {str(value) for value in sessions["timepoint_label"].dropna()},
+        key=lambda label: (
+            not label.casefold().startswith("t"),
+            int(label[1:])
+            if label.casefold().startswith("t") and label[1:].isdigit()
+            else 10**9,
+            label.casefold(),
+        ),
+    )
     return {
         "root": str(root),
         "index": str(index),
         "session_count": int(len(sessions)),
         "group_count": int(len(groups)),
         "groups": [_safe(row) for row in groups.to_dict(orient="records")],
-        "timepoint_labels": sorted(sessions["timepoint_label"].dropna().astype(str).unique().tolist()),
-        "day_labels": sorted(sessions["day_label"].dropna().astype(str).unique().tolist()),
+        "timepoint_labels": timepoint_values,
+        "day_labels": day_values,
         "timepoint_options": options,
         "default_selected_timepoint_labels": default_selected,
         "default_endpoint_day_label": default_endpoint,
@@ -309,6 +533,7 @@ def _project_card(path: Path) -> dict[str, Any]:
     plates = value.get("plates") if isinstance(value.get("plates"), list) else []
     aggregate: dict[str, int] = {}
     completed = 0
+    reviewed = 0
     for plate in plates:
         if not isinstance(plate, dict):
             continue
@@ -317,7 +542,10 @@ def _project_card(path: Path) -> dict[str, Any]:
             completed += 1
             for key, count in (report.get("category_counts") or {}).items():
                 aggregate[str(key)] = aggregate.get(str(key), 0) + int(count or 0)
+        if _review_progress_for_plate(plate).get("review_complete"):
+            reviewed += 1
     project_id = str(value.get("project_id") or path.parent.name)
+    detection_start, detection_end = _project_detection_dates(value)
     return {
         "project_id": project_id,
         "project_name": str(value.get("project_name") or project_id),
@@ -325,7 +553,18 @@ def _project_card(path: Path) -> dict[str, Any]:
         "manifest_path": str(path),
         "plate_count": len(plates),
         "completed_plate_count": completed,
+        "recognized_plate_count": completed,
+        "reviewed_plate_count": reviewed,
         "category_counts": aggregate,
+        "single_cell_origin_well_count": int(aggregate.get("single_cell_origin", 0)),
+        "detection_start_date": detection_start,
+        "detection_end_date": detection_end,
+        "created_by": str(
+            value.get("created_by")
+            or value.get("creator")
+            or value.get("owner")
+            or ""
+        ),
         "generated_at": value.get("generated_at"),
         "detail_url": f"/projects/{_slug(project_id)}/",
     }
@@ -340,8 +579,9 @@ class _LazyPlateApp:
     deferring the expensive initialization to the first request.
     """
 
-    def __init__(self, config_path: Path):
+    def __init__(self, config_path: Path, project_back_url: str = ""):
         self.config_path = config_path
+        self.project_back_url = project_back_url
         self._app = None
         self._error: str | None = None
         self._lock = asyncio.Lock()
@@ -359,7 +599,9 @@ class _LazyPlateApp:
                     # Review-app creation performs synchronous image/database
                     # discovery.  Keep that work off the event loop.
                     self._app = await asyncio.to_thread(
-                        create_app, load_config(self.config_path)
+                        create_app,
+                        load_config(self.config_path),
+                        project_back_url=self.project_back_url,
                     )
                 except Exception as exc:  # pragma: no cover - startup-only path
                     self._error = f"{type(exc).__name__}: {exc}"
@@ -390,13 +632,13 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         raise FileNotFoundError(manifest_file)
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     project_name = str(manifest.get("project_name", manifest.get("project_id", "Cell Vision Project")))
+    project_id = str(manifest.get("project_id") or manifest_file.parent.name)
+    project_back_url = f"/projects/{_slug(project_id)}/"
     ui_root = PROJECT_ROOT / "review-ui"
     app = FastAPI(title=f"Cell Vision Project · {project_name}")
     app.mount("/project-assets", StaticFiles(directory=ui_root), name="project-assets")
     queue_file = _queue_path(manifest_file)
     queue_store = TaskQueueStore(queue_file)
-    project_paths = _project_manifest_paths(manifest_file)
-
     # Register completed boards lazily.  A project can still be opened while a
     # board is queued; that board simply appears as a disabled row until its
     # manifest and inference artifacts are ready.
@@ -412,7 +654,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         if not config_path.exists() or (images_path is not None and not images_path.exists()):
             continue
         try:
-            lazy_plate = _LazyPlateApp(config_path)
+            lazy_plate = _LazyPlateApp(config_path, project_back_url=project_back_url)
             app.mount(f"/plates/{slug}", lazy_plate, name=f"plate-{slug}")
             lazy_apps[slug] = lazy_plate
             mounted.append(slug)
@@ -430,7 +672,12 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     @app.get("/projects/{project_id}/", response_class=HTMLResponse)
     def project_detail_page(project_id: str) -> str:
         target = _slug(project_id)
-        available = {_slug(str((_read_manifest(path) or {}).get("project_id", path.parent.name))): path for path in project_paths}
+        # Re-scan here instead of using the startup snapshot: creating a task
+        # writes a new project manifest while the hub is already running.
+        available = {
+            _slug(str((_read_manifest(path) or {}).get("project_id", path.parent.name))): path
+            for path in _project_manifest_paths(manifest_file)
+        }
         if target not in available:
             raise HTTPException(status_code=404, detail="project not found")
         page = (ui_root / "project-dashboard.html").read_text(encoding="utf-8")
@@ -443,7 +690,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "project": project_name,
             "mounted_plates": mounted,
             "loaded_plates": [slug for slug, item in lazy_apps.items() if item.loaded],
-            "project_count": len(project_paths),
+            "project_count": len(_project_manifest_paths(manifest_file)),
         }
 
     @app.get("/api/ready")
@@ -483,14 +730,26 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         for item in plates:
             for key, value in item["category_counts"].items():
                 aggregate[key] = aggregate.get(key, 0) + int(value)
+        detection_start, detection_end = _project_detection_dates(selected_manifest)
         return {
             "project_id": selected_manifest.get("project_id", selected_path.parent.name),
             "project_name": selected_manifest.get("project_name", selected_path.parent.name),
             "root": selected_manifest.get("root"),
             "plate_count": len(plates),
             "mounted_plates": mounted if selected_path == manifest_file else [],
+            "recognized_plate_count": int(sum(item.get("status") == "completed" for item in plates)),
+            "reviewed_plate_count": int(sum(bool(item.get("review_complete")) for item in plates)),
             "category_counts": aggregate,
             "plates": plates,
+            "single_cell_origin_well_count": int(aggregate.get("single_cell_origin", 0)),
+            "detection_start_date": detection_start,
+            "detection_end_date": detection_end,
+            "created_by": str(
+                selected_manifest.get("created_by")
+                or selected_manifest.get("creator")
+                or selected_manifest.get("owner")
+                or ""
+            ),
             "generated_at": selected_manifest.get("generated_at"),
         }
 
@@ -504,24 +763,175 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
         if os.name != "nt":
             return {"path": ""}
+        focus_helper = r"""
+using System;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+
+public static class CellVisionWindowFocus
+{
+    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder className, int maxCount);
+
+    [DllImport("user32.dll")]
+    private static extern bool BringWindowToTop(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool SetWindowPos(
+        IntPtr hWnd,
+        IntPtr insertAfter,
+        int x,
+        int y,
+        int width,
+        int height,
+        uint flags);
+
+    private static readonly IntPtr HwndTopmost = new IntPtr(-1);
+    private const uint SwpNoSize = 0x0001;
+    private const uint SwpNoMove = 0x0002;
+    private const uint SwpShowWindow = 0x0040;
+    private static System.Threading.Timer promotionTimer;
+
+    public static void Start(uint targetProcessId)
+    {
+        Stop();
+        promotionTimer = new System.Threading.Timer(
+            unused => Promote(targetProcessId),
+            null,
+            0,
+            50);
+    }
+
+    public static void Stop()
+    {
+        var timer = promotionTimer;
+        promotionTimer = null;
+        if (timer != null)
+        {
+            timer.Dispose();
+        }
+    }
+
+    public static void Promote(uint targetProcessId)
+    {
+        IntPtr dialogHandle = IntPtr.Zero;
+        EnumWindows((hWnd, unused) =>
+        {
+            uint processId;
+            GetWindowThreadProcessId(hWnd, out processId);
+            if (processId != targetProcessId || !IsWindowVisible(hWnd))
+            {
+                return true;
+            }
+
+            var className = new StringBuilder(128);
+            GetClassName(hWnd, className, className.Capacity);
+            if (string.Equals(className.ToString(), "#32770", StringComparison.Ordinal))
+            {
+                dialogHandle = hWnd;
+                return false;
+            }
+
+            return true;
+        }, IntPtr.Zero);
+
+        if (dialogHandle == IntPtr.Zero)
+        {
+            return;
+        }
+
+        SetWindowPos(
+            dialogHandle,
+            HwndTopmost,
+            0,
+            0,
+            0,
+            0,
+            SwpNoMove | SwpNoSize | SwpShowWindow);
+        BringWindowToTop(dialogHandle);
+        SetForegroundWindow(dialogHandle);
+    }
+}
+"""
         script = (
             "Add-Type -AssemblyName System.Windows.Forms;"
+            "Add-Type -AssemblyName System.Drawing;"
+            "Add-Type -TypeDefinition @'\n"
+            + focus_helper
+            + "'@;"
+            "[System.Windows.Forms.Application]::EnableVisualStyles();"
+            "$owner=New-Object System.Windows.Forms.Form;"
+            "$owner.FormBorderStyle='None';"
+            "$owner.StartPosition='Manual';"
+            "$owner.Location=New-Object System.Drawing.Point -ArgumentList -10,-10;"
+            "$owner.Size=New-Object System.Drawing.Size -ArgumentList 1,1;"
+            "$owner.Opacity=0;"
+            "$owner.ShowInTaskbar=$false;"
+            "$owner.TopMost=$true;"
+            "$owner.Show();"
+            "$owner.Activate();"
             "$d=New-Object System.Windows.Forms.FolderBrowserDialog;"
             "$d.Description='选择包含 sessions.idx 的数据文件夹';"
             "$d.ShowNewFolderButton=$false;"
-            "if($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK){$d.SelectedPath}"
+            "[CellVisionWindowFocus]::Start([uint32]$PID);"
+            "try{if($d.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK){$d.SelectedPath}}"
+            "finally{[CellVisionWindowFocus]::Stop();$d.Dispose();$owner.Close();$owner.Dispose()}"
         )
         try:
+            # The review service is often started without an attached console
+            # (for example from a detached local launcher).  Explicitly ask
+            # PowerShell for a normal interactive window without creating a
+            # second console that could send a close event to the server.
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            startupinfo.wShowWindow = getattr(subprocess, "SW_SHOWNORMAL", 1)
             completed = subprocess.run(
-                ["powershell.exe", "-NoProfile", "-STA", "-Command", script],
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-STA",
+                    "-WindowStyle",
+                    "Normal",
+                    "-Command",
+                    script,
+                ],
                 capture_output=True,
                 text=True,
                 timeout=120,
                 check=False,
+                startupinfo=startupinfo,
             )
-        except (OSError, subprocess.SubprocessError):
-            return {"path": ""}
-        return {"path": completed.stdout.strip()}
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(
+                f"Folder picker failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return {"path": "", "error": "无法启动 Windows 文件夹选择器，请直接输入文件夹路径。"}
+        selected_path = completed.stdout.strip()
+        if selected_path:
+            return {"path": selected_path}
+        error = completed.stderr.strip()
+        return {
+            "path": "",
+            "error": error or "未选择文件夹；也可以直接输入文件夹路径。",
+        }
 
     @app.post("/api/project/analyze-folder")
     def analyze_folder(payload: FolderPayload) -> dict[str, Any]:
@@ -569,6 +979,29 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "created_at": now,
         }
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+        project_id = _slug(payload.name.strip()) or new_task_id
+        project_dir = manifest_file.parent.parent / project_id
+        project_manifest_path = project_dir / "project.json"
+        if project_manifest_path.exists():
+            project_id = f"{project_id}-{new_task_id.rsplit('-', 1)[-1]}"
+            project_dir = manifest_file.parent.parent / project_id
+            project_manifest_path = project_dir / "project.json"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        project_manifest_path.write_text(
+            json.dumps({
+                "project_id": project_id,
+                "project_name": payload.name.strip() or "新建项目任务",
+                "root": analysis["root"],
+                "generated_at": now,
+                "task_id": new_task_id,
+                "status": "queued",
+                "selected_timepoint_labels": selected,
+                "endpoint_day_label": endpoint_label,
+                "endpoint_day_number": endpoint_day,
+                "plates": [],
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         task = {
             "task_id": new_task_id,
             "name": payload.name.strip() or "新建项目任务",
@@ -587,6 +1020,8 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "endpoint_day_number": endpoint_day,
             "endpoint_timepoint_labels": endpoint_timepoint_labels,
             "plan_path": str(plan_path),
+            "project_id": project_id,
+            "project_manifest": str(project_manifest_path),
         }
         return queue_store.add(task)
 

@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
     gated.add_argument("--output-dir", required=True)
     gated.add_argument("--early-screening-csv", default="")
     gated.add_argument("--sessions-csv", default="")
+    gated.add_argument("--endpoint-day-label", default="Day14", help="Actual culture day used as the endpoint gate")
     gated.add_argument(
         "--skip-day7-localization",
         action="store_true",
@@ -190,6 +191,7 @@ def main(argv: list[str] | None = None) -> None:
             early_screening_csv=args.early_screening_csv or None,
             sessions_csv=args.sessions_csv or None,
             locate_day7=not args.skip_day7_localization,
+            endpoint_day_label=args.endpoint_day_label,
         )
         print(json.dumps({key: value for key, value in result.items() if key != "wells"}, ensure_ascii=False, indent=2))
     elif args.command == "precache-review-images":

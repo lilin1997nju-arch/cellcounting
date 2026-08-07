@@ -19,6 +19,16 @@ body {
   flex-wrap: wrap;
 }
 
+.top-actions a.secondary {
+  color: #fff;
+  border-color: #6e8b8e;
+  background: transparent;
+}
+
+.top-actions a.secondary:hover {
+  background: rgba(255, 255, 255, .1);
+}
+
 .quick-stats #roundId {
   font-size: 15px;
   white-space: nowrap;
@@ -232,7 +242,7 @@ body {
   margin-top: 0;
   border: 1px solid #c9c6bd;
   border-radius: 9px;
-  padding: 11px;
+  padding: 11px 0;
   background: rgba(255, 255, 255, .58);
   min-width: 900px;
 }
@@ -247,17 +257,21 @@ body {
   margin-bottom: 9px;
 }
 
+.late-timepoint-section > .late-section-heading {
+  padding: 0 11px;
+}
+
 .late-section-heading h3 { margin: 1px 0 0; font-size: 16px; }
 .late-section-heading > p { margin: 0; color: #69787c; font-size: 11px; }
 
 .late-timepoint-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(360px, 1fr));
+  grid-template-columns: repeat(3, minmax(280px, 1fr));
   gap: 11px;
 }
 
 .timepoint-card.late-timepoint-card .image-stage {
-  aspect-ratio: 1.45;
+  aspect-ratio: 1;
 }
 
 .early-timepoint-section {
@@ -268,16 +282,6 @@ body {
 }
 
 .early-section-heading { margin-bottom: 9px; }
-
-.timepoint-card.has-growth-overlay > header {
-  box-shadow: inset 4px 0 0 #25a98c;
-}
-
-.timepoint-card.has-growth-overlay .timepoint-count::after {
-  content: " · 生长区阴影";
-  color: #17816d;
-  font-weight: 700;
-}
 
 .timepoint-card.late-timepoint-card > header {
   min-height: 43px;

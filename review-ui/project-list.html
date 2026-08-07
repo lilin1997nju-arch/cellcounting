@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-list.css">
+  <link rel="stylesheet" href="/project-assets/project-list.css?v=20260807-project-list-v2">
 </head>
 <body>
   <header class="hub-header">
@@ -23,10 +23,24 @@
     <section class="hub-summary" id="summaryCards"></section>
     <section class="panel">
       <div class="section-heading">
-        <div><h2>项目</h2><p class="muted">项目之间相互独立；点击项目卡片后再进入对应板子审核。</p></div>
+      <div><h2>项目</h2><p class="muted">项目之间相互独立；点击项目行进入对应板子审核。</p></div>
         <span id="projectCount" class="badge"></span>
       </div>
-      <div id="projectCards" class="project-grid"><div class="empty">正在加载项目…</div></div>
+      <div class="project-table-wrap">
+        <table class="project-table">
+          <thead>
+            <tr>
+              <th>项目</th>
+              <th>检测时间</th>
+              <th>创建人</th>
+              <th>状态</th>
+              <th>结果汇总</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="projectRows"><tr><td colspan="6" class="empty">正在加载项目…</td></tr></tbody>
+        </table>
+      </div>
     </section>
     <section class="panel">
       <div class="section-heading"><div><h2>任务队列</h2><p class="muted">新任务先解析文件夹并确认时间点，随后按末点数据快速排除无明显生长的孔。</p></div></div>
@@ -36,16 +50,17 @@
 
   <dialog id="taskDialog">
     <form method="dialog" id="taskForm">
-      <div class="dialog-heading"><div><h2>新建计算任务</h2><p class="muted">选择包含 sessions.idx 的数据文件夹，解析后勾选用于本轮计算的实际日龄。</p></div><button value="cancel" class="icon-button" type="submit">×</button></div>
+      <div class="dialog-heading"><div><h2>新建计算任务</h2><p class="muted">选择包含 sessions.idx 的数据文件夹，解析后勾选用于本轮计算的实际日龄。</p></div><button id="closeTaskButton" class="icon-button" type="button" aria-label="关闭">×</button></div>
       <label>任务名称<input id="taskName" required value="新建数据任务"></label>
       <label>数据文件夹<div class="folder-row"><input id="folderPath" required placeholder="例如 E:\\CM\\20260623 QL2603"><button id="browseButton" class="secondary" type="button">选择文件夹</button></div></label>
       <div id="analysisResult" class="analysis-result muted">选择文件夹后点击解析。</div>
       <div id="timepointPicker" class="timepoint-picker" hidden></div>
       <div class="endpoint-note" id="endpointNote" hidden></div>
-      <div class="dialog-actions"><button value="cancel" class="secondary" type="submit">取消</button><button id="analyzeButton" class="secondary" type="button">解析数据</button><button id="queueButton" class="primary" type="button" disabled>加入队列</button></div>
+      <div class="dialog-actions"><button id="cancelTaskButton" class="secondary" type="button">取消</button><button id="analyzeButton" class="secondary" type="button">解析数据</button><button id="queueButton" class="primary" type="button" disabled>加入队列</button></div>
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-list.js?v=20260806-project-list-v1"></script>
+  <script src="/project-assets/project-list.js?v=20260807-project-list-v3"></script>
+  <script>if(new URLSearchParams(location.search).get("new-task")==="1")document.getElementById("taskDialog").showModal();</script>
 </body>
 </html>
