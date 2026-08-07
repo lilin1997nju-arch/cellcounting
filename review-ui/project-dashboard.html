@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>细胞筛选项目</title>
+  <link rel="stylesheet" href="/project-assets/project-dashboard.css">
+</head>
+<body>
+  <header class="project-header">
+    <div>
+      <p class="eyebrow">CELL VISION · PROJECT HUB</p>
+      <h1 id="projectName">QL2603</h1>
+      <p id="projectMeta" class="muted">正在加载项目板列表…</p>
+    </div>
+    <div class="header-actions">
+      <a class="secondary" href="/">返回项目列表</a>
+      <button id="refreshButton" class="secondary" type="button">刷新</button>
+      <a class="primary header-link" href="/">新建任务</a>
+    </div>
+  </header>
+
+  <main class="project-main">
+    <section id="summaryCards" class="summary-cards"></section>
+    <section class="panel">
+      <div class="panel-heading">
+        <div>
+          <h2>板子列表</h2>
+          <p class="muted">点击板子进入对应的按孔快速审核界面；结果集中显示在此项目入口。</p>
+        </div>
+        <span id="mountedMeta" class="badge"></span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>
+            <th>板子</th><th>状态</th><th>无明显生长</th><th>单细胞来源</th>
+            <th>多细胞来源</th><th>待确定</th><th>总孔数</th><th>耗时</th><th></th>
+          </tr></thead>
+          <tbody id="plateRows"><tr><td colspan="9" class="empty">正在加载…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel queue-panel">
+      <div class="panel-heading"><div><h2>任务队列</h2><p class="muted">新建任务只负责解析和排队；计算按板子顺序执行，避免同时占用显存。</p></div></div>
+      <div id="taskRows" class="task-list"><div class="empty">暂无任务</div></div>
+    </section>
+  </main>
+
+  <dialog id="taskDialog">
+    <form method="dialog" id="taskForm">
+      <div class="dialog-heading"><div><h2>新建计算任务</h2><p class="muted">选择包含 sessions.idx 的数据文件夹。</p></div><button value="cancel" class="icon-button" type="submit">×</button></div>
+      <label>任务名称<input id="taskName" required value="QL2603 新任务"></label>
+      <label>数据文件夹<div class="folder-row"><input id="folderPath" required placeholder="例如 E:\\CM\\20260623 QL2603"><button id="browseButton" class="secondary" type="button">选择文件夹</button></div></label>
+      <div id="analysisResult" class="analysis-result muted">选择文件夹后点击解析。</div>
+      <div class="dialog-actions"><button value="cancel" class="secondary" type="submit">取消</button><button id="analyzeButton" class="secondary" type="button">解析数据</button><button id="queueButton" class="primary" type="button" disabled>加入队列</button></div>
+    </form>
+  </dialog>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/project-assets/project-dashboard.js?v=20260806-project-v1"></script>
+</body>
+</html>

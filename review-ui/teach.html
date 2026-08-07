@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>细胞快速教学</title>
+  <link rel="stylesheet" href="/assets/teach.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">QL11111 · T0 形态学习</p>
+      <h1>细胞快速教学</h1>
+      <p class="subtitle">先教会模型“什么像细胞”，再返回按孔快速审核。</p>
+    </div>
+    <div class="top-actions">
+      <a href="/auto-review" class="secondary">自动标注审核</a>
+      <a href="/" class="secondary">返回96孔板筛选</a>
+      <button id="trainButton" class="train">用当前标注训练</button>
+    </div>
+  </header>
+
+  <section class="status-strip">
+    <div><b id="totalCount">0</b><span>已教学</span></div>
+    <div><b id="cellCount">0</b><span>细胞</span></div>
+    <div><b id="debrisCount">0</b><span>杂质</span></div>
+    <div><b id="invalidCount">0</b><span>孔壁/无效</span></div>
+    <div class="model-state"><b id="modelState">尚未训练</b><span id="modelDetail">先完成一批标注</span></div>
+  </section>
+
+  <main>
+    <section class="toolbar">
+      <div class="mode-tabs">
+        <button class="active" data-mode="seed">细胞种子</button>
+        <button data-mode="uncertain">模型最不确定</button>
+        <button data-mode="hard_negative">困难负样本</button>
+        <button id="similarMode" data-mode="similar" disabled>与选中对象相似</button>
+      </div>
+      <div class="toolbar-right">
+        <label>每页
+          <select id="pageSize"><option>20</option><option selected>30</option><option>50</option></select>
+        </label>
+        <button id="reloadButton" class="secondary">换一批</button>
+      </div>
+    </section>
+
+    <section class="keyboard-help">
+      <span><kbd>1</kbd> 细胞</span>
+      <span><kbd>2</kbd> 杂质/碎片</span>
+      <span><kbd>3</kbd> 孔壁/无效</span>
+      <span><kbd>Space</kbd> 跳过</span>
+      <span><kbd>S</kbd> 找相似</span>
+      <strong id="message">正在加载候选…</strong>
+    </section>
+
+    <section id="grid" class="teaching-grid"></section>
+    <div id="empty" class="empty" hidden>这一组没有更多未标注对象。</div>
+  </main>
+
+  <template id="tileTemplate">
+    <article class="tile" tabindex="0">
+      <div class="image-wrap">
+        <img alt="候选图块">
+        <span class="index-badge"></span>
+        <span class="probability"></span>
+      </div>
+      <div class="tile-meta">
+        <div><b class="well"></b><small class="candidate"></small></div>
+        <button class="similar" title="寻找外观相似对象">找相似</button>
+      </div>
+      <div class="label-buttons">
+        <button data-label="cell">细胞 <kbd>1</kbd></button>
+        <button data-label="debris">杂质 <kbd>2</kbd></button>
+        <button data-label="invalid">无效 <kbd>3</kbd></button>
+      </div>
+    </article>
+  </template>
+
+  <script src="/assets/teach.js"></script>
+</body>
+</html>

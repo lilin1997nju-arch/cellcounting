@@ -1,0 +1,24 @@
+base_config: "configs/default.yaml"
+
+weak_segmenter:
+  patch_size_px: 96
+  patches_per_image: 4
+  max_train_wells: 24
+  max_validation_wells: 8
+  batch_size: 16
+  epochs: 3
+  learning_rate: 0.001
+  num_workers: 0
+  seed: 20260729
+  threshold: 0.5
+
+temporal_classifier:
+  small_scale_um: 96
+  large_scale_um: 320
+  encoder: "resnet18"
+  pretrained: false
+  classes:
+    object_type: ["cell", "debris", "irrelevant"]
+    viability: ["live", "dead", "unknown"]
+    division: ["division", "no_division"]
+

@@ -1,0 +1,8 @@
+base_config: configs/a12_22_training.yaml
+
+paths:
+  artifact_root: "artifacts/evaluation/a12_22_holdout/frozen-20260801-142209/after"
+
+# Inference only. The evaluation artifact has a fresh empty annotation DB.
+joint_training:
+  sources: []

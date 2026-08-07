@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>相连双细胞快速教学</title>
+  <link rel="stylesheet" href="/assets/teach.css">
+  <link rel="stylesheet" href="/assets/doublet-teach.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">QL11111 · T0 / T1 / T2 · 细胞数量学习</p>
+      <h1>相连双细胞快速教学</h1>
+      <p class="subtitle">判断一个候选区域实际包含1个、相连2个或3个以上细胞；不要按连通域数量判断。</p>
+    </div>
+    <div class="top-actions">
+      <a href="/" class="secondary">返回96孔板筛选</a>
+      <a href="/teach" class="secondary">细胞形态教学</a>
+    </div>
+  </header>
+
+  <section class="status-strip multiplicity-stats">
+    <div><b id="totalCount">0</b><span>已标记</span></div>
+    <div><b id="singleCount">0</b><span>单细胞</span></div>
+    <div><b id="doubletCount">0</b><span>相连两个</span></div>
+    <div><b id="clusterCount">0</b><span>3个以上</span></div>
+    <div><b id="notCellCount">0</b><span>非细胞</span></div>
+    <div class="model-state"><b id="targetText">建议先确认20个相连双细胞</b><span>同时需要单细胞作为对照</span></div>
+  </section>
+
+  <main>
+    <section class="toolbar">
+      <div class="mode-tabs">
+        <button class="active" data-mode="likely_doublet">疑似相连双细胞</button>
+        <button data-mode="uncertain">细胞概率不确定</button>
+        <button data-mode="diverse">跨孔位多样样本</button>
+      </div>
+      <div class="toolbar-right">
+        <label>每页
+          <select id="pageSize"><option>20</option><option selected>30</option><option>50</option></select>
+        </label>
+        <button id="reloadButton" class="secondary">换一批</button>
+      </div>
+    </section>
+
+    <section class="keyboard-help">
+      <span><kbd>1</kbd> 单细胞</span>
+      <span><kbd>2</kbd> 相连两个</span>
+      <span><kbd>3</kbd> 3个以上</span>
+      <span><kbd>4</kbd> 非细胞</span>
+      <span><kbd>Space</kbd> 跳过</span>
+      <strong id="message">正在加载候选…</strong>
+    </section>
+
+    <section class="guidance">
+      <b>判断重点：</b>
+      看区域内是否存在两个独立的细胞中心、双叶轮廓或中间凹陷。刚分裂但仍接触的两个细胞标为“相连两个”，不要标成一个大细胞。
+    </section>
+
+    <section id="grid" class="teaching-grid"></section>
+    <div id="empty" class="empty" hidden>这一组没有更多未标注对象。</div>
+  </main>
+
+  <template id="tileTemplate">
+    <article class="tile" tabindex="0">
+      <div class="image-wrap">
+        <img alt="细胞数量候选图块">
+        <span class="index-badge"></span>
+        <span class="probability"></span>
+        <i class="size-ring"></i>
+      </div>
+      <div class="tile-meta">
+        <div><b class="well"></b><small class="candidate"></small></div>
+        <div class="measure"></div>
+      </div>
+      <div class="label-buttons multiplicity-buttons">
+        <button data-label="single">单个 <kbd>1</kbd></button>
+        <button data-label="touching_doublet">相连两个 <kbd>2</kbd></button>
+        <button data-label="cluster_3plus">3个以上 <kbd>3</kbd></button>
+        <button data-label="not_cell">非细胞 <kbd>4</kbd></button>
+      </div>
+    </article>
+  </template>
+
+  <script src="/assets/doublet-teach.js?v=20260730-first"></script>
+</body>
+</html>

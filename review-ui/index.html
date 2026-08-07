@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>细胞谱系审核台</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">96孔板 · T0 → T1 → T2 · <span id="currentRound">载入最新轮次…</span></div>
+      <h1>细胞谱系审核台</h1>
+    </div>
+    <div class="top-actions">
+      <div class="progress-copy"><b id="progressText">载入中…</b><small id="progressDetail"></small></div>
+      <div class="progress-track"><i id="progressBar"></i></div>
+      <a class="top-button" href="/auto-review">按孔快速审核</a>
+      <a class="top-button" href="/teach">快速教学</a>
+      <a class="top-button" href="/doublet-teach">相连双细胞教学</a>
+      <a class="top-button" href="/integrated-review">全量判定审核</a>
+      <button class="top-button" id="reloadQueue">刷新队列</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar">
+      <div class="sidebar-tools">
+        <label><span>搜索孔位或目标</span><input id="search" placeholder="例如 H6、B3"></label>
+        <div class="filter-row">
+          <button data-filter="all">全部</button>
+          <button class="active" data-filter="unreviewed">本轮未审核</button>
+          <button data-filter="reviewed">已审核</button>
+          <button data-filter="model_cell">模型细胞</button>
+          <button data-filter="model_debris">模型杂质</button>
+          <button data-filter="model_uncertain">模型待定</button>
+          <button data-filter="edge">近孔壁</button>
+        </div>
+      </div>
+      <div class="lineage-list" id="lineageList"></div>
+    </aside>
+
+    <main class="review-main">
+      <div class="empty-state" id="emptyState" hidden>当前筛选下没有候选。</div>
+      <div id="reviewContent" hidden>
+        <section class="case-header">
+          <div>
+            <div class="case-title"><span class="well-badge" id="wellBadge">—</span><h2 id="caseTitle">—</h2></div>
+            <p id="caseMeta"></p>
+            <div class="ai-banner" id="evidenceText">正在计算时序证据…</div>
+          </div>
+          <div class="header-actions">
+            <div class="legend">
+              <span><i class="cell-dot"></i>细胞</span><span><i class="debris-dot"></i>杂质</span>
+              <span><i class="irrelevant-dot"></i>无关</span><span><i class="pending-dot"></i>待定</span>
+            </div>
+            <button class="secondary-button" id="toggleViewMode">切换到谱系视野</button>
+            <button class="secondary-button" id="toggleSuppressed">显示孔壁低优先级候选</button>
+          </div>
+        </section>
+
+        <section class="metrics">
+          <div><b id="maxMove">—</b><span>最大配准后位移</span></div>
+          <div><b id="areaChange">—</b><span>T0→T2面积变化</span></div>
+          <div><b id="nearbyT1">—</b><span>T1邻近目标</span></div>
+          <div><b id="nearbyT2">—</b><span>T2邻近目标</span></div>
+        </section>
+
+        <section class="panels-grid">
+          <article class="time-panel" data-timepoint="T0">
+            <div class="panel-heading"><strong>T0 · 来源</strong><span id="metaT0"></span></div>
+            <div class="overview-row">
+              <button class="overview-map" data-whole="T0"><img id="overviewT0" alt="T0整孔"><i></i></button>
+              <div><b>整孔定位</b><small>点击查看整孔</small></div>
+            </div>
+            <div class="view-controls">
+              <span>局部视图</span>
+              <button data-view="zoomOut" data-tp="T0">−</button><b id="zoomT0">100%</b>
+              <button data-view="zoomIn" data-tp="T0">＋</button>
+              <button data-view="reset" data-tp="T0">复位</button>
+              <button data-view="markers" data-tp="T0">标记</button>
+            </div>
+            <div class="mark-tools" data-mark-tools="T0"><span>点击模式</span>
+              <button class="on pan" data-mode="pan">浏览/拖动</button><button data-mode="cell">＋细胞</button>
+              <button data-mode="debris">＋杂质</button><button data-mode="irrelevant">＋无关</button><button data-mode="uncertain">＋待定</button>
+            </div>
+            <div class="canvas-wrap"><canvas id="canvasT0" width="512" height="512"></canvas></div>
+            <div class="panel-actions">
+              <span>T0必须确认来源位置</span><div><button class="danger" data-clear="T0">清空</button> <button id="recenter">以此位置重新搜索</button></div>
+            </div>
+            <div class="object-review" id="objectsT0"></div>
+          </article>
+
+          <article class="time-panel" data-timepoint="T1">
+            <div class="panel-heading"><strong id="headingT1">T1 · 谱系内最密区域</strong><span id="metaT1"></span></div>
+            <div class="overview-row">
+              <button class="overview-map" data-whole="T1"><img id="overviewT1" alt="T1整孔"><i></i></button>
+              <div><b>整孔定位</b><small>点击查看整孔</small></div>
+            </div>
+            <div class="view-controls">
+              <span>局部视图</span>
+              <button data-view="zoomOut" data-tp="T1">−</button><b id="zoomT1">100%</b>
+              <button data-view="zoomIn" data-tp="T1">＋</button>
+              <button data-view="reset" data-tp="T1">复位</button>
+              <button data-view="markers" data-tp="T1">标记</button>
+            </div>
+            <div class="mark-tools" data-mark-tools="T1"><span>点击模式</span>
+              <button class="on pan" data-mode="pan">浏览/拖动</button><button data-mode="cell">＋细胞</button>
+              <button data-mode="debris">＋杂质</button><button data-mode="irrelevant">＋无关</button><button data-mode="uncertain">＋待定</button>
+            </div>
+            <div class="canvas-wrap"><canvas id="canvasT1" width="512" height="512"></canvas></div>
+            <div class="panel-actions">
+              <label><input id="presentT1" type="checkbox"> 此时点存在</label>
+              <button class="danger" data-clear="T1">清除</button>
+            </div>
+            <div class="object-review" id="objectsT1"></div>
+          </article>
+
+          <article class="time-panel" data-timepoint="T2">
+            <div class="panel-heading"><strong id="headingT2">T2 · 谱系内最密区域</strong><span id="metaT2"></span></div>
+            <div class="overview-row">
+              <button class="overview-map" data-whole="T2"><img id="overviewT2" alt="T2整孔"><i></i></button>
+              <div><b>整孔定位</b><small>点击查看整孔</small></div>
+            </div>
+            <div class="view-controls">
+              <span>局部视图</span>
+              <button data-view="zoomOut" data-tp="T2">−</button><b id="zoomT2">100%</b>
+              <button data-view="zoomIn" data-tp="T2">＋</button>
+              <button data-view="reset" data-tp="T2">复位</button>
+              <button data-view="markers" data-tp="T2">标记</button>
+            </div>
+            <div class="mark-tools" data-mark-tools="T2"><span>点击模式</span>
+              <button class="on pan" data-mode="pan">浏览/拖动</button><button data-mode="cell">＋细胞</button>
+              <button data-mode="debris">＋杂质</button><button data-mode="irrelevant">＋无关</button><button data-mode="uncertain">＋待定</button>
+            </div>
+            <div class="canvas-wrap"><canvas id="canvasT2" width="512" height="512"></canvas></div>
+            <div class="panel-actions">
+              <label><input id="presentT2" type="checkbox"> 此时点存在</label>
+              <button class="danger" data-clear="T2">清除</button>
+            </div>
+            <div class="object-review" id="objectsT2"></div>
+          </article>
+        </section>
+
+        <section class="review-grid">
+          <div class="review-card">
+            <div class="section-heading"><h3>链接审核</h3><span>防止误连邻近目标</span></div>
+            <div class="link-row"><div><b>T0 → T1 <span class="link-score" id="scoreT0T1">—</span></b><small>是否为同一来源目标</small><small class="link-reason" id="reasonT0T1"></small></div>
+              <div class="segmented" data-link="T0-T1"><button data-value="correct">正确</button><button data-value="wrong">错误</button><button class="on" data-value="uncertain">待定</button></div></div>
+            <div class="link-row"><div><b>T1 → T2 <span class="link-score" id="scoreT1T2">—</span></b><small>是否为连续谱系/分裂</small><small class="link-reason" id="reasonT1T2"></small></div>
+              <div class="segmented" data-link="T1-T2"><button data-value="correct">正确</button><button data-value="wrong">错误</button><button class="on" data-value="uncertain">待定</button></div></div>
+          </div>
+
+          <div class="review-card">
+            <div class="section-heading"><h3>整条谱系结论</h3><span>保存为训练标签</span></div>
+            <div class="verdict-options" id="finalLabels">
+              <button data-value="live_cell">活细胞</button><button data-value="dead_cell">死细胞</button>
+              <button data-value="cell_unknown">细胞（活死待定）</button>
+              <button data-value="debris">杂质/碎片</button><button data-value="irrelevant">无关目标</button>
+              <button class="on" data-value="uncertain">待定</button>
+            </div>
+            <div class="form-row">
+              <label>形态<select id="morphology"><option value="uncertain">待定</option><option value="cell_like">细胞样</option><option value="debris_like">杂质样</option></select></label>
+              <label>分裂<select id="division"><option value="unknown">待定</option><option value="none">未见分裂</option><option value="dividing">正在分裂</option><option value="divided">已经分裂</option></select></label>
+              <label>谱系<select id="lineageStatus"><option value="needs_review">待复核</option><option value="correct_lineage">链接正确</option><option value="debris_lineage">杂质谱系</option><option value="wrong_link">错误链接</option></select></label>
+              <label>把握<select id="reviewConfidence"><option value="medium">中</option><option value="high">高</option><option value="low">低/二审</option></select></label>
+            </div>
+            <div class="issue-block"><span>问题标签（可多选）</span><div id="issueTags">
+              <button data-value="split_duplicate">分裂/重复</button><button data-value="edge_false_positive">孔壁伪阳性</button>
+              <button data-value="missed_target">漏检</button><button data-value="large_motion_mismatch">大位移误链</button>
+              <button data-value="shape_mismatch">形态不匹配</button>
+            </div></div>
+            <div class="review-fields">
+              <label>审核人<input id="reviewer" value="local_user"></label>
+              <label>备注<textarea id="notes" placeholder="记录判断依据或二审问题"></textarea></label>
+            </div>
+            <div class="save-row"><span id="status"></span><button class="secondary-button" id="skip">跳过 J</button><button class="secondary-button" id="save">保存修改并下一个</button><button class="approve-all" id="approveAll">✓ 全部正确并下一个</button></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
+
+  <dialog id="wholeDialog">
+    <div class="viewer-header"><div><div class="eyebrow">整孔定位</div><h2 id="wholeTitle">—</h2></div><button id="closeWhole">×</button></div>
+    <div class="whole-tabs"><button data-whole-tab="T0">T0</button><button data-whole-tab="T1">T1</button><button data-whole-tab="T2">T2</button></div>
+    <div class="whole-image-wrap"><img id="wholeImage" alt="整孔图"><i id="wholeCrop"></i></div>
+    <p>青色方框表示当前局部搜索范围。整孔视图仅用于方向和位置确认，避免误把孔壁当细胞。</p>
+  </dialog>
+  <script src="/assets/app.js?v=20260731-motion-lineage-density"></script>
+</body>
+</html>

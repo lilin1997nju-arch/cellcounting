@@ -1,0 +1,16 @@
+base_config: configs/default.yaml
+
+# A12-22 is deliberately absent: it is the frozen external holdout used to
+# compare the pre- and post-optimization checkpoints.
+joint_training:
+  sources:
+    - name: QL11111_reviewed
+      config: configs/default.yaml
+      require_human_labels: true
+    - name: QL2202_reviewed
+      config: configs/ql2202_validation.yaml
+      require_human_labels: true
+    - name: QL2603_T1_1_reviewed
+      config: configs/ql2603_t1_1_validation.yaml
+      # T1-1 was fully audited; use only its persisted human review labels.
+      require_human_labels: true

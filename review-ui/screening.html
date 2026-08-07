@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>96孔板单细胞活性筛选</title>
+  <link rel="stylesheet" href="/assets/screening.css">
+  <link rel="stylesheet" href="/assets/late-growth.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">T0–T2孔级筛选 · T3/T4晚期生长快速门控</p>
+      <h1>96孔板单细胞活性筛选</h1>
+      <p>T3/T4只需判断孔内是否存在明显细胞生长；均无明显生长的孔直接跳过深度检索。</p>
+    </div>
+    <a class="audit-link" href="/auto-review">进入T0–T2按孔快速审核</a>
+  </header>
+
+  <main>
+    <section class="summary" id="summary"></section>
+    <section class="plate-panel">
+      <div class="section-head">
+        <div><p class="eyebrow dark">96孔板总览</p><h2>点击孔位查看判定和快速标记T3/T4</h2></div>
+        <div class="legend">
+          <span class="good">单细胞且有活性</span>
+          <span class="single">生长待确认</span>
+          <span class="multi">多细胞来源</span>
+          <span class="issue">需复核</span>
+          <span class="no-growth">晚期无生长</span>
+        </div>
+      </div>
+      <div id="plate" class="plate"></div>
+    </section>
+
+    <section id="wellDetail" class="well-detail hidden">
+      <div class="detail-head">
+        <div><p class="eyebrow dark">当前孔</p><h2 id="wellTitle">—</h2><p id="wellVerdict"></p></div>
+        <div class="detail-actions">
+          <button id="nextLateButton" class="secondary">下一个T3/T4待标孔</button>
+          <a id="openAudit" class="secondary" href="/auto-review">审核T0–T2标注</a>
+          <button id="rejectButton" class="reject">孔级判定不正确</button>
+          <button id="approveButton" class="approve">孔级判定全部正确</button>
+        </div>
+      </div>
+      <div id="timepointReport" class="timepoint-report"></div>
+    </section>
+
+    <section class="report-panel">
+      <div class="section-head">
+        <div><p class="eyebrow dark">正式结果预览</p><h2>单细胞来源且有生长活性的孔</h2></div>
+        <label><input id="approvedOnly" type="checkbox"> 仅显示已审核通过</label>
+      </div>
+      <div id="reportList" class="report-list"></div>
+    </section>
+  </main>
+  <div id="message" class="message">正在载入结果…</div>
+  <script src="/assets/screening.js"></script>
+</body>
+</html>

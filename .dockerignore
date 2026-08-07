@@ -1,0 +1,13 @@
+.git
+.venv
+__pycache__
+.pytest_cache
+.pytest-tmp
+*.pyc
+.env
+artifacts
+*.log
+src/cellvision_local.egg-info
+tests
+docs
+

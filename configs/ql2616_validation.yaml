@@ -1,0 +1,33 @@
+base_config: configs/default.yaml
+
+paths:
+  data_root: "E:/CM/20260622 QL2616"
+  artifact_root: "artifacts/validation/ql2616"
+
+experiment:
+  experiment_id: "QL2616-20260622"
+  plate_id: "QL2616_plate_1"
+  # T0-T4 are acquisition-order indices, not culture-day numbers.  The
+  # 2026-06-23 directory contains no well images and is intentionally skipped.
+  timepoint_aliases:
+    T0: ["22"]
+    T1: ["24"]
+    T2: ["02"]
+    T3: ["08"]
+  timepoint_directories:
+    T0: "2026/06/22"
+    T1: "2026/06/24"
+    T2: "2026/07/02"
+    T3: "2026/07/08"
+
+morphology_classifier:
+  excluded_wells: ["A1"]
+  reuse_candidate_manifest: true
+
+dense_detection:
+  include_manual_anchors: false
+
+review_queue:
+  excluded_wells: ["A1"]
+  apply_manual_point_overrides: false
+  carry_forward_previous_reviews: false

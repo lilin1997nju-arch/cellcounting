@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>全量细胞与杂质判定审核</title>
+  <link rel="stylesheet" href="/assets/teach.css">
+  <link rel="stylesheet" href="/assets/integrated-review.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">QL11111 · T0 / T1 / T2 · 全训练集联合判定</p>
+      <h1>细胞、相连细胞与杂质审核</h1>
+      <p class="subtitle">这里会同时展示模型已成功判定和不确定的对象。点“判定正确”即可确认，也可直接改判。</p>
+    </div>
+    <div class="top-actions">
+      <a href="/" class="secondary">96孔板筛选报告</a>
+      <a href="/doublet-teach" class="secondary">相连细胞教学</a>
+      <button id="trainButton" class="train">用审核结果重训并更新孔级判定</button>
+    </div>
+  </header>
+
+  <section class="status-strip integrated-stats">
+    <div><b id="roundId">—</b><span>当前联合判定轮次</span></div>
+    <div><b id="reviewableCount">0</b><span>本轮待审核对象</span></div>
+    <div><b id="cellCount">0</b><span>细胞对象</span></div>
+    <div><b id="debrisCount">0</b><span>杂质</span></div>
+    <div><b id="uncertainCount">0</b><span>待定</span></div>
+    <div><b id="reviewedCount">0</b><span>已审核</span></div>
+    <div><b id="growthCount">0</b><span>确认生长的孔</span></div>
+    <div><b id="singleOriginCount">0</b><span>单细胞来源孔</span></div>
+  </section>
+
+  <main>
+    <section class="toolbar">
+      <div class="mode-tabs">
+        <button class="active" data-mode="all">全部判定</button>
+        <button data-mode="cell">所有细胞</button>
+        <button data-mode="doublet">相连两个</button>
+        <button data-mode="debris">杂质</button>
+        <button data-mode="uncertain">待定</button>
+        <button data-mode="reviewed">已审核</button>
+      </div>
+      <div class="toolbar-right">
+        <label>每批
+          <select id="pageSize">
+            <option>20</option>
+            <option selected>40</option>
+            <option>60</option>
+            <option>100</option>
+          </select>
+        </label>
+        <button id="reloadButton" class="secondary local-secondary">换一批</button>
+      </div>
+    </section>
+
+    <section class="keyboard-help">
+      <span><kbd>Space</kbd> 判定正确</span>
+      <span><kbd>1</kbd> 单个细胞</span>
+      <span><kbd>2</kbd> 相连两个</span>
+      <span><kbd>3</kbd> 3个以上</span>
+      <span><kbd>4</kbd> 杂质</span>
+      <span><kbd>5</kbd> 无效/无关物</span>
+      <span><kbd>6</kbd> 无法判定</span>
+      <strong id="message">正在加载本轮结果…</strong>
+    </section>
+
+    <section class="guidance">
+      <b>审核原则：</b>
+      只标记细胞和杂质；孔壁、光晕及无关结构改为“无效”。死细胞不能凭单张图直接判断，先按细胞形态确认，最终由 T0–T2 的位移与分裂信息判定。
+    </section>
+
+    <section id="grid" class="teaching-grid integrated-grid"></section>
+    <div id="empty" class="empty" hidden>这一类别已经没有未审核对象。</div>
+  </main>
+
+  <template id="tileTemplate">
+    <article class="tile audit-tile" tabindex="0">
+      <div class="image-wrap">
+        <img alt="候选对象局部图">
+        <span class="index-badge"></span>
+        <span class="prediction"></span>
+        <i class="size-ring"></i>
+      </div>
+      <div class="tile-meta">
+        <div>
+          <b class="well"></b>
+          <small class="candidate"></small>
+        </div>
+        <div class="confidence"></div>
+      </div>
+      <div class="prob-bars">
+        <span class="morph-probs"></span>
+        <span class="count-probs"></span>
+      </div>
+      <button class="approve" data-action="approve">✓ 判定正确 <kbd>Space</kbd></button>
+      <div class="label-buttons integrated-buttons">
+        <button data-label="single">单个 <kbd>1</kbd></button>
+        <button data-label="touching_doublet">相连2个 <kbd>2</kbd></button>
+        <button data-label="cluster_3plus">3个以上 <kbd>3</kbd></button>
+        <button data-label="debris">杂质 <kbd>4</kbd></button>
+        <button data-label="invalid">无效 <kbd>5</kbd></button>
+        <button data-label="uncertain">待定 <kbd>6</kbd></button>
+      </div>
+    </article>
+  </template>
+
+  <script src="/assets/integrated-review.js?v=20260731-full-audit"></script>
+</body>
+</html>

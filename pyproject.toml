@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cellvision-local"
+version = "0.1.0"
+description = "Offline multi-timepoint 96-well cell screening"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0",
+  "pandas>=2.2",
+  "Pillow>=10.0",
+  "PyYAML>=6.0",
+  "tifffile>=2025.0",
+  "scipy>=1.14",
+  "scikit-image>=0.24",
+  "torch>=2.5",
+  "torchvision>=0.20",
+  "fastapi>=0.115",
+  "pydantic>=2.9",
+  "uvicorn>=0.32",
+  "psutil>=6.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+cellvision = "cellvision.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

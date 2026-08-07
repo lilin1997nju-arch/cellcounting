@@ -1,0 +1,26 @@
+services:
+  cellvision:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8777:8777"
+    env_file:
+      - ../.env
+    environment:
+      CELLVISION_HOST: 0.0.0.0
+      CELLVISION_PORT: 8777
+      CELLVISION_ALLOW_REMOTE: "1"
+    volumes:
+      - ${CELLVISION_DATA_VOLUME:-E:/CM/data}:/data:ro
+      - ${CELLVISION_ARTIFACT_VOLUME:-E:/CM/cellvision-artifacts}:/artifacts
+      - ${CELLVISION_MODEL_VOLUME:-E:/CM/cellvision-models}:/models:ro
+      - ${CELLVISION_DB_VOLUME:-E:/CM/cellvision-db}:/db
+      - ${CELLVISION_LOG_VOLUME:-E:/CM/cellvision-logs}:/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8777/api/ready', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+

@@ -1,0 +1,37 @@
+base_config: configs/default.yaml
+
+paths:
+  data_root: "E:/CM/20260629 A12-22"
+  artifact_root: "artifacts/training/a12_22"
+
+experiment:
+  experiment_id: "A12-22-20260629"
+  plate_id: "A12-22_plate_1"
+  timepoint_aliases:
+    T0: ["29"]
+    T1: ["30"]
+    T2: ["01"]
+    T3: ["06"]
+    T4: ["13"]
+  timepoint_directories:
+    T0: "2026/06/29"
+    T1: "2026/06/30"
+    T2: "2026/07/01"
+    T3: "2026/07/06"
+    T4: "2026/07/13"
+
+morphology_classifier:
+  excluded_wells: ["A1"]
+  reuse_candidate_manifest: true
+
+dense_detection:
+  # A12-22 is evaluated from automatic proposals only. Historical manual
+  # missed-object anchors remain archived but must not seed this review round.
+  include_manual_anchors: false
+
+review_queue:
+  excluded_wells: ["A1"]
+  # Every A12-22 model-evaluation round must start from model predictions.
+  # Historical human labels remain stored but are not prefilled in the new UI.
+  carry_forward_previous_reviews: false
+  apply_manual_point_overrides: false

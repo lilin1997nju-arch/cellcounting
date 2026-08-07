@@ -1,0 +1,5 @@
+# Put this behind the laboratory VPN or internal network only.
+cellvision.lab.example {
+    reverse_proxy 127.0.0.1:8777
+}
+

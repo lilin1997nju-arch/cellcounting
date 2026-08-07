@@ -1,0 +1,49 @@
+:root{--ink:#19282e;--muted:#718086;--paper:#f3f0e8;--card:#fff;--line:#d8d3c8;--teal:#167d78;--green:#198f69;--orange:#c96b35;--purple:#76559a;--red:#ae4236;--shadow:0 10px 28px rgba(32,43,46,.11)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}
+button,a,select{font:inherit}
+button,a{transition:.16s ease}
+button{cursor:pointer}
+.topbar{display:flex;align-items:center;justify-content:space-between;padding:18px 28px;background:#15343a;color:#fff;border-bottom:4px solid #d7a84b}
+.eyebrow{margin:0 0 3px;color:#b9d4d3;font-size:12px;letter-spacing:.12em;text-transform:uppercase}
+h1{margin:0;font:700 30px/1.1 Georgia,"Microsoft YaHei",serif}
+.subtitle{margin:6px 0 0;color:#d8e5e5}
+.top-actions{display:flex;gap:10px;align-items:center}
+.top-actions a,.top-actions button,.secondary{border:1px solid #9ba9aa;border-radius:6px;padding:9px 14px;text-decoration:none}
+.top-actions .secondary{color:#fff;border-color:#6e8b8e;background:transparent}
+.train{border:0!important;background:#e4b451;color:#263437;font-weight:800}
+.status-strip{display:grid;grid-template-columns:repeat(4,minmax(105px,1fr)) minmax(230px,2fr);gap:1px;background:#cfd2cc;border-bottom:1px solid #bdc2ba}
+.status-strip>div{padding:12px 20px;background:#fff}
+.status-strip b{display:block;font-size:21px}
+.status-strip span{color:var(--muted);font-size:12px}
+.model-state{background:#e9f3f2!important}
+.model-state b{font-size:15px;color:#146f6a}
+main{padding:18px 24px 40px}
+.toolbar{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-bottom:10px}
+.mode-tabs{display:flex;gap:6px;flex-wrap:wrap}
+.mode-tabs button,.toolbar-right button,.toolbar select{border:1px solid #bfc6c3;background:#fff;border-radius:5px;padding:8px 12px;color:#425359}
+.mode-tabs button.active{background:var(--teal);border-color:var(--teal);color:#fff;font-weight:700}
+.mode-tabs button:disabled{opacity:.45;cursor:not-allowed}
+.toolbar-right{display:flex;align-items:center;gap:10px;color:var(--muted)}
+.keyboard-help{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:16px;padding:9px 12px;border:1px solid #d7d2c6;border-radius:6px;background:#ebe7dd;color:#536267}
+kbd{display:inline-block;min-width:20px;padding:1px 5px;border:1px solid #acb3b1;border-bottom-width:2px;border-radius:4px;background:#fff;color:#27383d;font:700 11px/1.5 Consolas,monospace;text-align:center}
+#message{margin-left:auto;color:#176c68;font-weight:600}
+.teaching-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:13px}
+.tile{overflow:hidden;border:2px solid transparent;border-radius:8px;background:var(--card);box-shadow:0 3px 12px rgba(44,52,51,.08);outline:none}
+.tile:hover{transform:translateY(-1px);box-shadow:var(--shadow)}
+.tile.focused{border-color:#d29e34;box-shadow:0 0 0 3px rgba(210,158,52,.18),var(--shadow)}
+.tile.saved{opacity:.34;transform:scale(.98);pointer-events:none}
+.image-wrap{position:relative;aspect-ratio:1;background:#20292c;overflow:hidden}
+.image-wrap img{display:block;width:100%;height:100%;object-fit:cover;image-rendering:auto}
+.index-badge,.probability{position:absolute;top:8px;padding:3px 7px;border-radius:4px;background:rgba(14,26,29,.78);color:#fff;font-size:11px}
+.index-badge{left:8px}.probability{right:8px}
+.tile-meta{display:flex;align-items:center;justify-content:space-between;padding:8px 9px 5px}
+.tile-meta b{display:block;font-size:16px}.tile-meta small{display:block;max-width:145px;overflow:hidden;text-overflow:ellipsis;color:var(--muted);white-space:nowrap}
+.similar{border:1px solid #a9bab8;border-radius:4px;background:#eef6f5;color:#246b68;padding:4px 7px;font-size:11px}
+.label-buttons{display:grid;grid-template-columns:repeat(3,1fr);gap:5px;padding:5px 8px 9px}
+.label-buttons button{border:1px solid #ccd2cf;border-radius:4px;background:#fff;padding:6px 4px;font-size:11px}
+.label-buttons button[data-label="cell"]:hover{background:#dff4eb;border-color:#70b99b;color:#126b50}
+.label-buttons button[data-label="debris"]:hover{background:#fae8dd;border-color:#d99b77;color:#91451d}
+.label-buttons button[data-label="invalid"]:hover{background:#ece5f3;border-color:#ab91c4;color:#61417f}
+.empty{padding:70px;text-align:center;color:var(--muted);font-size:17px}
+@media(max-width:900px){.status-strip{grid-template-columns:repeat(3,1fr)}.topbar{align-items:flex-start;gap:20px}.teaching-grid{grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}}

@@ -1,0 +1,10 @@
+.multiplicity-stats{grid-template-columns:repeat(5,minmax(95px,1fr)) minmax(250px,1.8fr)}
+.guidance{margin:0 0 14px;padding:10px 13px;border-left:4px solid #d6a43f;background:#fff8e8;color:#5f5339}
+.multiplicity-buttons{grid-template-columns:repeat(2,1fr)}
+.multiplicity-buttons button[data-label="single"]:hover{background:#e4f5ee;border-color:#73b99d;color:#17694f}
+.multiplicity-buttons button[data-label="touching_doublet"]:hover{background:#fff0cf;border-color:#d8a43c;color:#805d18}
+.multiplicity-buttons button[data-label="cluster_3plus"]:hover{background:#e9e4f4;border-color:#9c86bf;color:#594277}
+.multiplicity-buttons button[data-label="not_cell"]:hover{background:#f5e3df;border-color:#c9897c;color:#7b3930}
+.tile-meta .measure{text-align:right;color:#65757a;font-size:11px;white-space:nowrap}
+.size-ring{position:absolute;left:50%;top:50%;border:1.5px solid rgba(242,190,69,.9);border-radius:50%;transform:translate(-50%,-50%);box-shadow:0 0 0 1px rgba(20,34,36,.35)}
+@media(max-width:900px){.multiplicity-stats{grid-template-columns:repeat(3,1fr)}}

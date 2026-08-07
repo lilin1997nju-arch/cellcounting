@@ -1,0 +1,352 @@
+paths:
+  data_root: "E:/CM/QL11111"
+  artifact_root: "artifacts"
+
+experiment:
+  experiment_id: "QL11111"
+  plate_id: "QL11111_plate_1"
+  plate_rows: "ABCDEFGH"
+  plate_columns: 12
+  timepoint_aliases:
+    T0: ["04", "D0", "day0", "0"]
+    T1: ["05", "D1", "day1", "1"]
+    T2: ["06", "D2", "day2", "2"]
+    # T0-T4 are acquisition-order indices, not culture-day labels.  The
+    # fourth available session (day 14 here) is therefore T3.
+    T3: ["18", "D14", "day14", "14"]
+
+calibration:
+  resolution_um_per_pixel: 2.08
+  value_is_default_until_verified: false
+
+candidate_filter:
+  # Instrument-wall structures are never review candidates. Human cell anchors
+  # remain exempt so a reviewer can still preserve a real cell touching wall.
+  wall_band_start_fraction: 0.42
+  hard_wall_exclusion_fraction: 0.44
+  directional_wall_anisotropy: 0.60
+  wall_chain_neighbor_radius_px: 110
+  # Three co-radial neighbours cleanly separated reviewed wall chains from
+  # reviewed cells in the current round; two would remove genuine cells.
+  wall_chain_min_neighbors: 3
+
+hierarchical_suppression:
+  # Instance consolidation is adaptive: exact cross-source hits are merged,
+  # while adjacent independent singles remain separate. Group objects own the
+  # single-cell cores inside their footprint and are counted only once.
+  minimum_group_confidence: 0.58
+  single_diameter_reference_px: 8.0
+  doublet_radius_scale: 2.0
+  cluster_radius_scale: 2.8
+  maximum_radius_px: 96.0
+  duplicate_minimum_radius_px: 4.0
+  single_duplicate_diameter_fraction: 0.42
+  single_duplicate_maximum_px: 9.0
+  cross_source_radius_bonus_px: 2.0
+  group_duplicate_diameter_fraction: 0.60
+  group_duplicate_maximum_px: 28.0
+  debris_duplicate_diameter_fraction: 0.45
+  debris_duplicate_maximum_px: 12.0
+  # A CF connected component is treated as the full available instance mask.
+  # Local raw/residual peaks inside its buffered footprint inherit the same
+  # instance id even when their centre distance narrowly exceeds NMS.
+  component_assignment_minimum_px: 6.0
+  component_assignment_diameter_scale: 0.75
+  component_assignment_margin_px: 3.0
+  component_assignment_maximum_px: 16.0
+  component_maximum_area_px: 1200
+  component_maximum_diameter_px: 48
+
+temporal_appearance:
+  # Static morphology is intentionally retained. Only ambiguous 50--70% cases
+  # may be corrected using registered T0/T1/T2 pixel and contour evidence.
+  enabled: true
+  cell_probability_minimum: 0.50
+  cell_probability_maximum: 0.70
+  search_radius_px: 96
+  division_radius_px: 44
+  patch_size_px: 56
+  minimum_match_score: 0.34
+  static_patch_similarity: 0.86
+  static_mask_iou: 0.72
+  static_area_log_tolerance: 0.25
+  static_debris_probability_minimum: 0.22
+  dynamic_area_ratio: 1.32
+  dynamic_maximum_mask_iou: 0.68
+
+review_overrides:
+  # Human-confirmed correction: H6 has one T0 cell and two touching T1 cells.
+  H6:
+    T1:
+      primary_count: 2
+      use_all_detected_candidates: false
+
+split:
+  unit_preference: ["experiment_batch", "plate", "well"]
+  train_fraction: 0.70
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  seed: 20260729
+
+runtime:
+  device: "auto"
+  num_workers: 0
+  mixed_precision: true
+  offline: true
+
+late_growth:
+  # Dense late images only need a reliable growth conclusion; fine instance
+  # contours remain enabled for sparse/ambiguous views.
+  precise_v2_max_counting_instances: 96
+  precise_v2_max_cell_units: 160
+  # T3/T4 are evaluated independently from the T0-T2 audit table. The search
+  # stops as soon as a clear count increase is confirmed near high-confidence
+  # T0-T2 cells; otherwise it expands and finally checks the whole well.
+  anchor_confidence: 0.82
+  stage_radii_px: [450, 850]
+  stage_candidate_quotas: [160, 280, 480]
+  minimum_added_cells: 2
+  minimum_growth_ratio: 1.5
+  minimum_cell_probability: 0.78
+  minimum_instance_confidence: 0.58
+  # Dense late colonies are a region-level event, not a set of separable T0
+  # instances. These gates compare the strict well interior against T2.
+  dense_tile_size_px: 384
+  dense_minimum_foreground_fraction: 0.008
+  dense_minimum_foreground_delta: 0.006
+  dense_minimum_foreground_ratio: 1.8
+  dense_minimum_candidate_ratio: 1.5
+  dense_minimum_tile_foreground_fraction: 0.025
+  # The full V2 late detector may represent a contiguous colony as several
+  # touching/cluster instances. Treat a locally dense group as a region-level
+  # growth event instead of relying on an unstable exact cell count.
+  dense_minimum_local_instances: 8
+  dense_minimum_local_units: 12
+  dense_minimum_local_clusters: 2
+  # Override with CELLVISION_SHARED_MODEL_ROOT on a server. Relative paths
+  # resolve against the application root, which keeps local and deployed
+  # configurations identical.
+  shared_model_root: "artifacts"
+
+joint_training:
+  sources:
+    - name: QL11111_reviewed
+      config: configs/default.yaml
+      # Automatically skipped when QL11111 itself is the primary source, but
+      # included when training is launched from another plate's audit page.
+      require_human_labels: true
+    - name: QL2202_reviewed
+      config: configs/ql2202_validation.yaml
+      require_human_labels: true
+    - name: A12_22_review_queue
+      config: configs/a12_22_training.yaml
+      # This source becomes supervised training data as soon as its first
+      # audit is saved; unreviewed model predictions are never self-trained.
+      require_human_labels: true
+
+morphology_classifier:
+  # T0/T1/T2 from all 96 QL11111 wells are used for training. There is no
+  # internal validation split; a separate queue must be used for evaluation.
+  patch_size_px: 96
+  epochs: 30
+  batch_size: 64
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  max_patches_per_class: 12000
+  max_patches_per_well_per_class: 220
+  # A1 is a dense positive control and was explicitly excluded from annotation.
+  excluded_wells: ["A1"]
+  reuse_candidate_manifest: true
+  candidate_extraction_workers: 4
+  num_workers: 0
+  seed: 20260729
+
+review_queue:
+  excluded_wells: ["A1"]
+  max_candidates_per_well: 8
+  # The quick per-well audit receives model-positive cells plus a small
+  # uncertain band. Static morphology is never used to infer live/dead status.
+  model_cell_probability_min: 0.25
+  model_debris_probability_min: 0.80
+  model_max_candidates_per_well: 4
+  auto_invalid_wall_start_fraction: 0.42
+  auto_invalid_wall_anisotropy: 0.55
+  auto_invalid_wall_chain_anisotropy: 0.40
+  minimum_foreground_fraction: 0.001
+  minimum_confidence: 0.65
+  significant_displacement_um: 20.0
+  prefer_candidate_sources: ["cf_component", "instrument_csv"]
+
+teaching:
+  crop_size_px: 128
+  feature_batch_size: 96
+  epochs: 180
+  learning_rate: 0.003
+  seed: 20260730
+  # Balance every morphology class within every timepoint so later, denser
+  # cultures cannot hide the same single-object misses seen most clearly at T0.
+  timepoint_class_balance: true
+  timepoint_knn_blend: 0.40
+
+auto_annotation:
+  cell_threshold: 0.90
+  debris_threshold: 0.88
+  # Selected on the frozen A12-22 validation audit. The retrained model's
+  # debris scores are better calibrated below the former 0.92 cutoff.
+  formal_debris_threshold: 0.75
+  invalid_threshold: 0.92
+  max_review_per_well: 12
+  temporal_search_radius_px: 80
+  temporal_division_radius_px: 55
+
+temporal_completion:
+  # High-confidence cells seed both forward and backward searches. The lower
+  # threshold only expands the candidate pool; automatic relabeling still
+  # requires temporal, morphology, and ambiguity agreement.
+  anchor_cell_probability: 0.82
+  anchor_integrated_confidence: 0.82
+  search_radii_px: [96, 192, 384, 768]
+  existing_match_radius_px: 640
+  maximum_anchor_motion_px: 1400
+  distance_score_scale_px: 300
+  automatic_promotion_score: 0.78
+  review_score: 0.58
+  ambiguity_margin: 0.10
+  strong_debris_probability: 0.72
+  strong_debris_extra_threshold: 0.10
+  invalid_extra_threshold: 0.06
+  invalid_cell_probability_floor: 0.12
+  minimum_area_px: 8
+  maximum_area_px: 1200
+  passes: 2
+
+multiplicity:
+  epochs: 260
+  # Selected on the frozen A12-22 validation audit to recover reviewed
+  # touching-cell classes without accepting low-confidence morphology calls.
+  automatic_threshold: 0.425
+  search_radii_px: [160, 320, 640, 1200]
+  minimum_link_confidence: 0.58
+  link_distance_scale_px: 1600
+  link_ambiguity_scale_px: 140
+  first_division_radius_px: 140
+  growth_confirmation_radius_px: 1600
+
+debris_tracking:
+  # Debris may drift. T2 uses the T0→T1 motion vector as a prediction, and the
+  # final global search is accepted only when morphology and ambiguity agree.
+  search_radii_px: [180, 360, 720, 1200]
+  minimum_link_confidence: 0.56
+  link_distance_scale_px: 1600
+  link_ambiguity_scale_px: 140
+
+dense_detection:
+  reuse_unchanged_stage: true
+  maximum_peaks_per_image: 320
+  minimum_peak_distance_px: 7
+  # Candidate generation is recall-first inside the well. The physical wall is
+  # detected per image and never competes for the global peak budget.
+  response_percentile: 98.4
+  interior_response_percentile: 96.5
+  wall_buffer_response_percentile: 98.0
+  # Percentiles alone force proposals even in empty textured fields. Reviewed
+  # dense cells/debris start well above these floors, while blank-field peaks
+  # cluster below 12. CF components and manual anchors are unaffected.
+  minimum_interior_peak_response: 18.0
+  minimum_wall_buffer_peak_response: 20.0
+  duplicate_radius_px: 7
+  rebuild_timepoints: ["T0", "T1", "T2"]
+  multiscale_contrast_weight: 0.70
+  dynamic_wall_mask_enabled: true
+  wall_profile_target_size_px: 768
+  wall_search_start_fraction: 0.38
+  wall_search_end_fraction: 0.49
+  wall_profile_rise_fraction: 0.28
+  wall_profile_minimum_peak_ratio: 3.0
+  wall_fallback_inner_fraction: 0.44
+  wall_minimum_inner_fraction: 0.405
+  wall_maximum_inner_fraction: 0.46
+  # Real cells may touch the inner wall, so this band remains searchable but
+  # receives a bounded share of proposals.
+  wall_cell_buffer_width_fraction: 0.028
+  wall_buffer_candidate_fraction: 0.16
+  # A very small cell-shaped rescue stream protects reviewed cells whose
+  # centers overlap the physical rim. Arc-like peaks fail the Hessian test.
+  wall_rescue_candidate_fraction: 0.06
+  wall_rescue_width_fraction: 0.03
+  wall_rescue_response_percentile: 98.8
+  minimum_wall_rescue_peak_response: 28.0
+  wall_rescue_minimum_blobness: 0.34
+  # Structure-aware wall channel.  The annular wall is unwrapped, its slowly
+  # varying tangential background is subtracted, and only compact residuals
+  # are proposed.  This preserves cells overlapping the rim without admitting
+  # the continuous wall itself.
+  wall_residual_enabled: true
+  wall_residual_inside_fraction: 0.045
+  wall_residual_outside_fraction: 0.035
+  wall_residual_maximum_fraction: 0.47
+  wall_residual_angular_samples: 4096
+  wall_residual_tangential_sigma: 10.0
+  wall_residual_minimum_response: 40.0
+  wall_residual_candidate_quota: 24
+  wall_residual_radial_window: 11
+  wall_residual_angular_window: 7
+  candidate_grid_divisions: 8
+  coverage_peaks_per_tile: 2
+
+# V2 inference is tiered: hard-invalid texture does not enter the expensive
+# segmenter, while likely cells retain full narrow-band contour refinement.
+v2_inference:
+  reuse_unchanged_stage: true
+  hard_invalid_skip_threshold: 0.60
+  precise_contour_cell_probability: 0.12
+  precise_contour_labels: ["single", "touching_doublet", "cluster_3plus", "uncertain"]
+  precise_contour_sources: ["manual_cell_anchor", "manual_annotation_anchor", "wall_cell_rescue_peak", "wall_residual_peak"]
+
+v2_temporal_model:
+  maximum_correspondence_distance_px: 128
+  division_correspondence_radius_px: 88
+  object_descriptor_size_px: 48
+  # Object crops are recentered before comparison, so a 5x5 local search is
+  # sufficient and halves the former 7x7 comparison cost.
+  object_descriptor_maximum_shift_px: 2
+  object_identity_threshold: 0.58
+  object_static_similarity_threshold: 0.82
+  # A focus/halo change may lower one adjacent pair while the full object and
+  # its shape remain stable across all three frames.
+  object_static_minimum_pair_similarity: 0.72
+  object_static_minimum_shape_similarity: 0.90
+  minimum_foreground_quality: 0.30
+  static_maximum_area_ratio: 1.65
+  # A clean >=80% cell observation may support an ambiguous matched frame.
+  # Quality and correspondence gates prevent weak/duplicate/wall candidates
+  # from becoming propagation anchors.
+  temporal_cell_anchor_threshold: 0.80
+  temporal_cell_anchor_maximum_invalid_probability: 0.20
+  temporal_cell_anchor_minimum_instance_confidence: 0.55
+  temporal_cell_anchor_minimum_objectness: 0.70
+  temporal_cell_anchor_maximum_wall_overlap: 0.85
+  temporal_cell_anchor_minimum_path_confidence: 0.72
+  temporal_debris_anchor_threshold: 0.90
+  temporal_debris_consensus_threshold: 0.35
+  temporal_cell_consensus_threshold: 0.65
+  suspected_dead_cell_morphology_threshold: 0.80
+  debris_consensus_logit: 1.30
+  cell_consensus_logit: 1.30
+  base_high_confidence_threshold: 0.90
+  temporal_ambiguity_minimum_cell_probability: 0.25
+  temporal_ambiguity_maximum_cell_probability: 0.75
+  # Three-frame foreground stability is deliberately strong debris evidence.
+  three_frame_static_debris_logit: 2.60
+  # Two-frame stability is weak debris evidence; three-frame stability remains
+  # the strong criterion because two similar frames can still be a viable cell.
+  two_frame_static_debris_logit: 0.35
+  growth_cell_logit: 3.20
+  cell_anchor_logit: 3.10
+  debris_anchor_logit: 2.20
+  change_cell_logit: 0.55
+  temporal_cell_decision_threshold: 0.62
+  temporal_debris_decision_threshold: 0.62
+  static_wall_overlap_threshold: 0.90
+  static_wall_maximum_motion_px: 5
+  static_wall_maximum_area_ratio: 2.20

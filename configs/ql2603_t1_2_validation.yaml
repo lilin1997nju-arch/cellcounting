@@ -1,0 +1,56 @@
+base_config: configs/default.yaml
+
+paths:
+  data_root: "E:/CM/20260623 QL2603"
+  artifact_root: "artifacts/validation/ql2603_t1_2"
+
+experiment:
+  experiment_id: "QL2603-T1-2-validation"
+  plate_id: "QL2603_T1-2"
+  # The validation run intentionally contains only the first three sessions.
+  timepoint_directories:
+    T0: "E:/CM/20260623 QL2603/2026/06/23/2026-06-23 12-50-54"
+    T1: "E:/CM/20260623 QL2603/2026/06/24/2026-06-24 09-00-47"
+    T2: "E:/CM/20260623 QL2603/2026/06/25/2026-06-25 08-47-28"
+
+morphology_classifier:
+  excluded_wells: ["A1"]
+  reuse_candidate_manifest: false
+
+dense_detection:
+  include_manual_anchors: false
+  reuse_unchanged_stage: false
+
+v2_inference:
+  reuse_unchanged_stage: false
+
+review_queue:
+  excluded_wells: ["A1"]
+  apply_manual_point_overrides: false
+
+joint_training:
+  sources: []
+
+# Review-only images are appended in memory by the review service. They never
+# enter candidate generation, instance inference, or temporal inference.
+review:
+  late_timepoint_directories:
+    T3: "E:/CM/20260623 QL2603/2026/06/30/2026-06-30 12-54-42"
+    T4: "E:/CM/20260623 QL2603/2026/07/07/2026-07-07 10-22-26"
+  timepoint_display_names:
+    T0: "T0"
+    T1: "T1"
+    T2: "T2"
+    T3: "Day7"
+    T4: "Day14"
+  day14_overlay:
+    downsample: 4
+    minimum_component_coverage_pct: 1.0
+    minimum_radius_px: 40.0
+    minimum_mean_distance_px: 10.0
+
+gated_report:
+  group_id: "QL2603 T1-2"
+  day14_csv: "artifacts/day14_screening/ql2603/ql2603_day14_well_screening.csv"
+  sessions_csv: "artifacts/ingest/ql2603_sessions.csv"
+  output_dir: "artifacts/gated_screening/ql2603_t1_2"

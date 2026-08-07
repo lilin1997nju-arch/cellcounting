@@ -1,0 +1,67 @@
+base_config: configs/default.yaml
+
+algorithm:
+  version: v2
+
+v2_instance_segmentation:
+  enabled: true
+  patch_size_px: 96
+  seed_sigma_px: 4.0
+  maximum_instance_area_px: 1800
+  maximum_training_samples: 6000
+  base_channels: 16
+  epochs: 10
+  batch_size: 32
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  wall_loss_weight: 0.45
+  presence_loss_weight: 0.70
+  threshold: 0.50
+  wall_threshold: 0.50
+  presence_threshold: 0.55
+  seed: 20260802
+  # Incremental fine-tuning preserves the already learned cell/debris boundary.
+  initial_checkpoint: artifacts/v2/models/latest_instance_segmenter.pt
+  reuse_training_cache: false
+  training_sources:
+    - configs/default.yaml
+    - configs/ql2202_validation.yaml
+    - configs/ql2603_t1_1_validation.yaml
+    - configs/ql2603_t1_2_validation.yaml
+  excluded_external_validation_sources:
+    - configs/a12_22_training.yaml
+
+v2_temporal_model:
+  enabled: true
+  patch_size_px: 64
+  same_object_threshold: 0.80
+  static_similarity_threshold: 0.75
+  base_high_confidence_threshold: 0.90
+  temporal_logit_beta: 2.0
+  maximum_probability_shift: 0.30
+  maximum_correspondence_distance_px: 128
+  # This threshold is only used after all three instances overlap the wall,
+  # match within 5 px, and have a stable area. Ordinary objects still use 0.75.
+  static_wall_similarity_threshold: 0.70
+  static_wall_overlap_threshold: 0.90
+  static_wall_maximum_motion_px: 5
+  static_wall_maximum_area_ratio: 2.20
+  epochs: 80
+  batch_size: 16
+  learning_rate: 0.0008
+  training_sources:
+    - configs/default.yaml
+    - configs/ql2202_validation.yaml
+    - configs/ql2603_t1_1_validation.yaml
+    - configs/ql2603_t1_2_validation.yaml
+
+v2_review_performance:
+  initial_image_size_px: 1400
+  high_resolution_size_px: 4096
+  high_resolution_zoom_threshold: 2.5
+  disk_image_cache: true
+  browser_cache_seconds: 31536000
+
+v2_well_growth:
+  # Intentionally unchanged in V2. Existing V1 screening remains authoritative.
+  mode: preserve_v1

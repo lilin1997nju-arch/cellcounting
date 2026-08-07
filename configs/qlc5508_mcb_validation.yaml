@@ -1,0 +1,34 @@
+base_config: configs/default.yaml
+
+paths:
+  # Validation is intentionally restricted to the first three acquisition
+  # sessions.  The later 2026-07-03 session is outside this data root and is
+  # therefore never imported as T3/T4.
+  data_root: "E:/CM/20260616 QLC5508 MCB/2026/06"
+  artifact_root: "artifacts/validation/qlc5508_mcb"
+
+experiment:
+  experiment_id: "QLC5508-MCB-20260616"
+  plate_id: "QLC5508_MCB_plate_1"
+  timepoint_aliases:
+    T0: ["16"]
+    T1: ["17"]
+    T2: ["18"]
+
+morphology_classifier:
+  excluded_wells: ["A1"]
+  reuse_candidate_manifest: true
+
+dense_detection:
+  # Validation predictions remain independent of human point annotations, and
+  # review database writes therefore do not invalidate the dense-stage cache.
+  include_manual_anchors: false
+
+review_queue:
+  excluded_wells: ["A1"]
+  apply_manual_point_overrides: false
+
+# Keep this run inference-only.  Human corrections can be admitted as a new
+# training source only after the validation review is complete.
+joint_training:
+  sources: []

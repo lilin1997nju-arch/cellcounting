@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>按孔快速审核</title>
+  <link rel="stylesheet" href="assets/teach.css">
+  <link rel="stylesheet" href="assets/auto-review.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">T0 / T1 / T2 · 全目标审核</p>
+      <h1>按孔快速审核</h1>
+      <p class="subtitle">同一孔三个时间点并排显示；逐个确认细胞、粘连细胞、杂质与待定目标。</p>
+    </div>
+    <div class="top-actions">
+      <button id="plateReportButton" class="secondary" type="button">96孔板结果</button>
+      <button id="newRoundButton" class="train">用本轮结果训练并生成下一轮</button>
+    </div>
+  </header>
+
+  <section class="status-strip quick-stats">
+    <div><b id="roundId">—</b><span>当前轮次</span></div>
+    <div><b id="wellProgress">0 / 0</b><span>已完成孔</span></div>
+    <div><b id="objectProgress">0 / 0</b><span>已审核目标</span></div>
+    <div><b id="correctedCount">0</b><span>已纠正目标</span></div>
+    <div class="model-state">
+      <b id="currentWellState">等待载入</b>
+      <span id="currentWellDetail">选择一个孔开始审核</span>
+    </div>
+  </section>
+
+  <main class="quick-layout">
+    <aside class="well-sidebar">
+      <div class="sidebar-search">
+        <label for="wellSearch">搜索孔位</label>
+        <input id="wellSearch" placeholder="例如 H6">
+        <label for="wellTypeFilter" class="type-filter-label">孔类型</label>
+        <select id="wellTypeFilter">
+          <option value="all">全部类型</option>
+          <option value="single_active">单细胞有活性</option>
+          <option value="single_growth_unconfirmed">生长待确认</option>
+          <option value="multi_origin">多细胞来源</option>
+          <option value="missing_t0_or_late_object">T0缺失/后期出现</option>
+          <option value="no_cell_growth">后期无明显生长</option>
+          <option value="no_cell">未检出细胞</option>
+          <option value="ambiguous">判定不明确</option>
+        </select>
+      </div>
+      <div class="mode-tabs well-tabs">
+        <button class="active" data-mode="pending">待审核</button>
+        <button data-mode="reviewed">已完成</button>
+        <button data-mode="all">全部</button>
+      </div>
+      <div id="wellList" class="well-list"></div>
+    </aside>
+
+    <section class="review-workspace">
+      <div class="workspace-toolbar">
+        <div>
+          <p class="eyebrow dark">当前孔</p>
+          <h2 id="wellTitle">—</h2>
+        </div>
+        <div class="legend">
+          <span class="legend-single">单细胞</span>
+          <span class="legend-doublet">粘连2细胞</span>
+          <span class="legend-cluster">3+细胞团</span>
+          <span class="legend-dead">疑似死细胞</span>
+          <span class="legend-debris">杂质</span>
+          <span class="legend-uncertain">待定</span>
+        </div>
+        <label class="marker-size">标记大小
+          <input id="markerScale" type="range" min="70" max="180" value="110">
+        </label>
+      </div>
+
+      <section id="lateTimepointSection" class="late-timepoint-section" hidden>
+        <div class="late-section-heading">
+          <div><p class="eyebrow dark">第一行 · 生长证据</p><h3>Day7 / Day14 生长情况</h3></div>
+          <p>Day7默认定位细胞较多区域；Day14用半透明阴影和轮廓标出生长区域。均可放大和拖动。</p>
+        </div>
+        <div id="lateTimepointGrid" class="late-timepoint-grid"></div>
+      </section>
+
+      <section class="early-timepoint-section">
+        <div class="late-section-heading early-section-heading">
+          <div><p class="eyebrow dark">第二行 · 来源审核</p><h3>T0～T2 细胞、杂质与待定目标</h3></div>
+          <p>保持现有完整实例审核方式；保存后同步重算该孔在96孔报告中的结论。</p>
+        </div>
+        <div id="timepointGrid" class="timepoint-grid"></div>
+      </section>
+
+      <section id="selectionEditor" class="selection-editor empty-selection">
+        <div class="selected-preview">
+          <img id="selectedPatch" alt="选中目标局部图">
+        </div>
+        <div class="selected-copy">
+          <p class="eyebrow dark">选中目标</p>
+          <h3 id="selectedTitle">点击图中的标记进行判定</h3>
+          <p id="selectedDetail">每个标记均可修改分类；标记圈根据目标实际直径绘制。</p>
+          <div class="probability-row" id="selectedProbabilities"></div>
+          <div class="diameter-control" id="diameterControl" hidden>
+            <span>标记直径</span>
+            <button id="diameterDown">−</button>
+            <b id="diameterValue">12 px</b>
+            <button id="diameterUp">＋</button>
+          </div>
+        </div>
+        <div class="class-buttons">
+          <button data-label="single"><kbd>1</kbd> 单细胞</button>
+          <button data-label="touching_doublet"><kbd>2</kbd> 粘连2细胞</button>
+          <button data-label="cluster_3plus"><kbd>3</kbd> 3+细胞团</button>
+          <button data-label="debris"><kbd>4</kbd> 杂质/碎片</button>
+          <button data-label="uncertain"><kbd>5</kbd> 待定</button>
+          <button data-label="invalid" class="invalid-button"><kbd>0</kbd> 无关/误检</button>
+        </div>
+      </section>
+
+      <section class="keyboard-help quick-help">
+        <span>滚轮/按钮高清放大，拖动查看附近区域</span>
+        <span>点“＋漏检”后在图中点击新增目标</span>
+        <span>选中标记后按 <kbd>1–5</kbd> 改类</span>
+        <span><kbd>0</kbd> 排除误检</span>
+        <span><kbd>Enter</kbd> 保存修正并下一个</span>
+        <strong id="message">正在载入最新结果…</strong>
+      </section>
+
+      <footer class="review-actions">
+        <button id="resetButton" class="secondary light">撤销本孔修改</button>
+        <button id="approveButton" class="approve-well">✓ 本孔全部预测正确并下一个</button>
+        <button id="saveButton" class="save-well">保存修正并下一个</button>
+      </footer>
+    </section>
+  </main>
+
+  <template id="timepointTemplate">
+    <article class="timepoint-card">
+      <header>
+        <div>
+          <strong class="timepoint-name"></strong>
+          <span class="timepoint-count"></span>
+        </div>
+        <div class="timepoint-summary">
+          <span class="timepoint-breakdown"></span>
+          <div class="view-controls">
+            <button class="zoom-out" title="缩小">−</button>
+            <b class="zoom-value">100%</b>
+            <button class="zoom-in" title="放大">＋</button>
+            <button class="reset-view">复位</button>
+            <button class="add-missed">＋漏检</button>
+          </div>
+        </div>
+      </header>
+      <div class="image-stage">
+        <img class="well-image" alt="">
+        <canvas class="object-overlay"></canvas>
+        <div class="image-loading">载入图像…</div>
+      </div>
+      <div class="late-growth-actions" hidden>
+        <button data-growth="obvious_growth">明显生长</button>
+        <button data-growth="no_growth">无明显生长</button>
+        <button data-growth="uncertain">无法判断</button>
+      </div>
+    </article>
+  </template>
+
+  <dialog id="plateDialog" class="plate-dialog">
+    <form method="dialog" class="plate-dialog-shell">
+      <header>
+        <div><p class="eyebrow dark">96孔板结果</p><h2>点击孔位切换到对应审核界面</h2></div>
+        <button class="dialog-close" value="close" aria-label="关闭">×</button>
+      </header>
+      <div class="plate-dialog-legend">
+        <span data-status="single_active">单细胞有活性</span>
+        <span data-status="single_growth_unconfirmed">生长待确认</span>
+        <span data-status="multi_origin">多细胞来源</span>
+        <span data-status="no_cell_growth">无明显生长</span>
+        <span data-status="ambiguous">需复核</span>
+        <span data-status="positive_control">阳性对照</span>
+      </div>
+      <div id="plateDialogGrid" class="plate-dialog-grid"></div>
+    </form>
+  </dialog>
+
+  <script src="assets/auto-review.js?v=20260806-growth-layout-v1"></script>
+</body>
+</html>
