@@ -60,8 +60,10 @@ from .review_image_cache import render_review_image, review_image_cache_path
 from .decode import inspect_tiff
 from .gated_screening import build_gated_plate_report
 from .v2_mask_review import (
+    create_model_comparison_round,
     create_mask_review_round,
     list_mask_review_rounds,
+    mask_comparison_options,
     mask_review_candidate,
     mask_review_candidates,
     mask_review_summary,
@@ -815,6 +817,13 @@ class MaskReviewSavePayload(BaseModel):
     reviewed_mask_rle: str | None = None
     reviewer: str = "local_user"
     notes: str = ""
+
+
+class MaskComparisonPayload(BaseModel):
+    old_checkpoint: str | None = None
+    new_checkpoint: str | None = None
+    source_configs: list[str] = Field(default_factory=list)
+    round_id: str | None = None
 
 
 def _ensure_schema_columns(connection: sqlite3.Connection) -> None:
@@ -2172,6 +2181,26 @@ def create_app(
     @app.get("/api/mask-review-rounds")
     def mask_review_rounds() -> list[dict[str, Any]]:
         return list_mask_review_rounds(config, database)
+
+    @app.get("/api/mask-comparison-options")
+    def mask_comparison_options_api() -> dict[str, Any]:
+        try:
+            return mask_comparison_options(config, database)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/mask-comparison-round")
+    def mask_comparison_round_api(payload: MaskComparisonPayload) -> dict[str, Any]:
+        try:
+            return create_model_comparison_round(
+                config,
+                old_checkpoint=payload.old_checkpoint,
+                new_checkpoint=payload.new_checkpoint,
+                source_configs=payload.source_configs or None,
+                round_id=payload.round_id,
+            )
+        except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/mask-review-summary")
     def mask_review_summary_api(round_id: str) -> dict[str, Any]:
@@ -3571,11 +3600,35 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/patch")
-    def patch(well: str, timepoint: str, x: float, y: float, size: int = 256) -> Response:
-        selected = images_manifest[
-            (images_manifest["well"] == well.upper())
-            & (images_manifest["timepoint"] == timepoint.upper())
-            & (images_manifest["decode_status"] == "ok")
+    def patch(
+        well: str,
+        timepoint: str,
+        x: float,
+        y: float,
+        size: int = 256,
+        source_config: str | None = None,
+    ) -> Response:
+        image_manifest = images_manifest
+        if source_config:
+            try:
+                from .config import load_config
+
+                comparison_config = load_config(source_config)
+                comparison_manifest = (
+                    Path(comparison_config["paths"]["artifact_root"])
+                    / "manifests"
+                    / "images.csv"
+                )
+                if comparison_manifest.exists():
+                    image_manifest = pd.read_csv(comparison_manifest)
+            except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, pd.errors.ParserError):
+                image_manifest = None
+        if image_manifest is None:
+            raise HTTPException(status_code=503, detail="image manifest unavailable")
+        selected = image_manifest[
+            (image_manifest["well"] == well.upper())
+            & (image_manifest["timepoint"] == timepoint.upper())
+            & (image_manifest["decode_status"] == "ok")
         ]
         if selected.empty:
             raise HTTPException(status_code=404, detail="image unavailable")

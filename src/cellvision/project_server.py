@@ -46,7 +46,9 @@ from .review_summary import (
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
 from .v2_mask_review import (
+    create_model_comparison_round,
     list_mask_review_rounds,
+    mask_comparison_options,
     mask_review_candidate,
     mask_review_candidates,
     mask_review_summary,
@@ -417,6 +419,13 @@ class ProjectMaskReviewSavePayload(BaseModel):
     reviewed_mask_rle: str | None = None
     reviewer: str = "local_user"
     notes: str = ""
+
+
+class ProjectMaskComparisonPayload(BaseModel):
+    old_checkpoint: str | None = None
+    new_checkpoint: str | None = None
+    source_configs: list[str] = Field(default_factory=list)
+    round_id: str | None = None
 
 
 _DAY_RE = re.compile(r"^day\s*(?P<day>-?\d+)$", re.IGNORECASE)
@@ -843,6 +852,32 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             return []
         return list_mask_review_rounds(default_mask_config, default_mask_database)
 
+    @app.get("/api/mask-comparison-options")
+    def project_mask_comparison_options() -> dict[str, Any]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            return mask_comparison_options(default_mask_config, default_mask_database)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/mask-comparison-round")
+    def project_mask_comparison_round(
+        payload: ProjectMaskComparisonPayload,
+    ) -> dict[str, Any]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            return create_model_comparison_round(
+                default_mask_config,
+                old_checkpoint=payload.old_checkpoint,
+                new_checkpoint=payload.new_checkpoint,
+                source_configs=payload.source_configs or None,
+                round_id=payload.round_id,
+            )
+        except (FileNotFoundError, ValueError, OSError, RuntimeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.get("/api/mask-review-summary")
     def project_mask_review_summary(round_id: str) -> dict[str, Any]:
         if default_mask_config is None or default_mask_database is None:
@@ -910,14 +945,32 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
     @app.get("/api/patch")
     def project_mask_patch(
-        well: str, timepoint: str, x: float, y: float, size: int = 256
+        well: str,
+        timepoint: str,
+        x: float,
+        y: float,
+        size: int = 256,
+        source_config: str | None = None,
     ) -> Response:
-        if default_mask_images is None:
+        image_manifest = default_mask_images
+        if source_config:
+            try:
+                comparison_config = load_config(_resolve(source_config))
+                comparison_manifest = (
+                    Path(comparison_config["paths"]["artifact_root"])
+                    / "manifests"
+                    / "images.csv"
+                )
+                if comparison_manifest.exists():
+                    image_manifest = pd.read_csv(comparison_manifest)
+            except (FileNotFoundError, KeyError, OSError, TypeError, ValueError, pd.errors.ParserError):
+                image_manifest = None
+        if image_manifest is None:
             raise HTTPException(status_code=503, detail="image manifest unavailable")
-        selected = default_mask_images[
-            (default_mask_images["well"].astype(str).str.upper() == well.upper())
-            & (default_mask_images["timepoint"].astype(str).str.upper() == timepoint.upper())
-            & (default_mask_images["decode_status"].astype(str) == "ok")
+        selected = image_manifest[
+            (image_manifest["well"].astype(str).str.upper() == well.upper())
+            & (image_manifest["timepoint"].astype(str).str.upper() == timepoint.upper())
+            & (image_manifest["decode_status"].astype(str) == "ok")
         ]
         if selected.empty:
             raise HTTPException(status_code=404, detail="image unavailable")

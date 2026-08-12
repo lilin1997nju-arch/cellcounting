@@ -9,10 +9,14 @@
   const state = {
     rounds: [],
     roundId: "",
+    reviewMode: "p0",
+    comparisonOptions: null,
     candidates: [],
     currentIndex: -1,
     item: null,
     modelMask: new Uint8Array(SIZE * SIZE),
+    oldModelMask: new Uint8Array(SIZE * SIZE),
+    newModelMask: new Uint8Array(SIZE * SIZE),
     currentMask: new Uint8Array(SIZE * SIZE),
     editing: false,
     erasing: false,
@@ -30,6 +34,12 @@
     const element = $("message");
     element.textContent = message || "";
     element.classList.toggle("error", error);
+  }
+
+  function boundaryMessage() {
+    return state.reviewMode === "comparison"
+      ? "原图已加载。橙色为旧模型、黄色为新模型、绿色为当前审核边界。"
+      : "原图已加载。黄色为模型边界，绿色为当前审核边界。";
   }
 
   async function api(url, options) {
@@ -105,8 +115,23 @@
       overlay.data[index * 4 + 3] = 88;
     }
     ctx.putImageData(overlay, 0, 0);
-    drawBoundary(state.modelMask, "rgba(255, 209, 102, .95)", 1);
+    if (state.reviewMode === "comparison") {
+      drawBoundary(state.oldModelMask, "rgba(255, 140, 105, .98)", 1);
+      drawBoundary(state.newModelMask, "rgba(255, 209, 102, .98)", 1);
+    } else {
+      drawBoundary(state.modelMask, "rgba(255, 209, 102, .95)", 1);
+    }
     drawBoundary(state.currentMask, "rgba(66, 224, 189, .98)", 1);
+  }
+
+  function updateModeUi() {
+    const comparison = state.reviewMode === "comparison";
+    $("comparison-setup").hidden = !comparison;
+    $("accept-old-button").hidden = !comparison;
+    $("old-model-legend").hidden = !comparison;
+    $("new-model-legend").querySelector(".legend-model").hidden = false;
+    $("new-model-legend").lastChild.textContent = comparison ? "新模型边界" : "模型边界";
+    $("accept-button").textContent = comparison ? "采用新模型轮廓" : "接受模型轮廓";
   }
 
   function setEditMode(enabled) {
@@ -126,18 +151,20 @@
       $("accept-button").disabled = true;
       $("reject-button").disabled = true;
       $("save-button").disabled = true;
+      $("accept-old-button").disabled = true;
       return;
     }
     $("canvas-empty").style.display = "none";
     $("accept-button").disabled = false;
     $("reject-button").disabled = false;
     $("save-button").disabled = false;
+    $("accept-old-button").disabled = state.reviewMode !== "comparison";
     $("candidate-title").textContent = `${item.well} / ${item.timepoint} / ${item.candidate_id}`;
     $("decision-badge").textContent = item.decision === "pending" ? "待审核" : item.decision;
     const values = [
       ["模型类别", item.integrated_label],
-      ["模型置信度", Number(item.model_confidence).toFixed(3)],
-      ["模型面积", `${item.model_area_px} px²`],
+      [state.reviewMode === "comparison" ? "新模型置信度" : "模型置信度", Number(item.model_confidence).toFixed(3)],
+      [state.reviewMode === "comparison" ? "新模型面积" : "模型面积", `${item.model_area_px} px²`],
       ["当前面积", `${item.reviewed_area_px} px²`],
       ["细胞概率", Number(item.cell_probability).toFixed(3)],
       ["无效概率", Number(item.invalid_probability).toFixed(3)],
@@ -146,6 +173,12 @@
       ["P0 IoU", Number(item.refinement_iou).toFixed(3)],
       ["坐标", `(${Number(item.x_px).toFixed(1)}, ${Number(item.y_px).toFixed(1)})`],
     ];
+    if (state.reviewMode === "comparison") {
+      values.splice(3, 0,
+        ["旧模型面积", `${item.old_model_area_px ?? 0} px²`],
+        ["旧模型置信度", Number(item.old_model_confidence ?? 0).toFixed(3)],
+      );
+    }
     $("candidate-details").innerHTML = values.map(([label, value]) => `<div><dt>${label}</dt><dd>${value}</dd></div>`).join("");
     $("notes").value = item.notes || "";
   }
@@ -167,7 +200,10 @@
     state.candidates.forEach((candidate, index) => {
       const button = document.createElement("button");
       button.className = `queue-item ${index === state.currentIndex ? "selected" : ""}`;
-      button.innerHTML = `<span><span class="candidate-name">${candidate.well} · ${candidate.timepoint}</span><br><span class="candidate-meta">${candidate.candidate_id} · ${candidate.integrated_label} · ${candidate.model_area_px}px²</span></span><span class="candidate-status">${candidate.decision}</span>`;
+      const comparisonMeta = state.reviewMode === "comparison"
+        ? `旧 ${candidate.old_model_area_px ?? "?"} / 新 ${candidate.model_area_px ?? "?"}px²`
+        : `${candidate.model_area_px}px²`;
+      button.innerHTML = `<span><span class="candidate-name">${candidate.well} · ${candidate.timepoint}</span><br><span class="candidate-meta">${candidate.candidate_id} · ${candidate.integrated_label} · ${comparisonMeta}</span></span><span class="candidate-status">${candidate.decision}</span>`;
       button.addEventListener("click", () => selectCandidate(index));
       list.appendChild(button);
     });
@@ -203,7 +239,9 @@
     setMessage("加载对象…");
     try {
       state.item = await api(`/api/mask-review-candidate?round_id=${encodeURIComponent(state.roundId)}&candidate_id=${encodeURIComponent(candidate.candidate_id)}`);
-      state.modelMask = decodeRle(state.item.model_mask_rle);
+      state.oldModelMask = decodeRle(state.item.old_model_mask_rle || state.item.model_mask_rle);
+      state.newModelMask = decodeRle(state.item.new_model_mask_rle || state.item.model_mask_rle);
+      state.modelMask = state.newModelMask.slice();
       state.currentMask = decodeRle(state.item.reviewed_mask_rle || state.item.model_mask_rle);
       const imageRequestId = state.imageRequestId + 1;
       state.imageRequestId = imageRequestId;
@@ -212,7 +250,7 @@
         if (state.imageRequestId !== imageRequestId) return;
         sourceImage.hidden = false;
         drawCanvas();
-        setMessage("原图已加载。黄色为模型边界，绿色为当前审核边界。");
+        setMessage(boundaryMessage());
       };
       sourceImage.onerror = () => {
         if (state.imageRequestId !== imageRequestId) return;
@@ -220,12 +258,15 @@
         drawCanvas();
         setMessage("原图加载失败，但仍可审核 Mask；请检查当前板的图像清单或服务状态。", true);
       };
-      sourceImage.src = `${apiPath("/api/patch")}?well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}`;
+      const sourceQuery = state.item.source_config
+        ? `&source_config=${encodeURIComponent(state.item.source_config)}`
+        : "";
+      sourceImage.src = `${apiPath("/api/patch")}?well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}${sourceQuery}`;
       $("notes").value = state.item.notes || "";
       setEditMode(false);
       updateDetails();
       drawCanvas();
-      setMessage("已加载。黄色为模型边界，绿色为当前审核边界。");
+      setMessage(boundaryMessage());
     } catch (error) { setMessage(error.message, true); }
   }
 
@@ -302,12 +343,22 @@
   }
 
   async function loadRounds() {
-    state.rounds = await api("/api/mask-review-rounds");
+    const allRounds = await api("/api/mask-review-rounds");
+    state.rounds = allRounds.filter((round) => state.reviewMode === "comparison"
+      ? round.kind === "comparison"
+      : round.kind !== "comparison");
     const select = $("round-select");
     select.innerHTML = state.rounds.map((round) => `<option value="${round.round_id}">${round.round_id} · 待审 ${round.pending_count}</option>`).join("");
     if (!state.rounds.length) {
-      setMessage("尚未生成审核批次，请先运行 scripts/run_p0_mask_review.py。", true);
+      setMessage(state.reviewMode === "comparison" ? "尚未生成对比批次，请在上方选择留出样本并生成。" : "尚未生成审核批次，请先运行 scripts/run_p0_mask_review.py。", state.reviewMode !== "comparison");
+      state.roundId = "";
+      state.item = null;
+      state.candidates = [];
+      state.currentIndex = -1;
       updateDetails();
+      renderSummary({ pending_count: 0, accepted_count: 0, edited_count: 0, rejected_count: 0 });
+      renderQueue();
+      drawCanvas();
       return;
     }
     state.roundId = state.rounds[0].round_id;
@@ -322,14 +373,15 @@
   });
   $("status-select").addEventListener("change", () => loadQueue());
   $("refresh-button").addEventListener("click", () => loadRounds().catch((error) => setMessage(error.message, true)));
-  $("accept-button").addEventListener("click", () => { state.currentMask = state.modelMask.slice(); setEditMode(false); drawCanvas(); save("accepted"); });
+  $("accept-old-button").addEventListener("click", () => { state.currentMask = state.oldModelMask.slice(); setEditMode(false); drawCanvas(); save("edited"); });
+  $("accept-button").addEventListener("click", () => { state.currentMask = state.newModelMask.slice(); setEditMode(false); drawCanvas(); save("accepted"); });
   $("reject-button").addEventListener("click", () => { state.currentMask.fill(0); setEditMode(false); drawCanvas(); save("rejected"); });
   $("edit-button").addEventListener("click", () => setEditMode(!state.editing));
   $("brush-button").addEventListener("click", () => { state.erasing = false; $("brush-button").classList.add("active"); $("eraser-button").classList.remove("active"); setEditMode(true); });
   $("eraser-button").addEventListener("click", () => { state.erasing = true; $("eraser-button").classList.add("active"); $("brush-button").classList.remove("active"); setEditMode(true); });
   $("brush-size").addEventListener("input", (event) => { state.brushSize = Number(event.target.value); $("brush-size-value").textContent = String(state.brushSize); });
   $("fill-button").addEventListener("click", fillHoles);
-  $("reset-button").addEventListener("click", () => { if (!state.item) return; state.currentMask = state.modelMask.slice(); drawCanvas(); setMessage("已重置为模型 Mask。"); });
+  $("reset-button").addEventListener("click", () => { if (!state.item) return; state.currentMask = state.newModelMask.slice(); drawCanvas(); setMessage("已重置为新模型 Mask。"); });
   $("save-button").addEventListener("click", () => save());
   canvas.addEventListener("pointerdown", (event) => { if (!state.editing) return; state.drawing = true; canvas.setPointerCapture(event.pointerId); paint(event); });
   canvas.addEventListener("pointermove", (event) => { if (state.drawing) paint(event); });
@@ -344,6 +396,56 @@
     else if (event.key === "ArrowRight") { event.preventDefault(); selectCandidate(state.currentIndex + 1); }
   });
 
+  async function loadComparisonOptions() {
+    state.comparisonOptions = await api("/api/mask-comparison-options");
+    const checkpointSelect = $("comparison-checkpoint-select");
+    checkpointSelect.innerHTML = (state.comparisonOptions.new_candidates || [])
+      .map((item) => `<option value="${item.path}">${item.label}</option>`).join("");
+    const sourceSelect = $("comparison-source-select");
+    sourceSelect.innerHTML = (state.comparisonOptions.holdout_sources || [])
+      .map((item) => `<option value="${item.source_config}" ${item.predictions_available && item.images_available ? "selected" : "disabled"}>${item.label} · ${item.candidate_count}候选</option>`).join("");
+    $("comparison-description").textContent = state.comparisonOptions.new_checkpoint
+      ? `旧模型为生产 checkpoint；新模型默认为 ${state.comparisonOptions.new_candidates?.[0]?.label || "最近候选"}。`
+      : "没有找到可用的新模型候选。";
+  }
+
+  async function createComparisonRound() {
+    const sourceConfigs = Array.from($("comparison-source-select").selectedOptions).map((option) => option.value);
+    const newCheckpoint = $("comparison-checkpoint-select").value;
+    if (!sourceConfigs.length || !newCheckpoint) {
+      setMessage("请至少选择一个留出板位和一个新模型。", true);
+      return;
+    }
+    const button = $("create-comparison-button");
+    button.disabled = true;
+    setMessage("正在对留出板位运行新旧模型，完成后会自动进入审核队列……");
+    try {
+      const result = await api("/api/mask-comparison-round", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_checkpoint: newCheckpoint, source_configs: sourceConfigs }),
+      });
+      state.roundId = result.round_id;
+      await loadRounds();
+      $("round-select").value = state.roundId;
+      setMessage(`对比批次已生成：${result.round_id}，共 ${result.candidate_count} 个可审核对象。`);
+    } catch (error) {
+      setMessage(error.message, true);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  $("review-mode").addEventListener("change", async (event) => {
+    state.reviewMode = event.target.value;
+    state.currentIndex = -1;
+    updateModeUi();
+    if (state.reviewMode === "comparison") await loadComparisonOptions();
+    await loadRounds();
+  });
+  $("create-comparison-button").addEventListener("click", () => createComparisonRound());
+
+  updateModeUi();
   drawCanvas();
   loadRounds().catch((error) => setMessage(error.message, true));
 })();

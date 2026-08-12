@@ -17,7 +17,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import artifact_path
+from .config import PROJECT_ROOT, artifact_path, load_config
 from .v2_instance_inference import (
     _contour,
     _rle,
@@ -141,7 +141,19 @@ def _read_round_frame(
     config: dict[str, Any], round_id: str, *, reviewed: bool = False
 ) -> pd.DataFrame:
     key = "reviewed_predictions" if reviewed else "pre_temporal_predictions"
-    path = _manifest_file(config, round_id, key)
+    manifest = load_mask_review_manifest(config, round_id)
+    value = manifest.get(key)
+    # Comparison rounds are assembled from two isolated inference outputs and
+    # use the combined reviewed file as their single review input.  Keep this
+    # fallback so older comparison manifests remain readable as well.
+    if not value and manifest.get("kind") == "comparison" and not reviewed:
+        value = manifest.get("reviewed_predictions")
+    if not value:
+        raise ValueError(f"mask review manifest is missing {key}")
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = round_directory(config, round_id) / path
+    path = path.resolve()
     if not path.exists():
         raise FileNotFoundError(f"mask review predictions are missing: {path}")
     return pd.read_csv(path, low_memory=False)
@@ -203,7 +215,10 @@ def _row_payload(
     mask_size: int,
 ) -> dict[str, Any]:
     candidate_id = str(row.get("candidate_id", ""))
-    model_rle = str(row.get("v2_mask_rle", "[]"))
+    is_comparison = "comparison_old_mask_rle" in row.index
+    model_rle = str(
+        row.get("comparison_new_mask_rle", row.get("v2_mask_rle", "[]"))
+    )
     decision = str(record.get("decision", "pending")) if record else "pending"
     reviewed_rle = str(record.get("reviewed_mask_rle", model_rle)) if record else model_rle
     payload: dict[str, Any] = {
@@ -216,13 +231,33 @@ def _row_payload(
         "integrated_confidence": _number(row.get("integrated_confidence")),
         "cell_probability": _number(row.get("cell_probability")),
         "invalid_probability": _number(row.get("invalid_probability")),
-        "model_mask_valid": _bool_value(row.get("v2_mask_valid", False)),
-        "model_area_px": int(round(_number(row.get("v2_instance_area_px")))),
-        "model_diameter_px": _number(row.get("v2_instance_diameter_px")),
-        "model_confidence": _number(row.get("v2_instance_confidence")),
-        "refinement_status": str(row.get("v2_refinement_status", "")),
-        "refinement_area_ratio": _number(row.get("v2_refinement_area_ratio"), 1.0),
-        "refinement_iou": _number(row.get("v2_refinement_iou"), 1.0),
+        "model_mask_valid": _bool_value(
+            row.get("comparison_new_mask_valid", row.get("v2_mask_valid", False))
+        ),
+        "model_area_px": int(
+            round(
+                _number(
+                    row.get("comparison_new_area_px", row.get("v2_instance_area_px"))
+                )
+            )
+        ),
+        "model_diameter_px": _number(
+            row.get("comparison_new_diameter_px", row.get("v2_instance_diameter_px"))
+        ),
+        "model_confidence": _number(
+            row.get("comparison_new_confidence", row.get("v2_instance_confidence"))
+        ),
+        "refinement_status": str(
+            row.get("comparison_new_refinement_status", row.get("v2_refinement_status", ""))
+        ),
+        "refinement_area_ratio": _number(
+            row.get("comparison_new_refinement_area_ratio", row.get("v2_refinement_area_ratio")),
+            1.0,
+        ),
+        "refinement_iou": _number(
+            row.get("comparison_new_refinement_iou", row.get("v2_refinement_iou")),
+            1.0,
+        ),
         "mask_origin_x": int(round(_number(row.get("v2_mask_origin_x")))),
         "mask_origin_y": int(round(_number(row.get("v2_mask_origin_y")))),
         "mask_size": mask_size,
@@ -235,6 +270,22 @@ def _row_payload(
         "reviewed_diameter_px": _number(record.get("reviewed_diameter_px"))
         if record
         else _number(row.get("v2_instance_diameter_px")),
+        "comparison": is_comparison,
+        "source_config": str(row.get("comparison_source_config", ""))
+        if is_comparison
+        else "",
+        "old_model_area_px": int(round(_number(row.get("comparison_old_area_px"))))
+        if is_comparison
+        else 0,
+        "new_model_area_px": int(round(_number(row.get("comparison_new_area_px"))))
+        if is_comparison
+        else 0,
+        "old_model_confidence": _number(row.get("comparison_old_confidence"))
+        if is_comparison
+        else 0.0,
+        "new_model_confidence": _number(row.get("comparison_new_confidence"))
+        if is_comparison
+        else 0.0,
     }
     if include_masks:
         payload["model_mask_rle"] = model_rle
@@ -245,6 +296,25 @@ def _row_payload(
             if record
             else str(row.get("v2_contour_json", "[]"))
         )
+        if is_comparison:
+            payload.update(
+                {
+                    "old_model_mask_rle": str(row.get("comparison_old_mask_rle", "[]")),
+                    "new_model_mask_rle": model_rle,
+                    "old_model_area_px": int(round(_number(row.get("comparison_old_area_px")))),
+                    "new_model_area_px": int(round(_number(row.get("comparison_new_area_px")))),
+                    "old_model_confidence": _number(row.get("comparison_old_confidence")),
+                    "new_model_confidence": _number(row.get("comparison_new_confidence")),
+                    "old_model_refinement_status": str(
+                        row.get("comparison_old_refinement_status", "")
+                    ),
+                    "new_model_refinement_status": str(
+                        row.get("comparison_new_refinement_status", "")
+                    ),
+                    "old_checkpoint": str(row.get("comparison_old_checkpoint", "")),
+                    "new_checkpoint": str(row.get("comparison_new_checkpoint", "")),
+                }
+            )
     return {key: _json_value(value) for key, value in payload.items()}
 
 
@@ -317,6 +387,7 @@ def mask_review_summary(
         counts[decision] = counts.get(decision, 0) + 1
     return {
         "round_id": str(round_id),
+        "kind": str(manifest.get("kind", "mask_review")),
         "created_at": manifest.get("created_at"),
         "checkpoint": manifest.get("checkpoint"),
         "algorithm_version": manifest.get("algorithm_version"),
@@ -342,6 +413,204 @@ def list_mask_review_rounds(
         except (FileNotFoundError, ValueError, OSError):
             continue
     return sorted(output, key=lambda item: str(item.get("created_at", "")), reverse=True)
+
+
+def _resolve_repo_path(value: str | Path) -> Path:
+    candidate = Path(str(value)).expanduser()
+    return candidate.resolve() if candidate.is_absolute() else (PROJECT_ROOT / candidate).resolve()
+
+
+def _comparison_holdout_sources() -> list[dict[str, Any]]:
+    training_config_path = PROJECT_ROOT / "configs" / "v2_training.yaml"
+    training_config = load_config(training_config_path)
+    sources: list[dict[str, Any]] = []
+    for source_value in training_config.get("validation_holdout_sources", []) or []:
+        source_path = _resolve_repo_path(source_value)
+        if not source_path.exists():
+            continue
+        source_config = load_config(source_path)
+        artifact_root = Path(source_config["paths"]["artifact_root"])
+        predictions = artifact_root / "predictions" / "latest_integrated_predictions.csv"
+        images = artifact_root / "manifests" / "images.csv"
+        sources.append(
+            {
+                "source_config": str(source_path),
+                "label": str(source_config.get("experiment", {}).get("experiment_id", source_path.stem)),
+                "plate_id": str(source_config.get("experiment", {}).get("plate_id", source_path.stem)),
+                "predictions_available": predictions.exists(),
+                "images_available": images.exists(),
+                "candidate_count": int(len(pd.read_csv(predictions, low_memory=False)))
+                if predictions.exists()
+                else 0,
+            }
+        )
+    return sources
+
+
+def _comparison_checkpoints() -> dict[str, Any]:
+    old = PROJECT_ROOT / "artifacts" / "v2" / "models" / "latest_instance_segmenter.pt"
+    candidates = sorted(
+        (
+            path
+            for path in (PROJECT_ROOT / "artifacts" / "v2" / "runs").glob(
+                "v2-instance-*/model.pt"
+            )
+            if path.exists() and path.resolve() != old.resolve()
+        ),
+        key=lambda path: path.stat().st_mtime_ns,
+        reverse=True,
+    )
+    return {
+        "old_checkpoint": str(old.resolve()),
+        "old_available": old.exists(),
+        "new_candidates": [
+            {"path": str(path.resolve()), "label": path.parent.name}
+            for path in candidates[:10]
+        ],
+        "new_checkpoint": str(candidates[0].resolve()) if candidates else "",
+    }
+
+
+def mask_comparison_options(
+    config: dict[str, Any], database: str | Path
+) -> dict[str, Any]:
+    rounds = [
+        item
+        for item in list_mask_review_rounds(config, database)
+        if item.get("kind") == "comparison"
+    ]
+    checkpoints = _comparison_checkpoints()
+    return {
+        "holdout_sources": _comparison_holdout_sources(),
+        "old_checkpoint": checkpoints["old_checkpoint"],
+        "old_available": checkpoints["old_available"],
+        "new_candidates": checkpoints["new_candidates"],
+        "new_checkpoint": checkpoints["new_checkpoint"],
+        "rounds": rounds,
+    }
+
+
+def create_model_comparison_round(
+    config: dict[str, Any],
+    *,
+    old_checkpoint: str | Path | None = None,
+    new_checkpoint: str | Path | None = None,
+    source_configs: list[str] | None = None,
+    round_id: str | None = None,
+) -> dict[str, Any]:
+    """Create an isolated old/new checkpoint comparison review round."""
+
+    sources = _comparison_holdout_sources()
+    allowed = {str(item["source_config"]): item for item in sources}
+    selected_paths = source_configs or list(allowed)
+    selected = [
+        allowed[str(_resolve_repo_path(value))]
+        for value in selected_paths
+        if str(_resolve_repo_path(value)) in allowed
+    ]
+    if not selected:
+        raise ValueError("no configured validation holdout sources are available")
+
+    checkpoints = _comparison_checkpoints()
+    old_path = _resolve_repo_path(old_checkpoint or checkpoints["old_checkpoint"])
+    new_path = _resolve_repo_path(new_checkpoint or checkpoints["new_checkpoint"])
+    if not old_path.exists():
+        raise FileNotFoundError(f"old comparison checkpoint is missing: {old_path}")
+    if not new_path.exists():
+        raise FileNotFoundError(f"new comparison checkpoint is missing: {new_path}")
+    if old_path.resolve() == new_path.resolve():
+        raise ValueError("old and new comparison checkpoints must be different")
+
+    if round_id is None:
+        round_id = "model-comparison-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    round_dir = round_directory(config, round_id)
+    combined: list[pd.DataFrame] = []
+    source_manifests: list[dict[str, Any]] = []
+    for source in selected:
+        source_config_path = Path(source["source_config"])
+        source_config = load_config(source_config_path)
+        artifact_root = Path(source_config["paths"]["artifact_root"])
+        predictions_path = artifact_root / "predictions" / "latest_integrated_predictions.csv"
+        if not predictions_path.exists():
+            continue
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", source_config_path.stem)
+        old_output = round_dir / f"{slug}-old-v2.csv"
+        old_pre_temporal = round_dir / f"{slug}-old-v2-pre-temporal.csv"
+        old_summary = round_dir / f"{slug}-old-v2.json"
+        new_output = round_dir / f"{slug}-new-v2.csv"
+        new_pre_temporal = round_dir / f"{slug}-new-v2-pre-temporal.csv"
+        new_summary = round_dir / f"{slug}-new-v2.json"
+        infer_v2_instances(
+            source_config,
+            old_path,
+            predictions_path=predictions_path,
+            output_path=old_output,
+            pre_temporal_output_path=old_pre_temporal,
+            summary_path=old_summary,
+        )
+        infer_v2_instances(
+            source_config,
+            new_path,
+            predictions_path=predictions_path,
+            output_path=new_output,
+            pre_temporal_output_path=new_pre_temporal,
+            summary_path=new_summary,
+        )
+        old_frame = pd.read_csv(old_output, low_memory=False)
+        old_frame["candidate_id"] = old_frame["candidate_id"].astype(str)
+        old_frame = old_frame.set_index("candidate_id")
+        new_frame = pd.read_csv(new_output, low_memory=False)
+        new_frame["candidate_id"] = new_frame["candidate_id"].astype(str)
+        visible = _reviewable_frame(new_frame).copy()
+        if visible.empty:
+            continue
+        old_frame = old_frame.reindex(visible["candidate_id"].astype(str))
+        visible["comparison_old_mask_rle"] = old_frame["v2_mask_rle"].fillna("[]").to_numpy()
+        visible["comparison_old_mask_valid"] = old_frame["v2_mask_valid"].fillna(False).to_numpy()
+        visible["comparison_old_area_px"] = old_frame["v2_instance_area_px"].fillna(0).to_numpy()
+        visible["comparison_old_diameter_px"] = old_frame["v2_instance_diameter_px"].fillna(0).to_numpy()
+        visible["comparison_old_confidence"] = old_frame["v2_instance_confidence"].fillna(0).to_numpy()
+        visible["comparison_old_refinement_status"] = old_frame["v2_refinement_status"].fillna("").to_numpy()
+        visible["comparison_old_refinement_area_ratio"] = old_frame["v2_refinement_area_ratio"].fillna(0).to_numpy()
+        visible["comparison_old_refinement_iou"] = old_frame["v2_refinement_iou"].fillna(0).to_numpy()
+        visible["comparison_new_mask_rle"] = visible["v2_mask_rle"]
+        visible["comparison_new_mask_valid"] = visible["v2_mask_valid"]
+        visible["comparison_new_area_px"] = visible["v2_instance_area_px"]
+        visible["comparison_new_diameter_px"] = visible["v2_instance_diameter_px"]
+        visible["comparison_new_confidence"] = visible["v2_instance_confidence"]
+        visible["comparison_new_refinement_status"] = visible["v2_refinement_status"]
+        visible["comparison_source_config"] = str(source_config_path.resolve())
+        visible["comparison_source_id"] = slug
+        visible["comparison_old_checkpoint"] = str(old_path.resolve())
+        visible["comparison_new_checkpoint"] = str(new_path.resolve())
+        combined.append(visible)
+        source_manifests.append({**source, "candidate_count": int(len(visible))})
+
+    if not combined:
+        raise RuntimeError("comparison inference produced no reviewable candidates")
+    frame = _ensure_review_columns(pd.concat(combined, ignore_index=True, sort=False))
+    reviewed = round_dir / "reviewed_v2_predictions.csv"
+    _atomic_write_csv(frame, reviewed)
+    manifest = {
+        "round_id": str(round_id),
+        "kind": "comparison",
+        "created_at": _now_text(),
+        "algorithm_version": "v2-model-comparison-review-20260812",
+        "mask_size": MASK_SIZE,
+        "old_checkpoint": str(old_path.resolve()),
+        "new_checkpoint": str(new_path.resolve()),
+        "source_configs": [item["source_config"] for item in source_manifests],
+        "sources": source_manifests,
+        # The comparison frame already contains the new-model output plus the
+        # old-model columns, so it is the authoritative review input for both
+        # candidate listing and persistence.
+        "pre_temporal_predictions": str(reviewed.resolve()),
+        "reviewed_predictions": str(reviewed.resolve()),
+        "candidate_count": int(len(frame)),
+        "valid_instance_count": int(frame["v2_mask_valid"].map(_bool_value).sum()),
+    }
+    _atomic_write_json(manifest, round_dir / "manifest.json")
+    return manifest
 
 
 def _decode_valid_rle(value: str | None, size: int) -> tuple[str, np.ndarray]:
