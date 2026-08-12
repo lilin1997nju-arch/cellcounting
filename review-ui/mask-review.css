@@ -79,8 +79,11 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .canvas-card, .detail-card { border: 1px solid var(--border); border-radius: 12px; background: rgba(20, 28, 40, .78); }
 .canvas-card { padding: 15px; }
 .canvas-title-row { padding-bottom: 10px; }
-.canvas-wrap { display: grid; place-items: center; min-height: min(70vh, 700px); border-radius: 8px; background: #070a0f; background-image: linear-gradient(45deg, #0d131d 25%, transparent 25%), linear-gradient(-45deg, #0d131d 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #0d131d 75%), linear-gradient(-45deg, transparent 75%, #0d131d 75%); background-size: 24px 24px; background-position: 0 0, 0 12px, 12px -12px, -12px 0; overflow: hidden; }
-#mask-canvas { width: min(70vh, 680px); height: min(70vh, 680px); image-rendering: pixelated; image-rendering: crisp-edges; cursor: crosshair; }
+.canvas-wrap { position: relative; display: grid; place-items: center; min-height: min(70vh, 700px); border-radius: 8px; background: #070a0f; background-image: linear-gradient(45deg, #0d131d 25%, transparent 25%), linear-gradient(-45deg, #0d131d 25%, transparent 25%), linear-gradient(45deg, transparent 75%, #0d131d 75%), linear-gradient(-45deg, transparent 75%, #0d131d 75%); background-size: 24px 24px; background-position: 0 0, 0 12px, 12px -12px, -12px 0; overflow: hidden; }
+#source-image, #mask-canvas { grid-area: 1 / 1; width: min(70vh, 680px); height: min(70vh, 680px); }
+#source-image { display: block; object-fit: fill; image-rendering: auto; }
+#source-image[hidden] { display: none; }
+#mask-canvas { position: relative; z-index: 1; image-rendering: pixelated; image-rendering: crisp-edges; cursor: crosshair; }
 .canvas-empty { position: absolute; color: var(--muted); pointer-events: none; }
 .legend { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; padding-top: 11px; color: var(--muted); font-size: 12px; }
 .legend i { display: inline-block; width: 12px; height: 3px; margin-right: 5px; vertical-align: middle; }
@@ -105,5 +108,5 @@ textarea { width: 100%; resize: vertical; padding: 9px; }
   .queue-panel { border-right: 0; border-bottom: 1px solid var(--border); }
   .queue-list { max-height: 300px; }
   .viewer-layout { grid-template-columns: 1fr; }
-  #mask-canvas { width: min(80vw, 600px); height: min(80vw, 600px); }
+  #source-image, #mask-canvas { width: min(80vw, 600px); height: min(80vw, 600px); }
 }

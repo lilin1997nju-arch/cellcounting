@@ -2,8 +2,9 @@
   const SIZE = 96;
   const API_BASE = document.querySelector('meta[name="mask-review-base"]')?.content || "";
   const apiPath = (path) => {
-    const base = API_BASE.replace(/\/+$/, "");
-    return `${base}${path}`;
+    const base = API_BASE.trim();
+    if (!base || base === "/") return path;
+    return `${base.replace(/\/+$/, "")}${path}`;
   };
   const state = {
     rounds: [],
@@ -17,10 +18,11 @@
     erasing: false,
     brushSize: 3,
     drawing: false,
-    image: null,
+    imageRequestId: 0,
   };
 
   const $ = (id) => document.getElementById(id);
+  const sourceImage = $("source-image");
   const canvas = $("mask-canvas");
   const ctx = canvas.getContext("2d");
 
@@ -94,11 +96,6 @@
 
   function drawCanvas() {
     ctx.clearRect(0, 0, SIZE, SIZE);
-    if (state.image) ctx.drawImage(state.image, 0, 0, SIZE, SIZE);
-    else {
-      ctx.fillStyle = "#080d14";
-      ctx.fillRect(0, 0, SIZE, SIZE);
-    }
     const overlay = ctx.createImageData(SIZE, SIZE);
     for (let index = 0; index < state.currentMask.length; index += 1) {
       if (!state.currentMask[index]) continue;
@@ -189,7 +186,13 @@
     state.currentIndex = target >= 0 ? target : Math.min(Math.max(state.currentIndex, 0), candidates.length - 1);
     renderQueue();
     if (state.currentIndex >= 0 && candidates[state.currentIndex]) await selectCandidate(state.currentIndex, false);
-    else { state.item = null; updateDetails(); drawCanvas(); }
+    else {
+      state.item = null;
+      sourceImage.hidden = true;
+      sourceImage.removeAttribute("src");
+      updateDetails();
+      drawCanvas();
+    }
   }
 
   async function selectCandidate(index, refreshList = true) {
@@ -202,9 +205,22 @@
       state.item = await api(`/api/mask-review-candidate?round_id=${encodeURIComponent(state.roundId)}&candidate_id=${encodeURIComponent(candidate.candidate_id)}`);
       state.modelMask = decodeRle(state.item.model_mask_rle);
       state.currentMask = decodeRle(state.item.reviewed_mask_rle || state.item.model_mask_rle);
-      state.image = new Image();
-      state.image.onload = () => drawCanvas();
-      state.image.src = `${apiPath("/api/patch")}?well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}`;
+      const imageRequestId = state.imageRequestId + 1;
+      state.imageRequestId = imageRequestId;
+      sourceImage.hidden = true;
+      sourceImage.onload = () => {
+        if (state.imageRequestId !== imageRequestId) return;
+        sourceImage.hidden = false;
+        drawCanvas();
+        setMessage("原图已加载。黄色为模型边界，绿色为当前审核边界。");
+      };
+      sourceImage.onerror = () => {
+        if (state.imageRequestId !== imageRequestId) return;
+        sourceImage.hidden = true;
+        drawCanvas();
+        setMessage("原图加载失败，但仍可审核 Mask；请检查当前板的图像清单或服务状态。", true);
+      };
+      sourceImage.src = `${apiPath("/api/patch")}?well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}`;
       $("notes").value = state.item.notes || "";
       setEditMode(false);
       updateDetails();

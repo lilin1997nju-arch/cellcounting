@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="mask-review-base" content=".">
+  <meta name="mask-review-base" content="./">
   <title>细胞 Mask 审核</title>
-  <link rel="stylesheet" href="assets/mask-review.css">
+  <link rel="stylesheet" href="assets/mask-review.css?v=20260812-raw-image">
 </head>
 <body>
   <header class="topbar">
@@ -62,6 +62,7 @@
             <span id="edit-state" class="state-badge">未选择对象</span>
           </div>
           <div class="canvas-wrap">
+            <img id="source-image" class="source-image" alt="原始图像" hidden>
             <canvas id="mask-canvas" width="96" height="96" aria-label="mask 编辑画布"></canvas>
             <div id="canvas-empty" class="canvas-empty">从左侧选择一个对象</div>
           </div>
@@ -86,6 +87,6 @@
       </div>
     </section>
   </main>
-  <script src="assets/mask-review.js"></script>
+  <script src="assets/mask-review.js?v=20260812-raw-image"></script>
 </body>
 </html>

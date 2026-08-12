@@ -828,6 +828,11 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     @app.get("/mask-review", response_class=HTMLResponse)
     def project_mask_review() -> str:
         page = (ui_root / "mask-review.html").read_text(encoding="utf-8")
+        page = page.replace(
+            '<meta name="mask-review-base" content="./">',
+            '<meta name="mask-review-base" content="/">',
+            1,
+        )
         return page.replace('href="assets/', 'href="/project-assets/').replace(
             'src="assets/', 'src="/project-assets/'
         )
