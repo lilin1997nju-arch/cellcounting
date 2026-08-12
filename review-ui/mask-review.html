@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="mask-review-base" content=".">
+  <title>细胞 Mask 审核</title>
+  <link rel="stylesheet" href="assets/mask-review.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand-block">
+      <a class="back-link" href="/">← 返回项目首页</a>
+      <h1>细胞 Mask 审核</h1>
+      <p>先确认模型轮廓，再对穿过细胞内部或粘连分割不完整的对象进行像素级修正。</p>
+    </div>
+    <div class="round-controls">
+      <label>审核批次<select id="round-select"></select></label>
+      <label>队列<select id="status-select">
+        <option value="pending">待审核</option>
+        <option value="all">全部</option>
+        <option value="reviewed">已审核</option>
+      </select></label>
+      <button id="refresh-button" class="ghost-button">刷新</button>
+    </div>
+  </header>
+
+  <main class="page-grid">
+    <aside class="queue-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>审核队列</h2>
+          <span id="queue-caption">加载中…</span>
+        </div>
+        <span id="queue-count" class="count-pill">0</span>
+      </div>
+      <div id="summary" class="summary-grid"></div>
+      <div id="queue-list" class="queue-list"></div>
+    </aside>
+
+    <section class="review-panel">
+      <div class="review-toolbar">
+        <div class="tool-group">
+          <button id="accept-button" class="primary-button">接受模型轮廓</button>
+          <button id="reject-button" class="danger-button">判为无有效细胞</button>
+        </div>
+        <div class="tool-group edit-tools">
+          <button id="edit-button" class="secondary-button">开始手动修正</button>
+          <button id="brush-button" class="tool-button active">画笔</button>
+          <button id="eraser-button" class="tool-button">橡皮</button>
+          <label class="brush-size">笔刷 <input id="brush-size" type="range" min="1" max="10" value="3"><span id="brush-size-value">3</span> px</label>
+          <button id="fill-button" class="tool-button">填充内部孔洞</button>
+          <button id="reset-button" class="tool-button">重置为模型</button>
+        </div>
+        <button id="save-button" class="save-button">保存审核结果</button>
+      </div>
+
+      <div class="viewer-layout">
+        <div class="canvas-card">
+          <div class="canvas-title-row">
+            <span>96×96 原图与 Mask</span>
+            <span id="edit-state" class="state-badge">未选择对象</span>
+          </div>
+          <div class="canvas-wrap">
+            <canvas id="mask-canvas" width="96" height="96" aria-label="mask 编辑画布"></canvas>
+            <div id="canvas-empty" class="canvas-empty">从左侧选择一个对象</div>
+          </div>
+          <div class="legend">
+            <span><i class="legend-current"></i>当前审核 Mask</span>
+            <span><i class="legend-model"></i>模型边界</span>
+            <span class="hint">手动修正时可直接在图上拖动</span>
+          </div>
+        </div>
+
+        <div class="detail-card">
+          <div class="detail-heading">
+            <h2 id="candidate-title">尚未选择对象</h2>
+            <span id="decision-badge" class="decision-badge">待审核</span>
+          </div>
+          <dl id="candidate-details" class="details-list"></dl>
+          <label class="notes-label" for="notes">审核备注</label>
+          <textarea id="notes" rows="4" placeholder="例如：左侧细胞边界被内部暗纹切开，已补齐…"></textarea>
+          <div id="message" class="message" role="status"></div>
+          <div class="keyboard-hint">快捷键：A 接受模型，E 切换编辑，S 保存，←/→ 切换对象</div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="assets/mask-review.js"></script>
+</body>
+</html>

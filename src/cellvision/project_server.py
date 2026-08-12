@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import asyncio
 import html
+import io
 import os
 import re
 import sqlite3
@@ -23,8 +24,9 @@ from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
+from PIL import Image, ImageEnhance
 from pydantic import BaseModel, Field
 
 from .config import PROJECT_ROOT, artifact_path, load_config
@@ -34,7 +36,7 @@ from .multiplicity import (
     multiplicity_stats,
     save_categorized_review_labels,
 )
-from .review_server import _visible_v2_review_instances, create_app
+from .review_server import _visible_v2_review_instances, create_app, initialize_database
 from .review_summary import (
     latest_prediction_path,
     read_summary,
@@ -43,6 +45,13 @@ from .review_summary import (
 )
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
+from .v2_mask_review import (
+    list_mask_review_rounds,
+    mask_review_candidate,
+    mask_review_candidates,
+    mask_review_summary,
+    save_mask_review,
+)
 
 
 def _safe(value: Any) -> Any:
@@ -399,6 +408,15 @@ class ProjectMultiplicityLabelItem(BaseModel):
 class ProjectMultiplicityLabelsPayload(BaseModel):
     items: list[ProjectMultiplicityLabelItem]
     reviewer: str = "local_user"
+
+
+class ProjectMaskReviewSavePayload(BaseModel):
+    round_id: str
+    candidate_id: str
+    decision: str
+    reviewed_mask_rle: str | None = None
+    reviewer: str = "local_user"
+    notes: str = ""
 
 
 _DAY_RE = re.compile(r"^day\s*(?P<day>-?\d+)$", re.IGNORECASE)
@@ -777,6 +795,135 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         except (OSError, ValueError, KeyError) as exc:
             plate["mount_error"] = str(exc)
     manifest["mounted_plates"] = mounted
+
+    # Bind the project-level mask-review page to the first mounted plate.  The
+    # project hub may contain many boards, but a review batch must never mix a
+    # board's coordinates with another board's source images.
+    default_mask_config: dict[str, Any] | None = None
+    default_mask_database: Path | None = None
+    default_mask_images: pd.DataFrame | None = None
+    selected_mask_plate = next(
+        (
+            plate
+            for plate in manifest.get("plates", [])
+            if str(plate.get("slug") or _slug(plate.get("board_id", ""))) in mounted
+        ),
+        None,
+    )
+    try:
+        if selected_mask_plate is not None:
+            selected_mask_config_path = _resolve(selected_mask_plate["config"])
+            default_mask_config = load_config(selected_mask_config_path)
+            default_mask_database = initialize_database(
+                artifact_path(default_mask_config, "annotations", "annotations.db")
+            )
+            selected_images_path = _resolve(selected_mask_plate.get("images_manifest", ""))
+            if selected_images_path.exists():
+                default_mask_images = pd.read_csv(selected_images_path)
+    except (OSError, KeyError, TypeError, ValueError, pd.errors.ParserError):
+        default_mask_config = None
+        default_mask_database = None
+        default_mask_images = None
+
+    @app.get("/mask-review", response_class=HTMLResponse)
+    def project_mask_review() -> str:
+        page = (ui_root / "mask-review.html").read_text(encoding="utf-8")
+        return page.replace('href="assets/', 'href="/project-assets/').replace(
+            'src="assets/', 'src="/project-assets/'
+        )
+
+    @app.get("/api/mask-review-rounds")
+    def project_mask_review_rounds() -> list[dict[str, Any]]:
+        if default_mask_config is None or default_mask_database is None:
+            return []
+        return list_mask_review_rounds(default_mask_config, default_mask_database)
+
+    @app.get("/api/mask-review-summary")
+    def project_mask_review_summary(round_id: str) -> dict[str, Any]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            return mask_review_summary(default_mask_config, default_mask_database, round_id)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/mask-review-candidates")
+    def project_mask_review_candidates(
+        round_id: str, status: str = "pending", limit: int = 500
+    ) -> list[dict[str, Any]]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            return mask_review_candidates(
+                default_mask_config,
+                default_mask_database,
+                round_id,
+                status=status,
+                limit=min(int(limit), 5000),
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/mask-review-candidate")
+    def project_mask_review_candidate(
+        round_id: str, candidate_id: str
+    ) -> dict[str, Any]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            item = mask_review_candidate(
+                default_mask_config,
+                default_mask_database,
+                round_id,
+                candidate_id,
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if item is None:
+            raise HTTPException(status_code=404, detail="mask review candidate not found")
+        return item
+
+    @app.post("/api/mask-review-save")
+    def project_mask_review_save(
+        payload: ProjectMaskReviewSavePayload,
+    ) -> dict[str, Any]:
+        if default_mask_config is None or default_mask_database is None:
+            raise HTTPException(status_code=503, detail="mask review is unavailable")
+        try:
+            return save_mask_review(
+                default_mask_config,
+                default_mask_database,
+                round_id=payload.round_id,
+                candidate_id=payload.candidate_id,
+                decision=payload.decision,
+                reviewed_mask_rle=payload.reviewed_mask_rle,
+                reviewer=payload.reviewer,
+                notes=payload.notes,
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/api/patch")
+    def project_mask_patch(
+        well: str, timepoint: str, x: float, y: float, size: int = 256
+    ) -> Response:
+        if default_mask_images is None:
+            raise HTTPException(status_code=503, detail="image manifest unavailable")
+        selected = default_mask_images[
+            (default_mask_images["well"].astype(str).str.upper() == well.upper())
+            & (default_mask_images["timepoint"].astype(str).str.upper() == timepoint.upper())
+            & (default_mask_images["decode_status"].astype(str) == "ok")
+        ]
+        if selected.empty:
+            raise HTTPException(status_code=404, detail="image unavailable")
+        size = max(64, min(int(size), 2048))
+        half = size // 2
+        with Image.open(selected.iloc[0]["raw_image_path"]) as image:
+            gray = ImageEnhance.Contrast(image.convert("L")).enhance(1.8)
+            crop = gray.crop((int(x) - half, int(y) - half, int(x) + half, int(y) + half))
+        buffer = io.BytesIO()
+        crop.save(buffer, format="JPEG", quality=90)
+        return Response(content=buffer.getvalue(), media_type="image/jpeg")
 
     def multiplicity_plate_contexts() -> list[dict[str, Any]]:
         """Return the lightweight per-board context for the project queue."""

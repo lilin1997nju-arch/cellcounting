@@ -59,6 +59,14 @@ from .well_screening import build_well_screening, save_late_growth_review
 from .review_image_cache import render_review_image, review_image_cache_path
 from .decode import inspect_tiff
 from .gated_screening import build_gated_plate_report
+from .v2_mask_review import (
+    create_mask_review_round,
+    list_mask_review_rounds,
+    mask_review_candidate,
+    mask_review_candidates,
+    mask_review_summary,
+    save_mask_review,
+)
 
 
 SCHEMA = """
@@ -184,6 +192,25 @@ CREATE TABLE IF NOT EXISTS quick_review_undo_actions (
     snapshot_json TEXT NOT NULL,
     created_at TEXT NOT NULL,
     undone_at TEXT
+);
+CREATE TABLE IF NOT EXISTS v2_mask_reviews (
+    review_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    round_id TEXT NOT NULL,
+    candidate_id TEXT NOT NULL,
+    well TEXT NOT NULL,
+    timepoint TEXT NOT NULL,
+    model_mask_rle TEXT NOT NULL,
+    reviewed_mask_rle TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    model_area_px INTEGER NOT NULL,
+    reviewed_area_px INTEGER NOT NULL,
+    model_diameter_px REAL NOT NULL,
+    reviewed_diameter_px REAL NOT NULL,
+    contour_json TEXT NOT NULL,
+    reviewer TEXT,
+    notes TEXT,
+    updated_at TEXT NOT NULL,
+    UNIQUE(round_id, candidate_id)
 );
 """
 
@@ -781,6 +808,15 @@ class LateGrowthReviewPayload(BaseModel):
     notes: str = ""
 
 
+class MaskReviewSavePayload(BaseModel):
+    round_id: str
+    candidate_id: str
+    decision: str
+    reviewed_mask_rle: str | None = None
+    reviewer: str = "local_user"
+    notes: str = ""
+
+
 def _ensure_schema_columns(connection: sqlite3.Connection) -> None:
     columns = {
         row[1] for row in connection.execute("PRAGMA table_info(lineage_reviews)").fetchall()
@@ -1313,6 +1349,9 @@ def create_app(
         Path(__file__).resolve().parents[2]
         / "review-ui"
         / "integrated-review.html"
+    )
+    mask_review_html_path = (
+        Path(__file__).resolve().parents[2] / "review-ui" / "mask-review.html"
     )
     screening_html_path = (
         Path(__file__).resolve().parents[2] / "review-ui" / "screening.html"
@@ -2110,6 +2149,10 @@ def create_app(
     def integrated_review() -> str:
         return integrated_review_html_path.read_text(encoding="utf-8")
 
+    @app.get("/mask-review", response_class=HTMLResponse)
+    def mask_review() -> str:
+        return mask_review_html_path.read_text(encoding="utf-8")
+
     @app.get("/api/health")
     def health() -> dict[str, str]:
         return {"status": "ok", "scope": "configured host"}
@@ -2125,6 +2168,56 @@ def create_app(
             "database": str(database_path),
             "image_count": int(len(images_manifest)),
         }
+
+    @app.get("/api/mask-review-rounds")
+    def mask_review_rounds() -> list[dict[str, Any]]:
+        return list_mask_review_rounds(config, database)
+
+    @app.get("/api/mask-review-summary")
+    def mask_review_summary_api(round_id: str) -> dict[str, Any]:
+        try:
+            return mask_review_summary(config, database, round_id)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/mask-review-candidates")
+    def mask_review_candidates_api(
+        round_id: str, status: str = "pending", limit: int = 500
+    ) -> list[dict[str, Any]]:
+        try:
+            return mask_review_candidates(
+                config, database, round_id, status=status, limit=min(int(limit), 5000)
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/mask-review-candidate")
+    def mask_review_candidate_api(
+        round_id: str, candidate_id: str
+    ) -> dict[str, Any]:
+        try:
+            item = mask_review_candidate(config, database, round_id, candidate_id)
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if item is None:
+            raise HTTPException(status_code=404, detail="mask review candidate not found")
+        return item
+
+    @app.post("/api/mask-review-save")
+    def mask_review_save(payload: MaskReviewSavePayload) -> dict[str, Any]:
+        try:
+            return save_mask_review(
+                config,
+                database,
+                round_id=payload.round_id,
+                candidate_id=payload.candidate_id,
+                decision=payload.decision,
+                reviewed_mask_rle=payload.reviewed_mask_rle,
+                reviewer=payload.reviewer,
+                notes=payload.notes,
+            )
+        except (FileNotFoundError, ValueError, OSError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/annotations")
     def annotations(limit: int = 100) -> list[dict[str, Any]]:

@@ -476,11 +476,37 @@ def refinalize_v2_file(config: dict[str, Any], patch_size: int = 96) -> Path:
     return output_path
 
 
-def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> Path:
-    predictions_path = artifact_path(config, "predictions", "latest_integrated_predictions.csv")
-    output = artifact_path(config, "predictions", "latest_v2_predictions.csv")
-    pre_temporal_output = output.with_name("latest_v2_pre_temporal_predictions.csv")
-    summary_path = output.with_suffix(".json")
+def infer_v2_instances(
+    config: dict[str, Any],
+    checkpoint_path: str | Path,
+    *,
+    predictions_path: str | Path | None = None,
+    output_path: str | Path | None = None,
+    pre_temporal_output_path: str | Path | None = None,
+    summary_path: str | Path | None = None,
+) -> Path:
+    """Run V2 inference, optionally writing to an isolated versioned output.
+
+    The default paths intentionally remain the historical ``latest_*`` paths
+    so existing production callers keep their behavior.  Review workflows can
+    pass explicit paths to create a reproducible batch without overwriting the
+    active prediction artifacts.
+    """
+
+    predictions_path = Path(predictions_path) if predictions_path is not None else artifact_path(
+        config, "predictions", "latest_integrated_predictions.csv"
+    )
+    output = Path(output_path) if output_path is not None else artifact_path(
+        config, "predictions", "latest_v2_predictions.csv"
+    )
+    pre_temporal_output = (
+        Path(pre_temporal_output_path)
+        if pre_temporal_output_path is not None
+        else output.with_name("latest_v2_pre_temporal_predictions.csv")
+    )
+    summary_path = Path(summary_path) if summary_path is not None else output.with_suffix(".json")
+    for destination in (output, pre_temporal_output, summary_path):
+        destination.parent.mkdir(parents=True, exist_ok=True)
     inference_settings = config.get("v2_inference", {})
     fingerprint = _inference_fingerprint(config, predictions_path, checkpoint_path)
     if bool(inference_settings.get("reuse_unchanged_stage", True)) and pre_temporal_output.exists() and summary_path.exists():
