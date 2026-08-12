@@ -316,6 +316,11 @@ v2_inference:
   precise_contour_cell_probability: 0.12
   precise_contour_labels: ["single", "touching_doublet", "cluster_3plus", "uncertain"]
   precise_contour_sources: ["manual_cell_anchor", "manual_annotation_anchor", "wall_cell_rescue_peak", "wall_residual_peak"]
+  # Reject active-contour refinements that cut through the cell interior.
+  refinement_minimum_area_ratio: 0.80
+  refinement_minimum_iou: 0.70
+  # Preserve adjacent lobes for reviewed doublets and larger cell groups.
+  group_component_gap_px: 3
 
 v2_temporal_model:
   maximum_correspondence_distance_px: 128

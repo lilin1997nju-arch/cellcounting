@@ -560,16 +560,9 @@ function drawObject(ctx, entry, object) {
   const contour = contourGeometry(entry, object);
   if (contour.length >= 3 && label !== "invalid") {
     ctx.beginPath();
-    const firstMid = [
-      (contour[0][0] + contour[1][0]) / 2,
-      (contour[0][1] + contour[1][1]) / 2
-    ];
-    ctx.moveTo(firstMid[0], firstMid[1]);
-    for (let index = 1; index <= contour.length; index += 1) {
-      const current = contour[index % contour.length];
-      const next = contour[(index + 1) % contour.length];
-      const midpoint = [(current[0] + next[0]) / 2, (current[1] + next[1]) / 2];
-      ctx.quadraticCurveTo(current[0], current[1], midpoint[0], midpoint[1]);
+    ctx.moveTo(contour[0][0], contour[0][1]);
+    for (let index = 1; index < contour.length; index += 1) {
+      ctx.lineTo(contour[index][0], contour[index][1]);
     }
     ctx.closePath();
     ctx.fill();

@@ -1,11 +1,15 @@
 import json
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+from scipy.ndimage import binary_fill_holes
+from skimage.morphology import closing, disk
 
 from cellvision.v2_instance_inference import (
     _contour,
     _rle,
+    _selected_component,
     consolidate_v2_masks,
     decode_rle,
     finalize_v2_instances,
@@ -55,6 +59,49 @@ def test_refinement_is_narrow_band_and_contour_is_subpixel():
     contour = json.loads(_contour(refined, 0, 0))
     assert len(contour) >= 12
     assert any(float(x) != round(float(x)) or float(y) != round(float(y)) for x, y in contour)
+
+
+def test_group_component_selection_retains_nearby_lobes():
+    yy, xx = np.mgrid[:32, :32]
+    left = (xx - 12) ** 2 + (yy - 16) ** 2 <= 4**2
+    right = (xx - 23) ** 2 + (yy - 16) ** 2 <= 4**2
+    binary = left | right
+    seed = np.exp(-((xx - 15.5) ** 2 + (yy - 15.5) ** 2) / (2 * 3**2))
+
+    single = _selected_component(binary, seed)
+    group = _selected_component(binary, seed, retain_nearby=True, nearby_distance=3)
+
+    assert single[16, 12]
+    assert not single[16, 23]
+    assert group[16, 12]
+    assert group[16, 23]
+    assert group.sum() > single.sum() * 1.7
+
+
+def test_refinement_falls_back_when_active_contour_cuts_through_cell():
+    yy, xx = np.mgrid[:64, :64]
+    mask = (xx - 32) ** 2 + (yy - 32) ** 2 <= 10**2
+    mask[29:35, 29:35] = False
+    raw = np.full((64, 64), 0.5, dtype=np.float32)
+    wall = np.zeros_like(raw)
+    cut_mask = mask & (xx <= 25)
+    diagnostics = {}
+
+    with patch(
+        "cellvision.v2_instance_inference.morphological_geodesic_active_contour",
+        return_value=cut_mask,
+    ):
+        refined = refine_instance_mask(
+            mask,
+            raw,
+            wall,
+            diagnostics=diagnostics,
+        )
+
+    expected = np.asarray(binary_fill_holes(closing(mask, disk(1))), dtype=bool)
+    assert np.array_equal(refined, expected)
+    assert diagnostics["status"] == "fallback_area_shrink"
+    assert refined[32, 32]
 
 
 def test_strong_independent_cell_evidence_rescues_conservative_boundary_confidence():

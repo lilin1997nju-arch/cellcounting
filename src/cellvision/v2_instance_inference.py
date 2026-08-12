@@ -13,7 +13,7 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from scipy.ndimage import gaussian_filter, gaussian_filter1d, label as ndi_label, zoom
+from scipy.ndimage import binary_fill_holes, gaussian_filter, gaussian_filter1d, label as ndi_label, zoom
 from skimage.morphology import closing, dilation, disk, erosion, remove_small_holes, remove_small_objects
 from skimage.segmentation import inverse_gaussian_gradient, morphological_geodesic_active_contour
 from skimage.measure import find_contours, regionprops
@@ -32,8 +32,24 @@ def _normalize(raw: np.ndarray) -> np.ndarray:
     return np.clip((value - lo) / max(float(hi - lo), 1.0), 0, 1)
 
 
-def _selected_component(binary: np.ndarray) -> np.ndarray:
-    labelled, _ = ndi_label(binary)
+def _selected_component(
+    binary: np.ndarray,
+    seed_weights: np.ndarray | None = None,
+    *,
+    retain_nearby: bool = False,
+    nearby_distance: int = 3,
+) -> np.ndarray:
+    """Select the component supported by the seed, optionally retaining group lobes.
+
+    Instance crops are seed-conditioned, so component ownership should follow
+    the seed heatmap rather than only the component centroid.  Reviewed
+    doublets and clusters may contain two thresholded lobes separated by a
+    narrow one- or two-pixel gap; those nearby lobes are reconnected before
+    contour extraction instead of being silently discarded.
+    """
+
+    binary = np.asarray(binary, dtype=bool)
+    labelled, _ = ndi_label(binary, structure=np.ones((3, 3), dtype=np.uint8))
     regions = regionprops(labelled)
     if not regions:
         return np.zeros_like(binary, dtype=bool)
@@ -41,8 +57,40 @@ def _selected_component(binary: np.ndarray) -> np.ndarray:
     eligible = [region for region in regions if region.area >= 3]
     if not eligible:
         return np.zeros_like(binary, dtype=bool)
-    chosen = min(eligible, key=lambda region: np.linalg.norm(np.asarray(region.centroid) - center))
-    return labelled == chosen.label
+    if seed_weights is not None:
+        weights = np.asarray(seed_weights, dtype=np.float32)
+        if weights.shape != binary.shape:
+            raise ValueError("seed_weights must have the same shape as binary")
+        chosen = max(
+            eligible,
+            key=lambda region: (
+                float(weights[labelled == region.label].sum()),
+                -float(np.linalg.norm(np.asarray(region.centroid) - center)),
+                float(region.area),
+            ),
+        )
+    else:
+        chosen = min(
+            eligible,
+            key=lambda region: np.linalg.norm(np.asarray(region.centroid) - center),
+        )
+    selected = labelled == chosen.label
+    if not retain_nearby:
+        return selected
+
+    remaining = [region for region in eligible if region.label != chosen.label]
+    # Grow iteratively because a three-cell cluster may form a short chain.
+    while remaining:
+        neighborhood = dilation(selected, disk(max(int(nearby_distance), 1)))
+        attached = [region for region in remaining if np.any(neighborhood & (labelled == region.label))]
+        if not attached:
+            break
+        for region in attached:
+            selected |= labelled == region.label
+            remaining.remove(region)
+    if selected.any():
+        selected = closing(selected, disk(min(max(int(nearby_distance), 1), 2)))
+    return selected
 
 
 def _rle(mask: np.ndarray) -> str:
@@ -60,12 +108,33 @@ def decode_rle(value: str, size: int) -> np.ndarray:
     return mask.reshape(size, size)
 
 
-def refine_instance_mask(mask: np.ndarray, raw: np.ndarray, wall_probability: np.ndarray) -> np.ndarray:
+def _mask_iou(first: np.ndarray, second: np.ndarray) -> float:
+    union = np.logical_or(first, second).sum()
+    return float(np.logical_and(first, second).sum() / max(int(union), 1))
+
+
+def refine_instance_mask(
+    mask: np.ndarray,
+    raw: np.ndarray,
+    wall_probability: np.ndarray,
+    seed_weights: np.ndarray | None = None,
+    *,
+    retain_nearby: bool = False,
+    nearby_distance: int = 3,
+    minimum_area_ratio: float = 0.80,
+    minimum_iou: float = 0.70,
+    diagnostics: dict[str, Any] | None = None,
+) -> np.ndarray:
     """Snap a coarse mask to nearby image edges without allowing large shape drift."""
     original = remove_small_objects(mask.astype(bool), max_size=2)
     original = closing(original, disk(1))
-    original = remove_small_holes(original, max_size=9)
+    # Cell interiors often contain a dark nucleus or phase halo.  A closed
+    # cavity is therefore foreground for whole-cell feature extraction, not a
+    # second boundary to be preserved.
+    original = binary_fill_holes(original)
     if not original.any():
+        if diagnostics is not None:
+            diagnostics.update(status="empty", area_ratio=0.0, iou=0.0)
         return original
     edge_map = inverse_gaussian_gradient(raw.astype(np.float32), alpha=80.0, sigma=1.0)
     evolved = morphological_geodesic_active_contour(
@@ -80,9 +149,34 @@ def refine_instance_mask(mask: np.ndarray, raw: np.ndarray, wall_probability: np
     # Closing repairs one-pixel notches; avoid opening here because it can erase
     # the narrow bridge that is diagnostically important for touching doublets.
     evolved = closing(evolved, disk(1))
-    evolved = remove_small_holes(evolved, max_size=11)
+    evolved = binary_fill_holes(evolved)
     evolved = remove_small_objects(evolved, max_size=2)
-    return _selected_component(evolved)
+    evolved = _selected_component(
+        evolved,
+        seed_weights,
+        retain_nearby=retain_nearby,
+        nearby_distance=nearby_distance,
+    )
+    evolved = binary_fill_holes(evolved)
+
+    original_area = int(original.sum())
+    evolved_area = int(evolved.sum())
+    area_ratio = float(evolved_area / max(original_area, 1))
+    overlap = _mask_iou(original, evolved)
+    center = tuple(int(round((axis - 1) / 2)) for axis in original.shape)
+    lost_center_seed = bool(original[center] and not evolved[center])
+    status = "refined"
+    if not evolved.any():
+        status = "fallback_empty"
+    elif area_ratio < float(minimum_area_ratio):
+        status = "fallback_area_shrink"
+    elif overlap < float(minimum_iou):
+        status = "fallback_low_iou"
+    elif lost_center_seed:
+        status = "fallback_seed_lost"
+    if diagnostics is not None:
+        diagnostics.update(status=status, area_ratio=area_ratio, iou=overlap)
+    return original if status.startswith("fallback_") else evolved
 
 
 def lightweight_refine_instance_mask(mask: np.ndarray) -> np.ndarray:
@@ -120,7 +214,7 @@ def _inference_fingerprint(
         "apply_manual_point_overrides", True
     )
     payload = {
-        "algorithm": "v2-instance-tiered-20260804b",
+        "algorithm": "v2-instance-contour-guard-20260812",
         "predictions": _path_signature(predictions_path),
         "checkpoint": _path_signature(checkpoint_path),
         "annotations": _path_signature(database) if manual_overrides else {"ignored": True},
@@ -139,7 +233,14 @@ def _contour(mask: np.ndarray, origin_x: int, origin_y: int) -> str:
     contours = find_contours(surface, 0.5)
     if not contours:
         return "[]"
-    points = max(contours, key=len) / 4.0
+    # Prefer the enclosing boundary by polygon area.  Internal texture holes
+    # can occasionally have more samples than a compact outer boundary after
+    # interpolation, so point count alone is not a safe selector.
+    def polygon_area(points: np.ndarray) -> float:
+        y, x = points[:, 0], points[:, 1]
+        return float(abs(np.dot(x, np.roll(y, 1)) - np.dot(y, np.roll(x, 1))) / 2)
+
+    points = max(contours, key=polygon_area) / 4.0
     points[:, 0] = gaussian_filter1d(points[:, 0], sigma=1.1, mode="wrap")
     points[:, 1] = gaussian_filter1d(points[:, 1], sigma=1.1, mode="wrap")
     stride = max(1, int(np.ceil(len(points) / 120)))
@@ -406,6 +507,15 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
     protected_positive_ids = _reviewed_positive_ids(config, frame)
     hard_invalid_threshold = float(inference_settings.get("hard_invalid_skip_threshold", 0.60))
     precise_cell_threshold = float(inference_settings.get("precise_contour_cell_probability", 0.12))
+    refinement_minimum_area_ratio = float(
+        inference_settings.get("refinement_minimum_area_ratio", 0.80)
+    )
+    refinement_minimum_iou = float(
+        inference_settings.get("refinement_minimum_iou", 0.70)
+    )
+    group_component_gap_px = int(
+        inference_settings.get("group_component_gap_px", 3)
+    )
     precise_labels = {
         str(value)
         for value in inference_settings.get(
@@ -428,6 +538,7 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
         "v2_mask_valid": [], "v2_mask_rle": [], "v2_mask_origin_x": [], "v2_mask_origin_y": [],
         "v2_contour_json": [], "v2_instance_area_px": [], "v2_instance_diameter_px": [],
         "v2_instance_confidence": [], "v2_objectness": [], "v2_wall_overlap": [], "v2_wall_rejected": [],
+        "v2_refinement_status": [], "v2_refinement_area_ratio": [], "v2_refinement_iou": [],
     }
     seed = _seed_heatmap(size, sigma)
     for raw_path, group in frame.groupby("raw_image_path", sort=False):
@@ -459,6 +570,9 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
                     "v2_objectness": 0.0,
                     "v2_wall_overlap": 0.0,
                     "v2_wall_rejected": True,
+                    "v2_refinement_status": "skipped_hard_invalid",
+                    "v2_refinement_area_ratio": 0.0,
+                    "v2_refinement_iou": 0.0,
                 }
                 continue
             raw = _crop(full, row.x_px, row.y_px, size, int(np.median(full)))
@@ -499,9 +613,24 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
                 object_probability, wall_probability, presence_probability = probability
                 objectness = float(presence_probability.mean())
                 local_presence_threshold = candidate_presence_thresholds[batch_index]
+                position = batch_positions[batch_index]
+                row = group.iloc[position]
+                retain_nearby = str(row.integrated_label) in {
+                    "touching_doublet", "cluster_3plus"
+                }
                 binary = object_probability >= threshold
                 binary &= ~((wall_probability >= max(wall_threshold, 0.82)) & (object_probability < 0.72))
-                mask = _selected_component(binary)
+                mask = _selected_component(
+                    binary,
+                    seed,
+                    retain_nearby=retain_nearby,
+                    nearby_distance=group_component_gap_px,
+                )
+                refinement_diagnostics: dict[str, Any] = {
+                    "status": "not_run",
+                    "area_ratio": 1.0 if mask.any() else 0.0,
+                    "iou": 1.0 if mask.any() else 0.0,
+                }
                 if objectness >= local_presence_threshold and mask.any():
                     if precise_refinement[batch_index]:
                         precise_refinement_count += 1
@@ -509,10 +638,17 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
                             mask,
                             batch_values[batch_index][0],
                             wall_probability,
+                            seed,
+                            retain_nearby=retain_nearby,
+                            nearby_distance=group_component_gap_px,
+                            minimum_area_ratio=refinement_minimum_area_ratio,
+                            minimum_iou=refinement_minimum_iou,
+                            diagnostics=refinement_diagnostics,
                         )
                     else:
                         lightweight_refinement_count += 1
                         mask = lightweight_refine_instance_mask(mask)
+                        refinement_diagnostics["status"] = "lightweight"
                 regions = regionprops(mask.astype(np.uint8))
                 origin_x, origin_y = origins[batch_index]
                 valid = bool(objectness >= local_presence_threshold and regions and 3 <= regions[0].area <= 2200)
@@ -538,6 +674,9 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
                     "v2_objectness": objectness,
                     "v2_wall_overlap": overlap,
                     "v2_wall_rejected": wall_rejected,
+                    "v2_refinement_status": str(refinement_diagnostics["status"]),
+                    "v2_refinement_area_ratio": float(refinement_diagnostics["area_ratio"]),
+                    "v2_refinement_iou": float(refinement_diagnostics["iou"]),
                 }
         for result in group_results:
             if result is None:
@@ -572,6 +711,10 @@ def infer_v2_instances(config: dict[str, Any], checkpoint_path: str | Path) -> P
         "hard_invalid_segmentation_skipped": skipped_hard_invalid,
         "precise_contour_refinement_count": precise_refinement_count,
         "lightweight_contour_refinement_count": lightweight_refinement_count,
+        "contour_refinement_status_counts": {
+            str(key): int(value)
+            for key, value in enriched["v2_refinement_status"].value_counts().items()
+        },
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
     return output
