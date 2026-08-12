@@ -363,11 +363,13 @@ def _decode_valid_rle(value: str | None, size: int) -> tuple[str, np.ndarray]:
 
 
 def _ensure_review_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    defaults: dict[str, Any] = {
+    text_defaults: dict[str, str] = {
         "v2_mask_review_status": "pending",
         "v2_mask_reviewed_by": "",
         "v2_mask_reviewed_at": "",
         "v2_mask_review_notes": "",
+    }
+    numeric_defaults: dict[str, pd.Series] = {
         "v2_reviewed_area_px": pd.to_numeric(
             frame.get("v2_instance_area_px", pd.Series(0, index=frame.index)), errors="coerce"
         ).fillna(0),
@@ -375,7 +377,16 @@ def _ensure_review_columns(frame: pd.DataFrame) -> pd.DataFrame:
             frame.get("v2_instance_diameter_px", pd.Series(0.0, index=frame.index)), errors="coerce"
         ).fillna(0.0),
     }
-    for name, default in defaults.items():
+    # A freshly created review CSV contains empty strings in these fields.
+    # ``read_csv`` infers an all-empty column as float64, so a later reviewer
+    # name/timestamp/note assignment would fail with Pandas' strict upcast
+    # check.  Normalize existing columns as well as newly created ones.
+    for name, default in text_defaults.items():
+        if name not in frame.columns:
+            frame[name] = default
+        else:
+            frame[name] = frame[name].fillna("").astype(object)
+    for name, default in numeric_defaults.items():
         if name not in frame.columns:
             frame[name] = default
     return frame
@@ -427,6 +438,27 @@ def save_mask_review(
     timestamp = _now_text()
     database_path = Path(database)
     database_path.parent.mkdir(parents=True, exist_ok=True)
+    reviewed_path = _manifest_file(config, round_id, "reviewed_predictions")
+    reviewed_frame = _ensure_review_columns(pd.read_csv(reviewed_path, low_memory=False))
+    row_indices = reviewed_frame.index[
+        reviewed_frame["candidate_id"].astype(str) == str(candidate_id)
+    ]
+    if row_indices.empty:
+        raise ValueError(f"candidate is missing from reviewed predictions: {candidate_id}")
+    reviewed_frame.loc[row_indices, "v2_mask_rle"] = reviewed_rle
+    reviewed_frame.loc[row_indices, "v2_mask_valid"] = bool(reviewed_area > 0)
+    reviewed_frame.loc[row_indices, "v2_contour_json"] = contour
+    reviewed_frame.loc[row_indices, "v2_instance_area_px"] = reviewed_area
+    reviewed_frame.loc[row_indices, "v2_instance_diameter_px"] = reviewed_diameter
+    reviewed_frame.loc[row_indices, "v2_mask_review_status"] = normalized_decision
+    reviewed_frame.loc[row_indices, "v2_mask_reviewed_by"] = str(reviewer or "local_user")
+    reviewed_frame.loc[row_indices, "v2_mask_reviewed_at"] = timestamp
+    reviewed_frame.loc[row_indices, "v2_mask_review_notes"] = str(notes or "")
+    reviewed_frame.loc[row_indices, "v2_reviewed_area_px"] = reviewed_area
+    reviewed_frame.loc[row_indices, "v2_reviewed_diameter_px"] = reviewed_diameter
+    # Recompute overlap ownership and all downstream instance eligibility flags
+    # before either persistence target is committed.
+    reviewed_frame = finalize_v2_instances(reviewed_frame, mask_size, set())
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """
@@ -472,29 +504,6 @@ def save_mask_review(
         )
         connection.commit()
 
-    reviewed_path = _manifest_file(config, round_id, "reviewed_predictions")
-    reviewed_frame = _ensure_review_columns(pd.read_csv(reviewed_path, low_memory=False))
-    row_indices = reviewed_frame.index[
-        reviewed_frame["candidate_id"].astype(str) == str(candidate_id)
-    ]
-    if row_indices.empty:
-        raise ValueError(f"candidate is missing from reviewed predictions: {candidate_id}")
-    reviewed_frame.loc[row_indices, "v2_mask_rle"] = reviewed_rle
-    reviewed_frame.loc[row_indices, "v2_mask_valid"] = bool(reviewed_area > 0)
-    reviewed_frame.loc[row_indices, "v2_contour_json"] = contour
-    reviewed_frame.loc[row_indices, "v2_instance_area_px"] = reviewed_area
-    reviewed_frame.loc[row_indices, "v2_instance_diameter_px"] = reviewed_diameter
-    reviewed_frame.loc[row_indices, "v2_mask_review_status"] = normalized_decision
-    reviewed_frame.loc[row_indices, "v2_mask_reviewed_by"] = str(reviewer or "local_user")
-    reviewed_frame.loc[row_indices, "v2_mask_reviewed_at"] = timestamp
-    reviewed_frame.loc[row_indices, "v2_mask_review_notes"] = str(notes or "")
-    reviewed_frame.loc[row_indices, "v2_reviewed_area_px"] = reviewed_area
-    reviewed_frame.loc[row_indices, "v2_reviewed_diameter_px"] = reviewed_diameter
-    # Recompute overlap ownership and all downstream instance eligibility flags
-    # after a correction.  A manual edit can change whether a neighboring
-    # proposal is suppressed, so updating only the selected row would leave
-    # stale instance identities in the reviewed CSV.
-    reviewed_frame = finalize_v2_instances(reviewed_frame, mask_size, set())
     _atomic_write_csv(reviewed_frame, reviewed_path)
     return {
         "status": "saved",

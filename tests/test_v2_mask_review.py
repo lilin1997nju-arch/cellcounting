@@ -58,7 +58,17 @@ def test_manual_mask_review_recomputes_derived_fields_and_persists(tmp_path):
         "latest_v2_pre_temporal_predictions.csv",
         "reviewed_v2_predictions.csv",
     ):
-        frame.to_csv(folder / name, index=False)
+        output_frame = frame.copy()
+        # Keep the review metadata columns present but empty.  After a CSV
+        # round-trip pandas infers these all-empty columns as float64; saving
+        # a reviewer string must still work.
+        output_frame["v2_mask_review_status"] = "pending"
+        output_frame["v2_mask_reviewed_by"] = ""
+        output_frame["v2_mask_reviewed_at"] = ""
+        output_frame["v2_mask_review_notes"] = ""
+        output_frame["v2_reviewed_area_px"] = 0
+        output_frame["v2_reviewed_diameter_px"] = 0.0
+        output_frame.to_csv(folder / name, index=False)
     (folder / "manifest.json").write_text(
         json.dumps(
             {
@@ -73,6 +83,17 @@ def test_manual_mask_review_recomputes_derived_fields_and_persists(tmp_path):
         encoding="utf-8",
     )
     database = initialize_database(tmp_path / "annotations.db")
+    accepted = save_mask_review(
+        config,
+        database,
+        round_id=round_id,
+        candidate_id="B1:T0:test:1",
+        decision="accepted",
+        reviewed_mask_rle=None,
+        reviewer="tester",
+        notes="接受模型轮廓",
+    )
+    assert accepted["reviewed_area_px"] == int(mask.sum())
     edited = mask.copy()
     edited[40, 48] = True
     result = save_mask_review(
