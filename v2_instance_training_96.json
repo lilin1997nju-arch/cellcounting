@@ -1,0 +1,23 @@
+{
+  "sample_count": 5526,
+  "source_configs": [
+    "configs/default.yaml",
+    "configs/ql2202_validation.yaml"
+  ],
+  "patch_size_px": 96,
+  "label_counts": {
+    "debris": 2245,
+    "invalid": 2096,
+    "single": 916,
+    "touching_doublet": 203,
+    "cluster_3plus": 66
+  },
+  "A12_22_excluded": true,
+  "label_source": "reviewed_candidate_seed_plus_CF_or_residual_pseudo_mask",
+  "balanced_by_plate_and_class": true,
+  "label_origin_counts": {
+    "human_review": 3550,
+    "structural_wall_hard_negative": 1600,
+    "high_invalid_probability_texture_negative": 376
+  }
+}

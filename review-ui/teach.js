@@ -1,8 +1,12 @@
 const $=id=>document.getElementById(id);
+const reviewBaseUrl = document.querySelector('meta[name="review-base-url"]')?.content || "";
+const reviewUrl = url => reviewBaseUrl && String(url).startsWith("/")
+  ? `${reviewBaseUrl}${url}`
+  : url;
 const state={mode:"seed",items:[],focused:0,anchor:null,busy:false};
 
 async function api(url,options){
-  const response=await fetch(url,options);
+  const response=await fetch(reviewUrl(url),options);
   if(!response.ok)throw new Error(await response.text());
   return response.json();
 }
@@ -39,7 +43,7 @@ function render(){
   state.items.forEach((item,index)=>{
     const tile=$("tileTemplate").content.firstElementChild.cloneNode(true);
     tile.dataset.index=index;
-    tile.querySelector("img").src=`/api/patch?well=${item.well}&timepoint=T0&x=${item.x_px}&y=${item.y_px}&size=128`;
+    tile.querySelector("img").src=reviewUrl(`/api/patch?well=${item.well}&timepoint=T0&x=${item.x_px}&y=${item.y_px}&size=128`);
     tile.querySelector(".index-badge").textContent=index+1;
     tile.querySelector(".probability").textContent=probabilityText(item);
     tile.querySelector(".well").textContent=item.well;

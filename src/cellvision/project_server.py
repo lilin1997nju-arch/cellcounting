@@ -18,6 +18,9 @@ import re
 import sqlite3
 import subprocess
 import sys
+import time
+from threading import RLock
+from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -659,6 +662,8 @@ def _folder_name(path_value: str | Path) -> str:
 
 
 def _project_card(path: Path) -> dict[str, Any]:
+    """Build a lightweight project card without opening board artifacts."""
+
     value = _read_manifest(path) or {}
     plates = value.get("plates") if isinstance(value.get("plates"), list) else []
     aggregate: dict[str, int] = {}
@@ -668,27 +673,16 @@ def _project_card(path: Path) -> dict[str, Any]:
         if not isinstance(plate, dict):
             continue
         stored_counts = plate.get("category_counts")
-        has_stored_result = (
-            isinstance(stored_counts, dict)
-            and (
-                str(plate.get("status", "")).lower() == "completed"
-                or bool(stored_counts)
-            )
-        )
-        if has_stored_result:
+        if str(plate.get("status", "")).lower() == "completed":
             completed += 1
-            for key, count in stored_counts.items():
-                aggregate[str(key)] = aggregate.get(str(key), 0) + int(count or 0)
-        else:
-            report, _ = _report_for_plate(plate)
-            if report:
-                completed += 1
-                for key, count in (report.get("category_counts") or {}).items():
+            if isinstance(stored_counts, dict):
+                for key, count in stored_counts.items():
                     aggregate[str(key)] = aggregate.get(str(key), 0) + int(count or 0)
-        if _review_progress_for_plate(plate).get("review_complete"):
+        if bool(plate.get("review_complete")):
             reviewed += 1
     project_id = str(value.get("project_id") or path.parent.name)
-    detection_start, detection_end = _project_detection_dates(value)
+    detection_start = value.get("detection_start_date")
+    detection_end = value.get("detection_end_date")
     return {
         "project_id": project_id,
         "project_name": str(value.get("project_name") or project_id),
@@ -722,16 +716,45 @@ class _LazyPlateApp:
     deferring the expensive initialization to the first request.
     """
 
-    def __init__(self, config_path: Path, project_back_url: str = ""):
+    def __init__(
+        self,
+        config_path: Path,
+        project_back_url: str = "",
+        review_base_url: str = "",
+    ):
         self.config_path = config_path
         self.project_back_url = project_back_url
+        self.review_base_url = review_base_url.rstrip("/")
         self._app = None
         self._error: str | None = None
         self._lock = asyncio.Lock()
+        self._active_requests = 0
+        self._last_used = time.monotonic()
 
     @property
     def loaded(self) -> bool:
         return self._app is not None
+
+    @property
+    def active_requests(self) -> int:
+        return self._active_requests
+
+    @property
+    def last_used(self) -> float:
+        return self._last_used
+
+    def touch(self) -> None:
+        self._last_used = time.monotonic()
+
+    async def unload(self) -> None:
+        """Release the in-memory review application after it becomes idle."""
+
+        async with self._lock:
+            if self._active_requests:
+                return
+            self._app = None
+            self._error = None
+            self.touch()
 
     async def _ensure_app(self):
         if self._app is not None:
@@ -745,28 +768,249 @@ class _LazyPlateApp:
                         create_app,
                         load_config(self.config_path),
                         project_back_url=self.project_back_url,
+                        review_base_url=self.review_base_url,
                     )
                 except Exception as exc:  # pragma: no cover - startup-only path
                     self._error = f"{type(exc).__name__}: {exc}"
         return self._app
 
     async def __call__(self, scope, receive, send):
-        app = await self._ensure_app()
+        self._active_requests += 1
+        self.touch()
+        try:
+            app = await self._ensure_app()
+            if app is None:
+                if scope.get("type") != "http":
+                    raise RuntimeError(self._error or "plate review app unavailable")
+                body = json.dumps(
+                    {"detail": "plate review app unavailable", "error": self._error},
+                    ensure_ascii=False,
+                ).encode("utf-8")
+                await send({
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [(b"content-type", b"application/json; charset=utf-8")],
+                })
+                await send({"type": "http.response.body", "body": body})
+                return
+            await app(scope, receive, send)
+        finally:
+            self._active_requests = max(0, self._active_requests - 1)
+            self.touch()
+
+
+class _PlateReviewManager:
+    """Resolve and lazily serve any project/plate pair from one hub.
+
+    Project manifests are intentionally read only when a board is requested.
+    The manager keeps a small LRU of initialized review applications, so the
+    hub can expose many projects without loading every board's CSV/database at
+    startup.
+    """
+
+    def __init__(
+        self,
+        root_manifest: Path,
+        *,
+        fixed_project_id: str | None = None,
+        legacy_project_id: str | None = None,
+        max_loaded: int = 3,
+        idle_seconds: float = 20 * 60,
+    ) -> None:
+        self.root_manifest = root_manifest
+        self.fixed_project_id = fixed_project_id
+        self.legacy_project_id = legacy_project_id
+        self.max_loaded = max(1, int(max_loaded))
+        self.idle_seconds = max(30.0, float(idle_seconds))
+        self._apps: OrderedDict[tuple[str, str], _LazyPlateApp] = OrderedDict()
+        self._lock = asyncio.Lock()
+        self._manifest_cache: dict[Path, tuple[int, dict[str, Any]]] = {}
+        self._manifest_lock = RLock()
+
+    @property
+    def loaded_keys(self) -> list[tuple[str, str]]:
+        return [key for key, value in self._apps.items() if value.loaded]
+
+    async def start(self) -> None:
+        if getattr(self, "_janitor", None) is None or self._janitor.done():
+            self._janitor = asyncio.create_task(self._janitor_loop())
+
+    async def stop(self) -> None:
+        janitor = getattr(self, "_janitor", None)
+        if janitor is None:
+            return
+        janitor.cancel()
+        try:
+            await janitor
+        except asyncio.CancelledError:
+            pass
+        self._janitor = None
+
+    async def _janitor_loop(self) -> None:
+        interval = min(60.0, max(5.0, self.idle_seconds / 4))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                await self._evict()
+        except asyncio.CancelledError:
+            raise
+
+    def resolve_plate(
+        self,
+        project_id: str,
+        plate_slug: str,
+    ) -> tuple[str, Path, dict[str, Any]] | None:
+        """Return the canonical project id, config path and plate record."""
+
+        requested_project = self.fixed_project_id or project_id
+        wanted_project = _slug(requested_project)
+        manifest_path = None
+        value = None
+        with self._manifest_lock:
+            for candidate in _project_manifest_paths(self.root_manifest):
+                try:
+                    modified = candidate.stat().st_mtime_ns
+                except OSError:
+                    continue
+                cached = self._manifest_cache.get(candidate)
+                if cached is None or cached[0] != modified:
+                    current = _read_manifest(candidate)
+                    if current is None:
+                        self._manifest_cache.pop(candidate, None)
+                        continue
+                    self._manifest_cache[candidate] = (modified, current)
+                    cached = (modified, current)
+                candidate_value = cached[1]
+                candidate_id = _slug(str(candidate_value.get("project_id") or candidate.parent.name))
+                if candidate_id == wanted_project:
+                    manifest_path = candidate
+                    value = candidate_value
+                    break
+            live_paths = set(_project_manifest_paths(self.root_manifest))
+            for cached_path in list(self._manifest_cache):
+                if cached_path not in live_paths:
+                    self._manifest_cache.pop(cached_path, None)
+        if value is None:
+            return None
+        canonical_project = str(value.get("project_id") or manifest_path.parent.name)
+        if self.fixed_project_id and _slug(canonical_project) != _slug(self.fixed_project_id):
+            return None
+        wanted_plate = _slug(plate_slug)
+        for plate in value.get("plates", []):
+            if not isinstance(plate, dict):
+                continue
+            candidate = str(plate.get("slug") or _slug(plate.get("board_id", "")))
+            if not candidate or _slug(candidate) != wanted_plate:
+                continue
+            config_value = plate.get("config")
+            images_value = plate.get("images_manifest")
+            if not config_value or not images_value:
+                return None
+            config_path = _resolve(config_value)
+            images_path = _resolve(images_value)
+            if not config_path.exists() or not images_path.exists():
+                return None
+            return canonical_project, config_path, plate
+        return None
+
+    async def _get_app(
+        self,
+        project_id: str,
+        plate_slug: str,
+    ) -> tuple[_LazyPlateApp | None, str | None]:
+        resolved = self.resolve_plate(project_id, plate_slug)
+        if resolved is None:
+            return None, "project or plate not found"
+        canonical_project, config_path, _ = resolved
+        canonical_plate = _slug(plate_slug)
+        key = (canonical_project, canonical_plate)
+        async with self._lock:
+            app = self._apps.get(key)
+            if app is None:
+                app = _LazyPlateApp(
+                    config_path,
+                    project_back_url=f"/projects/{_slug(canonical_project)}/",
+                    review_base_url=f"/projects/{_slug(canonical_project)}/plates/{canonical_plate}",
+                )
+                self._apps[key] = app
+            else:
+                # A worker may replace a generated config while the server is
+                # running.  Re-resolve the path on every request and refresh
+                # the wrapper if it changed.
+                if app.config_path != config_path:
+                    await app.unload()
+                    app = _LazyPlateApp(
+                        config_path,
+                        project_back_url=f"/projects/{_slug(canonical_project)}/",
+                        review_base_url=f"/projects/{_slug(canonical_project)}/plates/{canonical_plate}",
+                    )
+                    self._apps[key] = app
+            self._apps.move_to_end(key)
+            app.touch()
+        await self._evict(exclude=key)
+        return app, None
+
+    async def _evict(self, *, exclude: tuple[str, str] | None = None) -> None:
+        now = time.monotonic()
+        async with self._lock:
+            all_loaded = [
+                (key, app)
+                for key, app in self._apps.items()
+                if app.loaded
+            ]
+            loaded = [
+                item for item in all_loaded
+                if item[0] != exclude and item[1].active_requests == 0
+            ]
+            by_age = sorted(loaded, key=lambda item: item[1].last_used)
+            needed = max(0, len(all_loaded) - self.max_loaded)
+            candidates = by_age[:needed]
+            for item in by_age:
+                if now - item[1].last_used >= self.idle_seconds and item not in candidates:
+                    candidates.append(item)
+            for key, app in candidates:
+                if self._apps.get(key) is app:
+                    self._apps.pop(key, None)
+        for _, app in candidates:
+            await app.unload()
+
+    async def __call__(self, scope, receive, send):
+        params = scope.get("path_params", {})
+        project_id = str(
+            params.get("project_id")
+            or self.fixed_project_id
+            or self.legacy_project_id
+            or ""
+        )
+        plate_slug = str(params.get("plate_slug") or "")
+        app, error = await self._get_app(project_id, plate_slug)
         if app is None:
-            if scope.get("type") != "http":
-                raise RuntimeError(self._error or "plate review app unavailable")
-            body = json.dumps(
-                {"detail": "plate review app unavailable", "error": self._error},
-                ensure_ascii=False,
-            ).encode("utf-8")
+            body = json.dumps({"detail": error or "plate not found"}, ensure_ascii=False).encode("utf-8")
             await send({
                 "type": "http.response.start",
-                "status": 503,
+                "status": 404,
                 "headers": [(b"content-type", b"application/json; charset=utf-8")],
             })
             await send({"type": "http.response.body", "body": body})
             return
-        await app(scope, receive, send)
+        # ``add_route`` performs parameter matching but does not create the
+        # child ASGI scope that ``mount`` normally creates.  Strip the hub
+        # prefix before handing the request to the per-board FastAPI app so
+        # its existing /auto-review, /api/* and /assets/* routes continue to
+        # match.  Keep root_path for URL generation and diagnostics.
+        path = str(params.get("path") or "")
+        child_scope = dict(scope)
+        prefix = str(scope.get("root_path") or "")
+        if not prefix:
+            raw_path = str(scope.get("path") or "")
+            marker = f"/plates/{plate_slug}"
+            marker_index = raw_path.find(marker)
+            prefix = raw_path[: marker_index + len(marker)] if marker_index >= 0 else raw_path
+        child_scope["root_path"] = ""
+        child_scope["app_root_path"] = prefix
+        child_scope["path"] = f"/{path}" if path else "/"
+        child_scope["path_params"] = {}
+        await app(child_scope, receive, send)
 
 
 def create_project_app(manifest_path: str | Path) -> FastAPI:
@@ -782,27 +1026,95 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     app.mount("/project-assets", StaticFiles(directory=ui_root), name="project-assets")
     queue_file = _queue_path(manifest_file)
     queue_store = TaskQueueStore(queue_file)
-    # Register completed boards lazily.  A project can still be opened while a
-    # board is queued; that board simply appears as a disabled row until its
-    # manifest and inference artifacts are ready.
+
+    def manifest_for_project(project_id: str | None = None) -> Path:
+        """Resolve the manifest that owns a project-scoped API request."""
+
+        if not project_id:
+            return manifest_file
+        selected = _find_project_manifest(manifest_file, project_id)
+        if selected is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        return selected
+
+    def task_store_for_manifest(selected_manifest: Path) -> TaskQueueStore:
+        """Keep each project's task lifecycle in its own durable store."""
+
+        return TaskQueueStore(_queue_path(selected_manifest))
+
+    def task_store_entries() -> list[tuple[Path, TaskQueueStore]]:
+        """Return all project stores, including legacy records in the main store."""
+
+        entries: list[tuple[Path, TaskQueueStore]] = []
+        seen: set[Path] = set()
+        for selected_manifest in _project_manifest_paths(manifest_file):
+            resolved_queue = _queue_path(selected_manifest).resolve()
+            if resolved_queue in seen:
+                continue
+            seen.add(resolved_queue)
+            entries.append((selected_manifest, TaskQueueStore(resolved_queue)))
+        if queue_file.resolve() not in seen:
+            entries.append((manifest_file, queue_store))
+        return entries
+
+    def tasks_for_project(project_id: str | None = None) -> list[dict[str, Any]]:
+        """Read one project's queue, or a de-duplicated hub-wide view."""
+
+        if project_id:
+            return task_store_for_manifest(manifest_for_project(project_id)).list()
+        values: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        for _, store in task_store_entries():
+            for task in store.list():
+                key = str(task.get("task_id") or "")
+                if key and key in seen_ids:
+                    continue
+                if key:
+                    seen_ids.add(key)
+                values.append(task)
+        return values
+
+    def locate_task(task_id_value: str) -> tuple[TaskQueueStore, dict[str, Any]] | None:
+        """Find a task without assuming it belongs to the startup project."""
+
+        for _, store in task_store_entries():
+            task = store.get(task_id_value)
+            if task is not None:
+                return store, task
+        return None
+
+    # Register only a dynamic dispatcher.  It resolves the requested project
+    # and plate at request time, so sibling projects are immediately usable and
+    # no board image manifest/database is read during service startup.
+    review_manager = _PlateReviewManager(manifest_file, legacy_project_id=project_id)
+
+    @app.on_event("startup")
+    async def start_review_manager() -> None:
+        await review_manager.start()
+
+    @app.on_event("shutdown")
+    async def stop_review_manager() -> None:
+        await review_manager.stop()
+
+    app.add_route(
+        "/projects/{project_id}/plates/{plate_slug}/{path:path}",
+        review_manager,
+        methods=None,
+        name="project-plate-review",
+    )
+    # Keep the old URL working for existing bookmarks.  It is restricted to
+    # the startup project because the old URL has no project namespace.
+    app.add_route(
+        "/plates/{plate_slug}/{path:path}",
+        review_manager,
+        methods=None,
+        name="legacy-plate-review",
+    )
     mounted: list[str] = []
-    lazy_apps: dict[str, _LazyPlateApp] = {}
     for plate in manifest.get("plates", []):
         slug = str(plate.get("slug") or _slug(plate.get("board_id", "")))
-        config_value = plate.get("config")
-        if not slug or not config_value:
-            continue
-        config_path = _resolve(config_value)
-        images_path = _resolve(plate.get("images_manifest", "")) if plate.get("images_manifest") else None
-        if not config_path.exists() or (images_path is not None and not images_path.exists()):
-            continue
-        try:
-            lazy_plate = _LazyPlateApp(config_path, project_back_url=project_back_url)
-            app.mount(f"/plates/{slug}", lazy_plate, name=f"plate-{slug}")
-            lazy_apps[slug] = lazy_plate
+        if review_manager.resolve_plate(project_id, slug) is not None:
             mounted.append(slug)
-        except (OSError, ValueError, KeyError) as exc:
-            plate["mount_error"] = str(exc)
     manifest["mounted_plates"] = mounted
 
     # Bind the project-level mask-review page to the first mounted plate.  The
@@ -834,42 +1146,102 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         default_mask_database = None
         default_mask_images = None
 
+    mask_context_cache: dict[str, tuple[dict[str, Any] | None, Path | None, pd.DataFrame | None]] = {}
+
+    def mask_context(project_id: str | None = None) -> tuple[dict[str, Any] | None, Path | None, pd.DataFrame | None]:
+        """Load mask-review inputs lazily for the selected project."""
+
+        if not project_id:
+            return default_mask_config, default_mask_database, default_mask_images
+        selected_path = manifest_for_project(project_id)
+        selected_value = _read_manifest(selected_path)
+        if selected_value is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        selected_id = _slug(str(selected_value.get("project_id") or selected_path.parent.name))
+        if selected_id in mask_context_cache:
+            return mask_context_cache[selected_id]
+        selected_plate = next(
+            (
+                plate for plate in selected_value.get("plates", [])
+                if isinstance(plate, dict) and plate.get("config") and plate.get("images_manifest")
+            ),
+            None,
+        )
+        config_value: dict[str, Any] | None = None
+        database_value: Path | None = None
+        images_value: pd.DataFrame | None = None
+        try:
+            if selected_plate is not None:
+                config_value = load_config(_resolve(selected_plate["config"]))
+                database_value = initialize_database(
+                    artifact_path(config_value, "annotations", "annotations.db")
+                )
+                images_path = _resolve(selected_plate["images_manifest"])
+                if images_path.exists():
+                    images_value = pd.read_csv(images_path)
+        except (OSError, KeyError, TypeError, ValueError, pd.errors.ParserError):
+            config_value = None
+            database_value = None
+            images_value = None
+        context = (config_value, database_value, images_value)
+        mask_context_cache[selected_id] = context
+        return context
+
     @app.get("/mask-review", response_class=HTMLResponse)
-    def project_mask_review() -> str:
+    def project_mask_review(project_id: str | None = None) -> str:
         page = (ui_root / "mask-review.html").read_text(encoding="utf-8")
         page = page.replace(
             '<meta name="mask-review-base" content="./">',
             '<meta name="mask-review-base" content="/">',
             1,
         )
+        page = page.replace(
+            '<meta name="project-id" content="">',
+            f'<meta name="project-id" content="{html.escape(_slug(project_id or ""), quote=True)}">',
+            1,
+        )
+        selected_back_url = f"/projects/{_slug(project_id)}/" if project_id else "/"
+        page = page.replace(
+            '<meta name="project-back-url" content="/">',
+            f'<meta name="project-back-url" content="{html.escape(selected_back_url, quote=True)}">',
+            1,
+        )
         return page.replace('href="assets/', 'href="/project-assets/').replace(
             'src="assets/', 'src="/project-assets/'
         )
 
+    @app.get("/projects/{project_id}/mask-review", response_class=HTMLResponse)
+    def project_scoped_mask_review(project_id: str) -> str:
+        return project_mask_review(project_id)
+
     @app.get("/api/mask-review-rounds")
-    def project_mask_review_rounds() -> list[dict[str, Any]]:
-        if default_mask_config is None or default_mask_database is None:
+    def project_mask_review_rounds(project_id: str | None = None) -> list[dict[str, Any]]:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             return []
-        return list_mask_review_rounds(default_mask_config, default_mask_database)
+        return list_mask_review_rounds(selected_config, selected_database)
 
     @app.get("/api/mask-comparison-options")
-    def project_mask_comparison_options() -> dict[str, Any]:
-        if default_mask_config is None or default_mask_database is None:
+    def project_mask_comparison_options(project_id: str | None = None) -> dict[str, Any]:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
-            return mask_comparison_options(default_mask_config, default_mask_database)
+            return mask_comparison_options(selected_config, selected_database)
         except (FileNotFoundError, ValueError, OSError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/mask-comparison-round")
     def project_mask_comparison_round(
         payload: ProjectMaskComparisonPayload,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        if default_mask_config is None or default_mask_database is None:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
             return create_model_comparison_round(
-                default_mask_config,
+                selected_config,
                 old_checkpoint=payload.old_checkpoint,
                 new_checkpoint=payload.new_checkpoint,
                 source_configs=payload.source_configs or None,
@@ -879,24 +1251,27 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/mask-review-summary")
-    def project_mask_review_summary(round_id: str) -> dict[str, Any]:
-        if default_mask_config is None or default_mask_database is None:
+    def project_mask_review_summary(round_id: str, project_id: str | None = None) -> dict[str, Any]:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
-            return mask_review_summary(default_mask_config, default_mask_database, round_id)
+            return mask_review_summary(selected_config, selected_database, round_id)
         except (FileNotFoundError, ValueError, OSError) as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/api/mask-review-candidates")
     def project_mask_review_candidates(
-        round_id: str, status: str = "pending", limit: int = 500
+        round_id: str, status: str = "pending", limit: int = 500,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        if default_mask_config is None or default_mask_database is None:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
             return mask_review_candidates(
-                default_mask_config,
-                default_mask_database,
+                selected_config,
+                selected_database,
                 round_id,
                 status=status,
                 limit=min(int(limit), 5000),
@@ -906,14 +1281,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
     @app.get("/api/mask-review-candidate")
     def project_mask_review_candidate(
-        round_id: str, candidate_id: str
+        round_id: str, candidate_id: str, project_id: str | None = None
     ) -> dict[str, Any]:
-        if default_mask_config is None or default_mask_database is None:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
             item = mask_review_candidate(
-                default_mask_config,
-                default_mask_database,
+                selected_config,
+                selected_database,
                 round_id,
                 candidate_id,
             )
@@ -926,13 +1302,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     @app.post("/api/mask-review-save")
     def project_mask_review_save(
         payload: ProjectMaskReviewSavePayload,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        if default_mask_config is None or default_mask_database is None:
+        selected_config, selected_database, _ = mask_context(project_id)
+        if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
             return save_mask_review(
-                default_mask_config,
-                default_mask_database,
+                selected_config,
+                selected_database,
                 round_id=payload.round_id,
                 candidate_id=payload.candidate_id,
                 decision=payload.decision,
@@ -951,8 +1329,9 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         y: float,
         size: int = 256,
         source_config: str | None = None,
+        project_id: str | None = None,
     ) -> Response:
-        image_manifest = default_mask_images
+        _, _, image_manifest = mask_context(project_id)
         if source_config:
             try:
                 comparison_config = load_config(_resolve(source_config))
@@ -983,14 +1362,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         crop.save(buffer, format="JPEG", quality=90)
         return Response(content=buffer.getvalue(), media_type="image/jpeg")
 
-    def multiplicity_plate_contexts() -> list[dict[str, Any]]:
+    def multiplicity_plate_contexts(selected_manifest: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Return the lightweight per-board context for the project queue."""
 
+        selected_value = selected_manifest if selected_manifest is not None else manifest
         contexts: list[dict[str, Any]] = []
-        for plate in manifest.get("plates", []):
+        for plate in selected_value.get("plates", []):
             slug = str(plate.get("slug") or _slug(plate.get("board_id", "")))
             config_value = plate.get("config")
-            if not slug or slug not in mounted or not config_value:
+            if not slug or not config_value:
                 continue
             config_path = _resolve(config_value)
             if not config_path.exists():
@@ -1009,28 +1389,44 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         return contexts
 
     @app.get("/single-doublet-review", response_class=HTMLResponse)
-    def single_doublet_review() -> str:
+    def single_doublet_review(project_id: str | None = None) -> str:
+        selected_manifest = manifest if not project_id else _read_manifest(manifest_for_project(project_id))
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        selected_project_id = str(selected_manifest.get("project_id") or project_id or manifest_file.parent.name)
+        selected_project_name = str(selected_manifest.get("project_name") or selected_project_id)
+        selected_back_url = f"/projects/{_slug(selected_project_id)}/" if project_id else "/"
         page = (ui_root / "single-doublet-review.html").read_text(encoding="utf-8")
         page = page.replace('content="plate"', 'content="project"', 1)
         page = page.replace(
+            '<meta name="project-id" content="">',
+            f'<meta name="project-id" content="{html.escape(_slug(selected_project_id), quote=True)}">',
+            1,
+        )
+        page = page.replace(
             '<meta name="project-back-url" content="">',
-            f'<meta name="project-back-url" content="{html.escape(project_back_url, quote=True)}">',
+            f'<meta name="project-back-url" content="{html.escape(selected_back_url, quote=True)}">',
             1,
         )
         page = page.replace(
             '<meta name="project-name" content="">',
-            f'<meta name="project-name" content="{html.escape(project_name, quote=True)}">',
+            f'<meta name="project-name" content="{html.escape(selected_project_name, quote=True)}">',
             1,
         )
         page = page.replace('href="assets/', 'href="/project-assets/', 1)
         page = page.replace('src="assets/', 'src="/project-assets/', 1)
         return page
 
+    @app.get("/projects/{project_id}/single-doublet-review", response_class=HTMLResponse)
+    def project_single_doublet_review(project_id: str) -> str:
+        return single_doublet_review(project_id)
+
     @app.get("/api/multiplicity-training-candidates")
     def multiplicity_training_candidates(
         mode: str = "likely_doublet",
         limit: int = 48,
         category: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         if mode not in {"likely_doublet", "uncertain", "diverse"}:
             raise HTTPException(status_code=422, detail="Invalid queue mode")
@@ -1042,9 +1438,13 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "invalid",
         }:
             raise HTTPException(status_code=422, detail="Invalid multiplicity category")
+        selected_manifest = manifest if not project_id else _read_manifest(manifest_for_project(project_id))
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        selected_project_id = str(selected_manifest.get("project_id") or project_id or manifest_file.parent.name)
         requested = max(1, min(int(limit), 240))
         candidates: list[dict[str, Any]] = []
-        for context in multiplicity_plate_contexts():
+        for context in multiplicity_plate_contexts(selected_manifest):
             try:
                 rows = multiplicity_queue(
                     context["config"],
@@ -1059,7 +1459,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 item = dict(row)
                 item["plate_slug"] = context["slug"]
                 item["plate_label"] = context["label"]
-                item["patch_base"] = f"/plates/{context['slug']}"
+                item["patch_base"] = f"/projects/{_slug(selected_project_id)}/plates/{context['slug']}"
                 item["review_id"] = f"{context['slug']}::{item['candidate_id']}"
                 candidates.append(item)
 
@@ -1130,7 +1530,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         return [_safe(item) for item in candidates[:requested]]
 
     @app.get("/api/multiplicity-training-stats")
-    def multiplicity_training_stats() -> dict[str, Any]:
+    def multiplicity_training_stats(project_id: str | None = None) -> dict[str, Any]:
+        selected_manifest = manifest if not project_id else _read_manifest(manifest_for_project(project_id))
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
         totals = {
             "single": 0,
             "touching_doublet": 0,
@@ -1142,7 +1545,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "skip": 0,
         }
         plates: list[dict[str, Any]] = []
-        for context in multiplicity_plate_contexts():
+        for context in multiplicity_plate_contexts(selected_manifest):
             stats = multiplicity_stats(context["database"])
             counts = stats.get("counts", {})
             for label in totals:
@@ -1171,8 +1574,12 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     @app.post("/api/multiplicity-training-labels")
     def multiplicity_training_labels(
         payload: ProjectMultiplicityLabelsPayload,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
-        contexts = {item["slug"]: item for item in multiplicity_plate_contexts()}
+        selected_manifest = manifest if not project_id else _read_manifest(manifest_for_project(project_id))
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        contexts = {item["slug"]: item for item in multiplicity_plate_contexts(selected_manifest)}
         grouped: dict[str, list[dict[str, Any]]] = {}
         for item in payload.items:
             if item.plate_slug not in contexts:
@@ -1192,9 +1599,12 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
     @app.delete("/api/multiplicity-training-labels/{plate_slug}/{candidate_id}")
     def multiplicity_training_label_delete(
-        plate_slug: str, candidate_id: str
+        plate_slug: str, candidate_id: str, project_id: str | None = None
     ) -> dict[str, Any]:
-        contexts = {item["slug"]: item for item in multiplicity_plate_contexts()}
+        selected_manifest = manifest if not project_id else _read_manifest(manifest_for_project(project_id))
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        contexts = {item["slug"]: item for item in multiplicity_plate_contexts(selected_manifest)}
         context = contexts.get(plate_slug)
         if context is None:
             raise HTTPException(status_code=404, detail="Unknown plate")
@@ -1230,11 +1640,16 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
     @app.get("/api/health")
     def health() -> dict[str, Any]:
+        loaded = [
+            {"project_id": project, "plate_slug": plate}
+            for project, plate in review_manager.loaded_keys
+        ]
         return {
             "status": "ok",
             "project": project_name,
             "mounted_plates": mounted,
-            "loaded_plates": [slug for slug, item in lazy_apps.items() if item.loaded],
+            "loaded_plates": [item["plate_slug"] for item in loaded if item["project_id"] == project_id],
+            "loaded_review_apps": loaded,
             "project_count": len(_project_manifest_paths(manifest_file)),
         }
 
@@ -1249,7 +1664,12 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             missing.append(str(ui_root))
         if missing:
             raise HTTPException(status_code=503, detail={"missing": missing})
-        return {"status": "ready", "project": project_name, "plate_count": len(mounted)}
+        return {
+            "status": "ready",
+            "project": project_name,
+            "plate_count": len(mounted),
+            "project_count": len(_project_manifest_paths(manifest_file)),
+        }
 
     @app.get("/api/projects")
     def projects() -> list[dict[str, Any]]:
@@ -1271,6 +1691,16 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             else:
                 raise HTTPException(status_code=404, detail="project not found")
         plates = [_plate_summary(item) for item in selected_manifest.get("plates", [])]
+        selected_project_id = str(selected_manifest.get("project_id") or selected_path.parent.name)
+        selected_mounted = [
+            str(item.get("slug") or _slug(item.get("board_id", "")))
+            for item in selected_manifest.get("plates", [])
+            if isinstance(item, dict)
+            and review_manager.resolve_plate(
+                selected_project_id,
+                str(item.get("slug") or _slug(item.get("board_id", ""))),
+            ) is not None
+        ]
         aggregate: dict[str, int] = {}
         for item in plates:
             for key, value in item["category_counts"].items():
@@ -1281,7 +1711,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "project_name": selected_manifest.get("project_name", selected_path.parent.name),
             "root": selected_manifest.get("root"),
             "plate_count": len(plates),
-            "mounted_plates": mounted if selected_path == manifest_file else [],
+            "mounted_plates": selected_mounted,
             "recognized_plate_count": int(sum(item.get("status") == "completed" for item in plates)),
             "reviewed_plate_count": int(sum(bool(item.get("review_complete")) for item in plates)),
             "category_counts": aggregate,
@@ -1299,14 +1729,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         }
 
     @app.get("/api/project/tasks")
-    def tasks() -> list[dict[str, Any]]:
-        return queue_store.list()
+    def tasks(project_id: str | None = None) -> list[dict[str, Any]]:
+        return tasks_for_project(project_id)
 
     @app.get("/api/project/worker-runtime")
-    def worker_runtime() -> dict[str, Any]:
+    def worker_runtime(project_id: str | None = None) -> dict[str, Any]:
         """Expose the adaptive worker's last hardware/status snapshot."""
 
-        runtime_path = queue_file.parent / "worker_runtime.json"
+        selected_manifest = manifest_for_project(project_id)
+        runtime_path = _queue_path(selected_manifest).parent / "worker_runtime.json"
         if not runtime_path.exists():
             return {
                 "status": "offline",
@@ -1360,11 +1791,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         if plates:
             raise HTTPException(status_code=409, detail="只有内容为空、没有板子的项目可以删除")
 
-        related = [
-            task
-            for task in queue_store.list()
-            if Path(str(task.get("project_manifest", ""))).expanduser().resolve() == selected_path.resolve()
-        ]
+        related_entries: list[tuple[TaskQueueStore, dict[str, Any]]] = []
+        for _, store in task_store_entries():
+            related_entries.extend(
+                (store, task)
+                for task in store.list()
+                if Path(str(task.get("project_manifest", ""))).expanduser().resolve()
+                == selected_path.resolve()
+            )
+        related = [task for _, task in related_entries]
         blocked = [
             task for task in related
             if str(task.get("status")) in {"running", "completed"}
@@ -1374,10 +1809,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
         selected_path.unlink(missing_ok=False)
         deleted_tasks: list[str] = []
-        plan_root = (queue_file.parent / "task_plans").resolve()
-        for task in related:
+        plan_root = (selected_path.parent / "task_plans").resolve()
+        for task_store, task in related_entries:
             task_key = str(task.get("task_id", ""))
-            if task_key and queue_store.delete(task_key) is not None:
+            if task_key and task_store.delete(task_key) is not None:
                 deleted_tasks.append(task_key)
             plan_value = task.get("plan_path")
             if plan_value:
@@ -1601,7 +2036,15 @@ public static class CellVisionWindowFocus
         })
         now = datetime.now(timezone.utc).isoformat()
         new_task_id = task_id()
-        plan_dir = queue_file.parent / "task_plans"
+        project_id = _slug(project_name) or new_task_id
+        project_dir = manifest_file.parent.parent / project_id
+        project_manifest_path = project_dir / "project.json"
+        if project_manifest_path.exists():
+            project_id = f"{project_id}-{new_task_id.rsplit('-', 1)[-1]}"
+            project_dir = manifest_file.parent.parent / project_id
+            project_manifest_path = project_dir / "project.json"
+        project_dir.mkdir(parents=True, exist_ok=True)
+        plan_dir = project_dir / "task_plans"
         plan_dir.mkdir(parents=True, exist_ok=True)
         plan_path = plan_dir / f"{new_task_id}.json"
         plan = {
@@ -1625,14 +2068,6 @@ public static class CellVisionWindowFocus
             "created_at": now,
         }
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-        project_id = _slug(project_name) or new_task_id
-        project_dir = manifest_file.parent.parent / project_id
-        project_manifest_path = project_dir / "project.json"
-        if project_manifest_path.exists():
-            project_id = f"{project_id}-{new_task_id.rsplit('-', 1)[-1]}"
-            project_dir = manifest_file.parent.parent / project_id
-            project_manifest_path = project_dir / "project.json"
-        project_dir.mkdir(parents=True, exist_ok=True)
         project_manifest_path.write_text(
             json.dumps({
                 "project_id": project_id,
@@ -1672,59 +2107,65 @@ public static class CellVisionWindowFocus
             "project_id": project_id,
             "project_manifest": str(project_manifest_path),
         }
-        return queue_store.add(task)
+        return task_store_for_manifest(project_manifest_path).add(task)
 
     @app.get("/api/project/task-queue")
-    def task_queue() -> dict[str, Any]:
-        return {"queue_path": str(queue_file), "tasks": queue_store.list()}
+    def task_queue(project_id: str | None = None) -> dict[str, Any]:
+        selected_manifest = manifest_for_project(project_id)
+        selected_queue = _queue_path(selected_manifest)
+        return {"queue_path": str(selected_queue), "tasks": tasks_for_project(project_id)}
 
     @app.get("/api/project/tasks/{task_id}")
     def task_detail(task_id: str) -> dict[str, Any]:
-        task = queue_store.get(task_id)
-        if task is None:
+        located = locate_task(task_id)
+        if located is None:
             raise HTTPException(status_code=404, detail="task not found")
+        _, task = located
         return task
 
     @app.post("/api/project/tasks/{task_id}/start")
     def start_task(task_id: str) -> dict[str, Any]:
-        task = queue_store.get(task_id)
-        if task is None:
+        located = locate_task(task_id)
+        if located is None:
             raise HTTPException(status_code=404, detail="task not found")
+        store, task = located
         if str(task.get("status")) != "queued":
             raise HTTPException(
                 status_code=409,
                 detail=f"task cannot start from status {task.get('status')}",
             )
-        started = queue_store.start(task_id, worker_id="manual")
+        started = store.start(task_id, worker_id="manual")
         if started is None:
             raise HTTPException(status_code=404, detail="task not found")
         return started
 
     @app.post("/api/project/tasks/{task_id}/cancel")
     def cancel_task(task_id: str) -> dict[str, Any]:
-        current = queue_store.get(task_id)
-        if current is None:
+        located = locate_task(task_id)
+        if located is None:
             raise HTTPException(status_code=404, detail="task not found")
+        store, current = located
         status = str(current.get("status"))
         if status not in {"queued", "running", "cancelled"}:
             raise HTTPException(
                 status_code=409,
                 detail=f"task cannot cancel from status {status}",
             )
-        task = queue_store.cancel(task_id)
+        task = store.cancel(task_id)
         return task or current
 
     @app.delete("/api/project/tasks/{task_id}")
     def delete_task(task_id: str) -> dict[str, Any]:
-        current = queue_store.get(task_id)
-        if current is None:
+        located = locate_task(task_id)
+        if located is None:
             raise HTTPException(status_code=404, detail="task not found")
+        store, current = located
         status = str(current.get("status"))
         if status == "completed":
             raise HTTPException(status_code=409, detail="completed tasks cannot be deleted")
         if status == "running":
             raise HTTPException(status_code=409, detail="cancel the running task before deleting it")
-        deleted = queue_store.delete(task_id)
+        deleted = store.delete(task_id)
         if deleted is None:
             raise HTTPException(status_code=404, detail="task not found")
         return {"status": "deleted", "task": deleted}

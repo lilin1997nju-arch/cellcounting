@@ -1,7 +1,10 @@
 const $ = id => document.getElementById(id);
-// The review UI is also mounted below /plates/<slug>.  Keep API and image
-// requests inside that mounted application instead of escaping to the hub.
-const mountedAppBase = (window.location.pathname.match(/^\/plates\/[^/]+/) || [""])[0];
+// The review UI is mounted below either /plates/<slug> (legacy) or
+// /projects/<project>/plates/<slug>. Keep API and image requests inside that
+// board application instead of escaping to the project hub.
+const mountedAppBase = document.querySelector('meta[name="review-base-url"]')?.content
+  || (window.location.pathname.match(/^(.*\/plates\/[^/]+)/) || [""])[1]
+  || "";
 const projectBackUrl = document.querySelector('meta[name="project-back-url"]')?.content || "";
 const backReviewList = $("backReviewList");
 if (backReviewList && projectBackUrl) backReviewList.href = projectBackUrl;

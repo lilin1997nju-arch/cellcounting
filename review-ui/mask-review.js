@@ -1,10 +1,16 @@
 (() => {
   const SIZE = 96;
   const API_BASE = document.querySelector('meta[name="mask-review-base"]')?.content || "";
+  const PROJECT_ID = document.querySelector('meta[name="project-id"]')?.content || "";
+  const PROJECT_BACK_URL = document.querySelector('meta[name="project-back-url"]')?.content || "/";
+  const backLink = document.querySelector(".back-link");
+  if (backLink) backLink.href = PROJECT_BACK_URL;
   const apiPath = (path) => {
     const base = API_BASE.trim();
-    if (!base || base === "/") return path;
-    return `${base.replace(/\/+$/, "")}${path}`;
+    const separator = path.includes("?") ? "&" : "?";
+    const scopedPath = PROJECT_ID ? `${path}${separator}project_id=${encodeURIComponent(PROJECT_ID)}` : path;
+    if (!base || base === "/") return scopedPath;
+    return `${base.replace(/\/+$/, "")}${scopedPath}`;
   };
   const state = {
     rounds: [],
@@ -261,7 +267,9 @@
       const sourceQuery = state.item.source_config
         ? `&source_config=${encodeURIComponent(state.item.source_config)}`
         : "";
-      sourceImage.src = `${apiPath("/api/patch")}?well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}${sourceQuery}`;
+      const patchPath = apiPath("/api/patch");
+      const patchSeparator = patchPath.includes("?") ? "&" : "?";
+      sourceImage.src = `${patchPath}${patchSeparator}well=${encodeURIComponent(state.item.well)}&timepoint=${encodeURIComponent(state.item.timepoint)}&x=${state.item.x_px}&y=${state.item.y_px}&size=${SIZE}&t=${Date.now()}${sourceQuery}`;
       $("notes").value = state.item.notes || "";
       setEditMode(false);
       updateDetails();

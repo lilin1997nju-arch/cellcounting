@@ -1,4 +1,8 @@
 const $=id=>document.getElementById(id);
+const reviewBaseUrl = document.querySelector('meta[name="review-base-url"]')?.content || "";
+const reviewUrl = url => reviewBaseUrl && String(url).startsWith("/")
+  ? `${reviewBaseUrl}${url}`
+  : url;
 const state={mode:"all",items:[],focused:0,busy:false,roundId:""};
 const labelNames={
   single:"单个细胞",
@@ -10,7 +14,7 @@ const labelNames={
 };
 
 async function api(url,options){
-  const response=await fetch(url,options);
+  const response=await fetch(reviewUrl(url),options);
   if(!response.ok)throw new Error(await response.text());
   return response.json();
 }
@@ -50,7 +54,7 @@ function render(){
   state.items.forEach((item,index)=>{
     const tile=$("tileTemplate").content.firstElementChild.cloneNode(true);
     tile.dataset.index=index;
-    tile.querySelector("img").src=`/api/patch?well=${item.well}&timepoint=${item.timepoint}&x=${item.x_px}&y=${item.y_px}&size=192`;
+    tile.querySelector("img").src=reviewUrl(`/api/patch?well=${item.well}&timepoint=${item.timepoint}&x=${item.x_px}&y=${item.y_px}&size=192`);
     tile.querySelector(".index-badge").textContent=index+1;
     const shownLabel=item.reviewed_label||item.integrated_label;
     const badge=tile.querySelector(".prediction");

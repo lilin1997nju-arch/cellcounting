@@ -1,14 +1,18 @@
 const $ = (id) => document.getElementById(id);
 
 const scope = document.querySelector('meta[name="review-scope"]')?.content || "plate";
+const projectId = document.querySelector('meta[name="project-id"]')?.content || "";
 const projectName = document.querySelector('meta[name="project-name"]')?.content || "当前板子";
 const pagePath = window.location.pathname.replace(/\/+$/, "");
 const plateBase = scope === "project" ? "" : pagePath.replace(/\/single-doublet-review$/, "");
 const apiRoot = scope === "project" ? "" : plateBase;
+const projectQuery = scope === "project" && projectId
+  ? `?project_id=${encodeURIComponent(projectId)}`
+  : "";
 const endpoints = {
-  queue: scope === "project" ? "/api/multiplicity-training-candidates" : `${apiRoot}/api/multiplicity-candidates`,
-  stats: scope === "project" ? "/api/multiplicity-training-stats" : `${apiRoot}/api/multiplicity-stats`,
-  labels: scope === "project" ? "/api/multiplicity-training-labels" : `${apiRoot}/api/multiplicity-labels`,
+  queue: scope === "project" ? `/api/multiplicity-training-candidates${projectQuery}` : `${apiRoot}/api/multiplicity-candidates`,
+  stats: scope === "project" ? `/api/multiplicity-training-stats${projectQuery}` : `${apiRoot}/api/multiplicity-stats`,
+  labels: scope === "project" ? `/api/multiplicity-training-labels${projectQuery}` : `${apiRoot}/api/multiplicity-labels`,
 };
 
 const categories = [
@@ -270,7 +274,8 @@ async function loadBatches(force = false) {
     state.pageSize = size;
     const results = await Promise.all(categories.map(async ({ key }) => {
       const query = new URLSearchParams({ mode: "uncertain", limit: String(size), category: key });
-      const rows = await api(`${endpoints.queue}?${query.toString()}`);
+      const separator = endpoints.queue.includes("?") ? "&" : "?";
+      const rows = await api(`${endpoints.queue}${separator}${query.toString()}`);
       if (rows.length && !Object.prototype.hasOwnProperty.call(rows[0], "predicted_category")) {
         throw new Error("服务端尚未加载分类审核接口，请重启 8777 后刷新页面");
       }

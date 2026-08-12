@@ -1,4 +1,8 @@
 const $=id=>document.getElementById(id);
+const reviewBaseUrl = document.querySelector('meta[name="review-base-url"]')?.content || "";
+const reviewUrl = url => reviewBaseUrl && String(url).startsWith("/")
+  ? `${reviewBaseUrl}${url}`
+  : url;
 const timepoints=["T0","T1","T2"];
 const colors={cell:"#16b58d",debris:"#d86b35",irrelevant:"#7b5ca7",uncertain:"#dda52f"};
 const modelNames={cell:"细胞",debris:"杂质/碎片",invalid:"无效"};
@@ -12,7 +16,7 @@ const state={
 };
 
 async function apiJson(url,options){
-  const response=await fetch(url,options);
+  const response=await fetch(reviewUrl(url),options);
   if(!response.ok)throw new Error(await response.text());
   return response.json();
 }
@@ -262,8 +266,8 @@ function loadImage(url){
 }
 async function loadPanelImage(tp){
   const info=state.context.timepoints[tp];if(!info?.available)return;
-  state.images[tp]=await loadImage(`/api/patch?well=${state.item.well}&timepoint=${tp}&x=${info.center_x_px}&y=${info.center_y_px}&size=${state.context.search_size_px}&v=${Date.now()}`);
-  $(`overview${tp}`).src=`/api/well-image?well=${state.item.well}&timepoint=${tp}&max_size=500`;
+  state.images[tp]=await loadImage(reviewUrl(`/api/patch?well=${state.item.well}&timepoint=${tp}&x=${info.center_x_px}&y=${info.center_y_px}&size=${state.context.search_size_px}&v=${Date.now()}`));
+  $(`overview${tp}`).src=reviewUrl(`/api/well-image?well=${state.item.well}&timepoint=${tp}&max_size=500`);
 }
 function renderCase(){
   $("wellBadge").textContent=state.item.well;$("caseTitle").textContent=state.item.canonical_target_id;
@@ -456,7 +460,7 @@ async function commitPanelPan(tp){
   view.panX=0;view.panY=0;
   $("status").textContent=`正在加载 ${tp} 邻近区域…`;
   try{
-    const url=`/api/review-context?well=${state.item.well}&x=${state.item.x_px}&y=${state.item.y_px}&search_size=${state.searchSize}&view_mode=${state.contextMode}&center_tp=${tp}&center_x=${centerX}&center_y=${centerY}&target_id=${encodeURIComponent(state.item.candidate_id)}`;
+    const url=reviewUrl(`/api/review-context?well=${state.item.well}&x=${state.item.x_px}&y=${state.item.y_px}&search_size=${state.searchSize}&view_mode=${state.contextMode}&center_tp=${tp}&center_x=${centerX}&center_y=${centerY}&target_id=${encodeURIComponent(state.item.candidate_id)}`);
     const refreshed=await apiJson(url);
     state.context.timepoints[tp]=refreshed.timepoints[tp];
     if(refreshed.representative_views?.[tp])state.context.representative_views[tp]=refreshed.representative_views[tp];
@@ -557,7 +561,7 @@ function openWhole(tp){
 }
 function renderWhole(){
   const tp=state.wholeTp,info=state.context.timepoints[tp];if(!info?.available)return;
-  $("wholeImage").src=`/api/well-image?well=${state.item.well}&timepoint=${tp}&max_size=1400`;
+  $("wholeImage").src=reviewUrl(`/api/well-image?well=${state.item.well}&timepoint=${tp}&max_size=1400`);
   const crop=$("wholeCrop");crop.style.left=`${info.origin_x_px/info.image_width_px*100}%`;crop.style.top=`${info.origin_y_px/info.image_height_px*100}%`;
   crop.style.width=`${state.context.search_size_px/info.image_width_px*100}%`;crop.style.height=`${state.context.search_size_px/info.image_height_px*100}%`;
   document.querySelectorAll("[data-whole-tab]").forEach(button=>button.classList.toggle("on",button.dataset.wholeTab===tp));

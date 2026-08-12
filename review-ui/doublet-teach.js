@@ -1,4 +1,8 @@
 const $=id=>document.getElementById(id);
+const reviewBaseUrl = document.querySelector('meta[name="review-base-url"]')?.content || "";
+const reviewUrl = url => reviewBaseUrl && String(url).startsWith("/")
+  ? `${reviewBaseUrl}${url}`
+  : url;
 const state={mode:"likely_doublet",items:[],focused:0,busy:false};
 const labelNames={
   single:"单细胞",touching_doublet:"相连两个",
@@ -6,7 +10,7 @@ const labelNames={
 };
 
 async function api(url,options){
-  const response=await fetch(url,options);
+  const response=await fetch(reviewUrl(url),options);
   if(!response.ok)throw new Error(await response.text());
   return response.json();
 }
@@ -38,7 +42,7 @@ function render(){
   for(const [index,item] of state.items.entries()){
     const tile=$("tileTemplate").content.firstElementChild.cloneNode(true);
     tile.dataset.index=index;
-    tile.querySelector("img").src=`/api/patch?well=${item.well}&timepoint=${item.timepoint}&x=${item.x_px}&y=${item.y_px}&size=160`;
+    tile.querySelector("img").src=reviewUrl(`/api/patch?well=${item.well}&timepoint=${item.timepoint}&x=${item.x_px}&y=${item.y_px}&size=160`);
     tile.querySelector(".index-badge").textContent=index+1;
     tile.querySelector(".probability").textContent=`细胞 ${(item.cell_probability*100).toFixed(0)}%`;
     tile.querySelector(".well").textContent=`${item.well} · ${item.timepoint}`;

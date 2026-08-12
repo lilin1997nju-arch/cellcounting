@@ -4,6 +4,17 @@ const projectId = document.querySelector('meta[name="project-id"]')?.content || 
 let projectData = null;
 let taskNameAutoValue = "";
 
+if (projectId) {
+  const multiplicityLink = $("multiplicityReviewLink");
+  if (multiplicityLink) {
+    multiplicityLink.href = `/single-doublet-review?project_id=${encodeURIComponent(projectId)}`;
+  }
+  const maskLink = $("maskReviewLink");
+  if (maskLink) {
+    maskLink.href = `/mask-review?project_id=${encodeURIComponent(projectId)}`;
+  }
+}
+
 const toast = text => {
   $("toast").textContent = text;
   $("toast").classList.add("show");
@@ -233,7 +244,9 @@ function renderProject(data) {
 
   $("plateRows").innerHTML = plates.length ? plates.map(plate => {
     const ready = mounted.includes(plate.slug);
-    const target = ready ? `/plates/${encodeURIComponent(plate.slug)}/` : "#";
+    const target = ready
+      ? `/projects/${encodeURIComponent(projectId)}/plates/${encodeURIComponent(plate.slug)}/`
+      : "#";
     const status = plateStatus(plate);
     const countsForPlate = plate.category_counts || {};
     return `<tr class="${ready ? "clickable" : ""}" ${ready ? `data-href="${esc(target)}"` : ""}>
@@ -267,7 +280,8 @@ async function loadTasks({ silent = false } = {}) {
   if (taskPollInFlight) return;
   taskPollInFlight = true;
   try {
-    const tasks = await api("/api/project/tasks");
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    const tasks = await api(`/api/project/tasks${query}`);
     tasks.forEach(task => {
       const id = String(task.task_id || "");
       const previous = taskStatusHistory.get(id);

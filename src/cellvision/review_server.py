@@ -1329,6 +1329,7 @@ def create_app(
     config: dict[str, Any],
     *,
     project_back_url: str | None = None,
+    review_base_url: str | None = None,
 ) -> FastAPI:
     database_path = artifact_path(config, "annotations", "annotations.db")
     images_manifest_path = artifact_path(config, "manifests", "images.csv")
@@ -1367,9 +1368,57 @@ def create_app(
     )
     app = FastAPI(title="Cell Vision Local Review")
     escaped_project_back_url = html.escape(project_back_url or "", quote=True)
+    escaped_review_base_url = html.escape((review_base_url or "").rstrip("/"), quote=True)
+
+    def review_page(path: Path) -> str:
+        """Rewrite a plate page so relative assets work on a nested route."""
+
+        page = path.read_text(encoding="utf-8")
+        if escaped_review_base_url:
+            page = page.replace(
+                "</head>",
+                f'<meta name="review-base-url" content="{escaped_review_base_url}">\n'
+                f'<base href="{escaped_review_base_url}/">\n</head>',
+                1,
+            )
+            page = page.replace(
+                'meta name="review-base-url" content=""',
+                f'meta name="review-base-url" content="{escaped_review_base_url}"',
+                1,
+            )
+            page = page.replace('href="/assets/', 'href="assets/').replace(
+                'src="/assets/', 'src="assets/'
+            )
+            for route in (
+                "auto-review",
+                "teach",
+                "doublet-teach",
+                "single-doublet-review",
+                "integrated-review",
+                "mask-review",
+            ):
+                page = page.replace(f'href="/{route}', f'href="{route}')
+            if path == mask_review_html_path:
+                page = page.replace(
+                    'meta name="mask-review-base" content="./"',
+                    f'meta name="mask-review-base" content="{escaped_review_base_url}"',
+                    1,
+                )
+            page = page.replace('href="/"', f'href="{escaped_project_back_url}"')
+        return page
 
     def auto_review_page() -> str:
-        page = auto_review_html_path.read_text(encoding="utf-8")
+        page = review_page(auto_review_html_path)
+        if escaped_project_back_url:
+            page = page.replace(
+                '<meta name="project-back-url" content="">',
+                f'<meta name="project-back-url" content="{escaped_project_back_url}">',
+                1,
+            )
+        return page
+
+    def scoped_page(path: Path) -> str:
+        page = review_page(path)
         if escaped_project_back_url:
             page = page.replace(
                 '<meta name="project-back-url" content="">',
@@ -2140,7 +2189,7 @@ def create_app(
 
     @app.get("/teach", response_class=HTMLResponse)
     def teach() -> str:
-        return teaching_html_path.read_text(encoding="utf-8")
+        return scoped_page(teaching_html_path)
 
     @app.get("/auto-review", response_class=HTMLResponse)
     def auto_review() -> str:
@@ -2148,19 +2197,19 @@ def create_app(
 
     @app.get("/doublet-teach", response_class=HTMLResponse)
     def doublet_teach() -> str:
-        return multiplicity_html_path.read_text(encoding="utf-8")
+        return scoped_page(multiplicity_html_path)
 
     @app.get("/single-doublet-review", response_class=HTMLResponse)
     def single_doublet_review() -> str:
-        return single_doublet_review_html_path.read_text(encoding="utf-8")
+        return scoped_page(single_doublet_review_html_path)
 
     @app.get("/integrated-review", response_class=HTMLResponse)
     def integrated_review() -> str:
-        return integrated_review_html_path.read_text(encoding="utf-8")
+        return scoped_page(integrated_review_html_path)
 
     @app.get("/mask-review", response_class=HTMLResponse)
     def mask_review() -> str:
-        return mask_review_html_path.read_text(encoding="utf-8")
+        return scoped_page(mask_review_html_path)
 
     @app.get("/api/health")
     def health() -> dict[str, str]:

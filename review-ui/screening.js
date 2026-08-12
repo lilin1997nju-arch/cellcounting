@@ -1,5 +1,9 @@
 const state = { wells: [], selected: null };
 const $ = id => document.getElementById(id);
+const reviewBaseUrl = document.querySelector('meta[name="review-base-url"]')?.content || "";
+const reviewUrl = url => reviewBaseUrl && String(url).startsWith("/")
+  ? `${reviewBaseUrl}${url}`
+  : url;
 
 const statusText = {
   single_active: "单细胞有活性",
@@ -32,7 +36,7 @@ const statusClass = status => ({
 }[status] || "issue");
 
 async function api(url, options) {
-  const response = await fetch(url, options);
+  const response = await fetch(reviewUrl(url), options);
   if (!response.ok) throw new Error(await response.text());
   return response.json();
 }
@@ -82,8 +86,8 @@ function imagePair(well, timepoint, units) {
   return `<article class="tp-card">
     <div class="tp-title"><span>${timepoint}</span><span>${units} 个细胞单位</span></div>
     <div class="image-pair">
-      <figure><img loading="lazy" src="/api/report-image?well=${well}&timepoint=${timepoint}&view=whole&max_size=900"><figcaption>整体视野（白框为局部位置）</figcaption></figure>
-      <figure><img loading="lazy" src="/api/report-image?well=${well}&timepoint=${timepoint}&view=local&max_size=900"><figcaption>局部原图（不绘制细胞圈）</figcaption></figure>
+      <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well}&timepoint=${timepoint}&view=whole&max_size=900`)}"><figcaption>整体视野（白框为局部位置）</figcaption></figure>
+      <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well}&timepoint=${timepoint}&view=local&max_size=900`)}"><figcaption>局部原图（不绘制细胞圈）</figcaption></figure>
     </div>
   </article>`;
 }
@@ -103,8 +107,8 @@ function confirmationCard(well, timepoint) {
   return `<article class="tp-card late-growth-card">
     <div class="tp-title"><span>${timepoint} 生长确认</span><span>${growthDecisionText[decision]}</span></div>
     <div class="image-pair">
-      <figure><img loading="lazy" src="/api/report-image?well=${well.well}&timepoint=${timepoint}&view=whole&max_size=1200"><figcaption>整体视野（用于判断孔内是否有明显生长）</figcaption></figure>
-      <figure><img loading="lazy" src="/api/report-image?well=${well.well}&timepoint=${timepoint}&view=local&max_size=1200"><figcaption>局部无标记视野</figcaption></figure>
+      <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well.well}&timepoint=${timepoint}&view=whole&max_size=1200`)}"><figcaption>整体视野（用于判断孔内是否有明显生长）</figcaption></figure>
+      <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well.well}&timepoint=${timepoint}&view=local&max_size=1200`)}"><figcaption>局部无标记视野</figcaption></figure>
     </div>
     <div class="growth-actions">${choices}</div>
   </article>`;
@@ -186,8 +190,8 @@ async function saveDecision(decision) {
 function reportCard(well) {
   const timepoints = ["T0", "T1", "T2", ...(well.t3_available ? ["T3"] : []), ...(well.t4_available ? ["T4"] : [])];
   const figures = timepoints.map(timepoint => `
-    <figure><img loading="lazy" src="/api/report-image?well=${well.well}&timepoint=${timepoint}&view=whole&max_size=700"><figcaption>${timepoint} 整体视野（白框为局部位置）</figcaption></figure>
-    <figure><img loading="lazy" src="/api/report-image?well=${well.well}&timepoint=${timepoint}&view=local&max_size=700"><figcaption>${timepoint} 局部无标记视野</figcaption></figure>`
+    <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well.well}&timepoint=${timepoint}&view=whole&max_size=700`)}"><figcaption>${timepoint} 整体视野（白框为局部位置）</figcaption></figure>
+    <figure><img loading="lazy" src="${reviewUrl(`/api/report-image?well=${well.well}&timepoint=${timepoint}&view=local&max_size=700`)}"><figcaption>${timepoint} 局部无标记视野</figcaption></figure>`
   ).join("");
   return `<article class="report-well"><h3>${well.well} <small>${well.review_decision === "approved" ? "已审核通过" : "模型预选·待孔级审核"}</small></h3><div class="report-images">${figures}</div></article>`;
 }
