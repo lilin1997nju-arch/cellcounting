@@ -1,0 +1,150 @@
+"""Runtime device detection and torch-device selection helpers.
+
+The project is intended to run on both GPU workstations and CPU-only
+machines.  Keep CUDA probing in one small module so the queue worker, CLI and
+inference code report the same decision and use the same fallback policy.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+
+
+SUPPORTED_DEVICE_REQUESTS = ("auto", "cuda", "cpu")
+
+
+def _normalise_request(value: str | None) -> str:
+    requested = str(value or os.getenv("CELLVISION_DEVICE", "auto")).strip().lower()
+    if requested not in SUPPORTED_DEVICE_REQUESTS:
+        raise ValueError(
+            f"Unsupported compute device {requested!r}; "
+            f"choose one of {', '.join(SUPPORTED_DEVICE_REQUESTS)}"
+        )
+    return requested
+
+
+@dataclass(frozen=True)
+class ComputeRuntime:
+    """A serialisable snapshot of the worker's selected compute backend."""
+
+    requested_device: str
+    selected_device: str
+    worker_kind: str
+    torch_available: bool
+    torch_version: str
+    cuda_available: bool
+    cuda_version: str
+    gpu_count: int
+    gpu_name: str
+    cpu_count: int
+    hostname: str
+    fallback_reason: str
+    detected_at: str
+
+    @property
+    def label(self) -> str:
+        if self.selected_device == "cuda":
+            return f"GPU worker ({self.gpu_name or 'CUDA'})"
+        return "CPU worker"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "requested_device": self.requested_device,
+            "selected_device": self.selected_device,
+            "worker_kind": self.worker_kind,
+            "label": self.label,
+            "torch_available": self.torch_available,
+            "torch_version": self.torch_version,
+            "cuda_available": self.cuda_available,
+            "cuda_version": self.cuda_version,
+            "gpu_count": self.gpu_count,
+            "gpu_name": self.gpu_name,
+            "cpu_count": self.cpu_count,
+            "hostname": self.hostname,
+            "fallback_reason": self.fallback_reason,
+            "detected_at": self.detected_at,
+        }
+
+
+def detect_compute_runtime(requested_device: str | None = None) -> ComputeRuntime:
+    """Detect CUDA and choose ``cuda`` or ``cpu``.
+
+    ``auto`` prefers CUDA only when PyTorch reports a usable CUDA runtime.  A
+    requested CUDA backend also falls back to CPU rather than preventing the
+    queue from running, which makes the same deployment command safe on a
+    CPU-only workstation.
+    """
+
+    requested = _normalise_request(requested_device)
+    torch_available = False
+    torch_version = ""
+    cuda_available = False
+    cuda_version = ""
+    gpu_count = 0
+    gpu_name = ""
+    probe_error = ""
+
+    try:
+        import torch
+
+        torch_available = True
+        torch_version = str(getattr(torch, "__version__", ""))
+        try:
+            cuda_available = bool(torch.cuda.is_available())
+            if cuda_available:
+                gpu_count = int(torch.cuda.device_count())
+                if gpu_count > 0:
+                    gpu_name = str(torch.cuda.get_device_name(0))
+                cuda_version = str(getattr(torch.version, "cuda", "") or "")
+        except Exception as exc:  # a broken driver must behave like no CUDA
+            probe_error = f"CUDA 检测失败：{type(exc).__name__}: {exc}"
+            cuda_available = False
+            gpu_count = 0
+    except Exception as exc:  # a CPU-only environment may not have torch yet
+        probe_error = f"PyTorch 不可用：{type(exc).__name__}: {exc}"
+
+    if requested == "cpu":
+        selected = "cpu"
+        fallback_reason = "按配置强制使用 CPU"
+    elif cuda_available:
+        selected = "cuda"
+        fallback_reason = ""
+    else:
+        selected = "cpu"
+        fallback_reason = probe_error or "未检测到可用 CUDA，自动切换 CPU"
+
+    return ComputeRuntime(
+        requested_device=requested,
+        selected_device=selected,
+        worker_kind="gpu" if selected == "cuda" else "cpu",
+        torch_available=torch_available,
+        torch_version=torch_version,
+        cuda_available=cuda_available,
+        cuda_version=cuda_version,
+        gpu_count=gpu_count,
+        gpu_name=gpu_name,
+        cpu_count=max(1, int(os.cpu_count() or 1)),
+        hostname=platform.node(),
+        fallback_reason=fallback_reason,
+        detected_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+
+def select_torch_device(requested_device: str | None = None):
+    """Return a torch device honoring ``CELLVISION_DEVICE`` when set."""
+
+    import torch
+
+    runtime = detect_compute_runtime(requested_device)
+    return torch.device(runtime.selected_device)
+
+
+def cuda_runtime_enabled(requested_device: str | None = None) -> bool:
+    """Whether CUDA synchronisation should be used for this process."""
+
+    return detect_compute_runtime(requested_device).selected_device == "cuda"
+

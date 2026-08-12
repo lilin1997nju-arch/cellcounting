@@ -12,15 +12,52 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 from scipy.ndimage import label as ndi_label
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
-from .config import artifact_path, load_config
+from .config import artifact_path, is_validation_holdout, load_config
 from .models.v2_temporal_evidence import TemporalEvidenceNet
 from .v2_instance_dataset import _crop
 from .v2_instance_inference import decode_rle
 
 
 CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
+
+
+def _balanced_sampler_weights(
+    groups: np.ndarray,
+    same: np.ndarray,
+    static: np.ndarray,
+    static_valid: np.ndarray,
+) -> np.ndarray:
+    """Return bounded plate/class weights for replay-balanced sampling."""
+
+    groups = np.asarray(
+        [str(value).split(":missing", 1)[0].split(":rolled", 1)[0] for value in groups]
+    )
+    same = np.asarray(same).astype(np.int64)
+    static = np.asarray(static).astype(np.int64)
+    static_valid = np.asarray(static_valid).astype(bool)
+
+    def inverse_frequency(values: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+        if valid is None:
+            valid = np.ones(len(values), dtype=bool)
+        weights = np.ones(len(values), dtype=np.float32)
+        if not valid.any():
+            return weights
+        unique, counts = np.unique(values[valid], return_counts=True)
+        target = float(np.median(counts))
+        for value, count in zip(unique, counts):
+            weights[valid & (values == value)] = np.clip(
+                target / max(float(count), 1.0), 0.5, 2.5
+            )
+        return weights
+
+    # Geometric blending prevents a tiny plate with a rare class from
+    # dominating the replay stream while still guaranteeing representation.
+    plate_weight = inverse_frequency(groups)
+    same_weight = inverse_frequency(same)
+    static_weight = inverse_frequency(static, static_valid)
+    return np.sqrt(plate_weight * same_weight * static_weight).astype(np.float32)
 
 
 def _lineage_static_target(row: pd.Series) -> float | None:
@@ -51,6 +88,16 @@ def _review_triplet_static_target(rows: list[pd.Series]) -> float | None:
     labels = [str(row.reviewed_label) for row in rows]
     if all(label == "debris" for label in labels):
         return 1.0
+    # A reviewed cell that progressively loses its cell morphology is a
+    # dynamic track, even when it does not divide.  Keeping this sequence out
+    # of the static class was allowing the temporal model to learn that a
+    # stable-looking T0 cell could remain a static object while it died.
+    if (
+        labels[0] in CELL_LABELS
+        and labels[-1] in {"uncertain", "debris"}
+        and any(label not in CELL_LABELS for label in labels[1:])
+    ):
+        return 0.0
     if not all(label in CELL_LABELS for label in labels):
         return None
     areas = [max(float(row.v2_instance_area_px), 1.0) for row in rows]
@@ -78,6 +125,8 @@ def _append_integrated_review_triplets(
     same_out: list[float],
     static_out: list[float],
     static_valid_out: list[float],
+    groups_out: list[str],
+    group_id: str,
 ) -> None:
     """Use the current rapid-review labels as temporal supervision.
 
@@ -198,15 +247,23 @@ def _append_integrated_review_triplets(
             same_out.append(1.0)
             static_out.append(static_target)
             static_valid_out.append(1.0)
+            groups_out.append(group_id)
 
 
 def build_temporal_training_cache(config: dict[str, Any]) -> Path:
     settings = config["v2_temporal_model"]
     size = int(settings.get("patch_size_px", 64))
-    images_out, numeric_out, present_out, same_out, static_out, static_valid_out = [], [], [], [], [], []
+    output = artifact_path(config, "v2", "cache", f"temporal_training_{size}.npz")
+    if bool(settings.get("reuse_training_cache", False)) and output.exists():
+        return output
+    images_out, numeric_out, present_out, same_out, static_out, static_valid_out, groups_out = [], [], [], [], [], [], []
     source_configs = settings.get("training_sources", ["configs/default.yaml", "configs/ql2202_validation.yaml"])
     for source_path in source_configs:
+        if is_validation_holdout(config, source_path):
+            continue
         source = load_config(source_path)
+        experiment = source.get("experiment", {})
+        group_id = f"{Path(source_path).stem}:{experiment.get('plate_id', '')}"
         database = artifact_path(source, "annotations", "annotations.db")
         manifest_path = artifact_path(source, "manifests", "images.csv")
         if not database.exists() or not manifest_path.exists():
@@ -291,6 +348,7 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
             static_target = _lineage_static_target(pd.Series(review._asdict()))
             static_out.append(float(static_target) if static_target is not None else 0.0)
             static_valid_out.append(float(static_target is not None))
+            groups_out.append(group_id)
         _append_integrated_review_triplets(
             source,
             size,
@@ -300,6 +358,8 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
             same_out,
             static_out,
             static_valid_out,
+            groups_out,
+            group_id,
         )
     if not images_out:
         raise RuntimeError("No lineage reviews are available for V2 temporal training.")
@@ -326,6 +386,7 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
         same_out.append(same_out[sample_index])
         static_out.append(static_out[sample_index])
         static_valid_out.append(static_valid_out[sample_index])
+        groups_out.append(f"{groups_out[sample_index]}:missing")
     # Rolled mismatches teach the correspondence head not to force a link.
     positive_images = np.asarray(images_out)
     if len(positive_images) > 1:
@@ -337,7 +398,7 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
         same_out.extend([0.0] * len(negatives))
         static_out.extend([0.0] * len(negatives))
         static_valid_out.extend([0.0] * len(negatives))
-    output = artifact_path(config, "v2", "cache", f"temporal_training_{size}.npz")
+        groups_out.extend([f"{group}:rolled" for group in groups_out[: len(negatives)]])
     np.savez_compressed(
         output,
         images=np.asarray(images_out, dtype=np.float32),
@@ -346,6 +407,7 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
         same=np.asarray(same_out, dtype=np.float32),
         static=np.asarray(static_out, dtype=np.float32),
         static_valid=np.asarray(static_valid_out, dtype=np.float32),
+        groups=np.asarray(groups_out, dtype=str),
     )
     return output
 
@@ -354,10 +416,43 @@ def train_v2_temporal_model(config: dict[str, Any]) -> Path:
     settings = config["v2_temporal_model"]
     cache = np.load(build_temporal_training_cache(config))
     dataset = TensorDataset(*(torch.from_numpy(cache[key]) for key in ("images", "numeric", "present", "same", "static", "static_valid")))
-    loader = DataLoader(dataset, batch_size=int(settings.get("batch_size", 16)), shuffle=True)
+    sampler = None
+    if bool(settings.get("balance_by_plate_and_class", True)):
+        sample_weights = _balanced_sampler_weights(
+            cache["groups"], cache["same"], cache["static"], cache["static_valid"]
+        )
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(sample_weights),
+            num_samples=len(dataset),
+            replacement=True,
+        )
+    loader = DataLoader(
+        dataset,
+        batch_size=int(settings.get("batch_size", 16)),
+        shuffle=sampler is None,
+        sampler=sampler,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     numeric_features = int(cache["numeric"].shape[1])
     model = TemporalEvidenceNet(numeric_features=numeric_features).to(device)
+    initial_checkpoint = str(settings.get("initial_checkpoint", "")).strip()
+    initialized_from_checkpoint = ""
+    if initial_checkpoint:
+        initial_path = Path(initial_checkpoint).expanduser()
+        if not initial_path.is_absolute():
+            initial_path = (Path.cwd() / initial_path).resolve()
+        if not initial_path.exists():
+            raise FileNotFoundError(f"Initial temporal checkpoint does not exist: {initial_path}")
+        payload = torch.load(initial_path, map_location=device)
+        state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
+        checkpoint_features = payload.get("numeric_features") if isinstance(payload, dict) else None
+        if checkpoint_features is not None and int(checkpoint_features) != numeric_features:
+            raise ValueError(
+                "Initial temporal checkpoint numeric feature count does not match the training cache: "
+                f"{checkpoint_features} != {numeric_features}"
+            )
+        model.load_state_dict(state, strict=True)
+        initialized_from_checkpoint = str(initial_path)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(settings.get("learning_rate", 8e-4)), weight_decay=1e-4)
     history = []
     static_values = cache["static"]
@@ -397,6 +492,7 @@ def train_v2_temporal_model(config: dict[str, Any]) -> Path:
         "base_high_confidence_threshold": float(settings.get("base_high_confidence_threshold", 0.90)),
         "temporal_logit_beta": float(settings.get("temporal_logit_beta", 2.0)),
         "maximum_probability_shift": float(settings.get("maximum_probability_shift", 0.30)),
+        "initialized_from_checkpoint": initialized_from_checkpoint or None,
     }
     torch.save(checkpoint_payload, checkpoint)
     metrics = {
@@ -407,6 +503,8 @@ def train_v2_temporal_model(config: dict[str, Any]) -> Path:
         "static_positive": int(static_counts[1]),
         "dynamic_positive": int(static_counts[0]),
         "static_valid": int(static_valid_values.sum()),
+        "initialized_from_checkpoint": initialized_from_checkpoint or None,
+        "balanced_sampler": bool(sampler is not None),
         "policy": "temporal output adjusts ambiguous cell/debris probabilities only",
         "fit_history": history,
     }

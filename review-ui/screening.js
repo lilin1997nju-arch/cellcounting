@@ -2,13 +2,16 @@ const state = { wells: [], selected: null };
 const $ = id => document.getElementById(id);
 
 const statusText = {
-  single_active: "高置信单细胞来源，已观察到生长分裂",
-  single_growth_unconfirmed: "单细胞来源，生长活性仍需确认",
+  single_active: "单细胞有活性",
+  single_not_divided: "T0-T2未分裂",
   multi_origin: "多细胞来源",
-  missing_t0_or_late_object: "T0缺失或后期才出现目标，需复核",
-  no_cell: "未检出细胞",
-  no_cell_growth: "T3/T4未见明显细胞生长，已跳过深度检索",
-  ambiguous: "来源判定不明确"
+  no_cell_growth: "无明显生长",
+  t0_missing_late_cells: "T0缺失但后期出现细胞",
+  positive_control: "阳性对照",
+  single_growth_unconfirmed: "T0-T2未分裂",
+  missing_t0_or_late_object: "T0缺失但后期出现细胞",
+  no_cell: "无明显生长",
+  ambiguous: "T0缺失但后期出现细胞"
 };
 const growthDecisionText = {
   obvious_growth: "明显生长",
@@ -18,10 +21,14 @@ const growthDecisionText = {
 };
 const statusClass = status => ({
   single_active: "good",
-  single_growth_unconfirmed: "single",
+  single_not_divided: "single",
   multi_origin: "multi",
-  no_cell: "empty",
-  no_cell_growth: "no-growth"
+  no_cell_growth: "no-growth",
+  t0_missing_late_cells: "issue",
+  single_growth_unconfirmed: "single",
+  missing_t0_or_late_object: "issue",
+  no_cell: "no-growth",
+  ambiguous: "issue"
 }[status] || "issue");
 
 async function api(url, options) {
@@ -41,7 +48,7 @@ function renderSummary() {
   const pending = state.wells.filter(well => well.late_growth_status === "pending").length;
   const required = state.wells.filter(well => well.deep_search_required).length;
   $("summary").innerHTML = `
-    <div class="metric"><b>${high}</b><span>单细胞且有活性</span></div>
+    <div class="metric"><b>${high}</b><span>单细胞有活性</span></div>
     <div class="metric"><b>${skipped}</b><span>晚期无生长，跳过深检</span></div>
     <div class="metric"><b>${pending}</b><span>T3/T4待快速标记</span></div>
     <div class="metric"><b>${required}</b><span>保留深度检索资格</span></div>`;

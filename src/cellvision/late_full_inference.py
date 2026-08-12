@@ -40,6 +40,35 @@ CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
 UNIT_COUNT = {"single": 1, "touching_doublet": 2, "cluster_3plus": 3}
 
 
+def _selected_late_timepoints(
+    config: dict[str, Any], images: pd.DataFrame
+) -> tuple[str, ...]:
+    """Return only the late endpoint that needs cell-position inference.
+
+    Day7/T3 is still useful as an image or growth-screening input, but when a
+    later endpoint exists its individual cell locations are not used by the
+    early-origin decision and are too unstable to justify full inference.
+    """
+
+    available = {
+        str(value).upper()
+        for value in images.get("timepoint", pd.Series(dtype=str)).dropna()
+        if str(value).upper() in LATE_TO_SURROGATE
+    }
+    if not available:
+        return ()
+    settings = config.get("late_growth", {})
+    requested = str(
+        settings.get(
+            "endpoint_timepoint",
+            config.get("gated_report", {}).get("endpoint_timepoint", ""),
+        )
+    ).upper()
+    if requested in available:
+        return (requested,)
+    return (max(available, key=lambda value: int(value[1:])),)
+
+
 def _shared_checkpoint(config: dict[str, Any], *parts: str) -> Path:
     shared_root = Path(
         config.get("late_growth", {}).get(
@@ -73,8 +102,9 @@ def _write_late_manifest(
     selected_wells: set[str] | None,
 ) -> pd.DataFrame:
     images = pd.read_csv(artifact_path(config, "manifests", "images.csv"))
+    selected_late_timepoints = _selected_late_timepoints(config, images)
     selected = images[
-        images["timepoint"].astype(str).isin(LATE_TO_SURROGATE)
+        images["timepoint"].astype(str).str.upper().isin(selected_late_timepoints)
         & images["decode_status"].astype(str).eq("ok")
     ].copy()
     excluded = {
@@ -312,11 +342,13 @@ def infer_late_full_instances(
     *,
     reuse_existing_integrated: bool = False,
 ) -> Path:
-    """Run the mature T0-T2 detection stack on T3/T4 images.
+    """Run the mature T0-T2 detection stack on the late endpoint only.
 
-    T3 and T4 are represented internally as T1 and T2 so the existing dense
+    The endpoint is represented internally as T1/T2 so the existing dense
     proposal, morphology, multiplicity, and V2 instance code can be reused
-    without mixing late predictions into the audited T0-T2 artifacts.
+    without mixing late predictions into the audited T0-T2 artifacts. Earlier
+    late images, especially Day7 when Day14 exists, remain available to the
+    growth gate but do not receive individual cell-position inference.
     """
 
     late_config = _late_pipeline_config(config)

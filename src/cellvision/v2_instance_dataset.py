@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +14,87 @@ from scipy.ndimage import gaussian_filter
 from skimage.measure import label, regionprops
 from torch.utils.data import Dataset
 
-from .config import artifact_path, load_config
+from .config import artifact_path, is_validation_holdout, load_config
 
 
 OBJECT_LABELS = {"single", "touching_doublet", "cluster_3plus", "debris"}
+
+
+def _balanced_training_indices(
+    labels: np.ndarray,
+    sources: np.ndarray,
+    maximum_samples: int,
+    seed: int,
+) -> np.ndarray:
+    """Select a reproducible, plate/class-balanced cache subset.
+
+    The reviewed 2603 material is much larger than the older sources and is
+    dominated by debris.  Uniform random truncation can therefore discard
+    most of the older plates or the rare multiplicity classes.  We allocate a
+    quota to each source plate, stratify that quota by reviewed class, and use
+    a deterministic fill pass for any unused capacity.
+    """
+
+    total = len(labels)
+    if total <= maximum_samples:
+        return np.random.default_rng(seed).permutation(total).astype(np.int64)
+
+    rng = np.random.default_rng(seed)
+    source_groups = np.asarray(
+        [str(value).split("|", 1)[0] for value in sources], dtype=str
+    )
+    group_values = sorted(set(source_groups.tolist()))
+    selected: list[int] = []
+
+    # Start with an equal plate quota.  A later fill pass gives the unused
+    # slots back to larger plates without changing the initial balance.
+    quota = max(1, maximum_samples // max(len(group_values), 1))
+    for group in group_values:
+        group_indices = np.flatnonzero(source_groups == group)
+        if len(group_indices) <= quota:
+            chosen = group_indices
+            remainder = np.empty(0, dtype=np.int64)
+        else:
+            class_values = sorted(set(labels[group_indices].astype(str).tolist()))
+            per_class = max(1, quota // max(len(class_values), 1))
+            chosen_parts: list[int] = []
+            for label in class_values:
+                label_indices = group_indices[labels[group_indices].astype(str) == label]
+                take = min(len(label_indices), per_class)
+                if take:
+                    chosen_parts.extend(
+                        rng.choice(label_indices, take, replace=False).tolist()
+                    )
+            chosen_set = set(chosen_parts)
+            unselected = np.asarray(
+                [index for index in group_indices if int(index) not in chosen_set],
+                dtype=np.int64,
+            )
+            remaining = max(0, quota - len(chosen_parts))
+            if remaining and len(unselected):
+                extra = rng.choice(
+                    unselected, min(remaining, len(unselected)), replace=False
+                )
+                chosen_parts.extend(extra.tolist())
+                chosen_set.update(int(value) for value in extra)
+            chosen = np.asarray(chosen_parts, dtype=np.int64)
+            remainder = np.asarray(
+                [index for index in unselected if int(index) not in chosen_set],
+                dtype=np.int64,
+            )
+        selected.extend(chosen.tolist())
+
+    selected_set = set(selected)
+    remaining = np.asarray(
+        [index for index in range(total) if index not in selected_set],
+        dtype=np.int64,
+    )
+    if len(selected) < maximum_samples and len(remaining):
+        remaining = rng.permutation(remaining)
+        selected.extend(
+            remaining[: maximum_samples - len(selected)].astype(np.int64).tolist()
+        )
+    return rng.permutation(np.asarray(selected[:maximum_samples], dtype=np.int64))
 
 
 def _crop(array: np.ndarray, x: float, y: float, size: int, fill: float = 0) -> np.ndarray:
@@ -92,7 +170,10 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
     maximum_area = int(settings.get("maximum_instance_area_px", 1800))
     maximum_samples = int(settings.get("maximum_training_samples", 6000))
     seed = int(settings.get("seed", 20260802))
-    output = artifact_path(config, "cache", f"v2_instance_training_{size}.npz")
+    cache_name = str(
+        settings.get("cache_name", f"v2_instance_training_{size}")
+    ).strip()
+    output = artifact_path(config, "cache", f"{cache_name}.npz")
     if bool(settings.get("reuse_training_cache", False)) and output.exists():
         return output
 
@@ -108,6 +189,9 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
         "training_sources", ["configs/default.yaml", "configs/ql2202_validation.yaml"]
     )
     for source_config_path in source_configs:
+        if is_validation_holdout(config, source_config_path):
+            continue
+        source_started = time.perf_counter()
         source_config = load_config(source_config_path)
         predictions_path = artifact_path(
             source_config, "predictions", "latest_integrated_predictions.csv"
@@ -117,6 +201,10 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
             continue
         predictions = pd.read_csv(predictions_path, low_memory=False)
         reviews = _latest_reviews(database)
+        if reviews.empty and not bool(
+            settings.get("include_unreviewed_hard_negatives", True)
+        ):
+            continue
         reviewed = predictions.merge(
             reviews[["candidate_id", "reviewed_label"]], on="candidate_id", how="inner"
         )
@@ -159,6 +247,19 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
         texture_negative["reviewed_label"] = "invalid"
         texture_negative["v2_label_origin"] = "high_invalid_probability_texture_negative"
         reviewed = pd.concat([reviewed, structural_wall, texture_negative], ignore_index=True, sort=False)
+        per_source_cap = int(settings.get("per_source_cap", 0) or 0)
+        if per_source_cap > 0 and len(reviewed) > per_source_cap:
+            local_indices = _balanced_training_indices(
+                reviewed["reviewed_label"].astype(str).to_numpy(),
+                np.full(len(reviewed), str(source_config_path), dtype=str),
+                per_source_cap,
+                seed,
+            )
+            reviewed = reviewed.iloc[local_indices].reset_index(drop=True)
+        print(
+            f"v2 instance source {source_config_path}: {len(reviewed)} rows",
+            flush=True,
+        )
         for raw_path, group in reviewed.groupby("raw_image_path", sort=False):
             with Image.open(raw_path) as image:
                 raw_full = np.asarray(image.convert("L"), dtype=np.uint8)
@@ -197,13 +298,26 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
                 origins_out.append(str(getattr(row, "v2_label_origin", "human_review")))
                 wells_out.append(str(row.well))
                 timepoints_out.append(str(row.timepoint))
+        print(
+            f"v2 instance source {source_config_path}: completed in "
+            f"{time.perf_counter() - source_started:.1f}s",
+            flush=True,
+        )
 
     if not inputs:
         raise RuntimeError("No reviewed V2 instance samples are available.")
     rng = np.random.default_rng(seed)
     indices = np.arange(len(inputs))
     if len(indices) > maximum_samples:
-        indices = rng.choice(indices, maximum_samples, replace=False)
+        if bool(settings.get("balance_by_plate_and_class", True)):
+            indices = _balanced_training_indices(
+                np.asarray(labels_out),
+                np.asarray(sources_out),
+                maximum_samples,
+                seed,
+            )
+        else:
+            indices = rng.choice(indices, maximum_samples, replace=False)
     np.savez_compressed(
         output,
         inputs=np.stack(inputs)[indices],
@@ -227,6 +341,9 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
                 },
                 "A12_22_excluded": True,
                 "label_source": "reviewed_candidate_seed_plus_CF_or_residual_pseudo_mask",
+                "balanced_by_plate_and_class": bool(
+                    settings.get("balance_by_plate_and_class", True)
+                ),
                 "label_origin_counts": {
                     str(key): int(value)
                     for key, value in pd.Series(np.asarray(origins_out)[indices]).value_counts().items()

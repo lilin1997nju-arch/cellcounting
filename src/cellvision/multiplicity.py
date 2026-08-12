@@ -15,17 +15,37 @@ from torch import nn
 from .config import artifact_path
 from .hierarchy import suppress_nested_single_candidates
 from .temporal_appearance import refine_ambiguous_temporal_appearance
-from .teaching import ensure_teaching_features, joint_training_sources
+from .teaching import (
+    ensure_teaching_features,
+    joint_training_sources,
+    save_teaching_labels,
+)
 
 
 MULTIPLICITY_LABELS = {
     "single",
     "touching_doublet",
     "cluster_3plus",
+    # These two labels are accepted by the review store as corrections from
+    # the categorized audit page.  They deliberately do not enter
+    # ``MULTIPLICITY_CLASSES`` and therefore cannot become multiplicity-head
+    # training targets.
+    "debris",
+    "invalid",
+    # Legacy review marker retained so earlier audit rounds remain readable.
+    # The categorized page now stores the confirmed category itself.
+    "approved",
     "not_cell",
     "skip",
 }
 MULTIPLICITY_CLASSES = ["single", "touching_doublet", "cluster_3plus"]
+CATEGORIZED_MULTIPLICITY_CATEGORIES = [
+    "single",
+    "touching_doublet",
+    "cluster_3plus",
+    "debris",
+    "invalid",
+]
 INTEGRATED_REVIEW_LABELS = {
     "single",
     "touching_doublet",
@@ -78,6 +98,9 @@ def multiplicity_stats(database: str | Path) -> dict[str, Any]:
             "single": 40,
             "touching_doublet": 20,
             "cluster_3plus": 10,
+            "debris": 0,
+            "invalid": 0,
+            "approved": 0,
             "not_cell": 20,
         },
     }
@@ -126,6 +149,41 @@ def save_multiplicity_labels(
     return len(rows)
 
 
+def save_categorized_review_labels(
+    database: str | Path,
+    items: list[dict[str, Any]],
+    reviewer: str,
+) -> int:
+    """Persist categorized human confirmations for both relevant heads.
+
+    The multiplicity table keeps the exact single/doublet/3+ decision.  The
+    morphology table receives the corresponding cell/debris/invalid target so
+    a confirmed card is useful to both small classifiers.  ``approved`` is a
+    legacy queue-only marker and intentionally has no morphology target.
+    """
+
+    saved = save_multiplicity_labels(database, items, reviewer)
+    morphology_items = []
+    for item in items:
+        label = str(item["label"])
+        if label in MULTIPLICITY_CLASSES:
+            morphology_label = "cell"
+        elif label in {"debris", "invalid"}:
+            morphology_label = label
+        else:
+            continue
+        morphology_items.append(
+            {
+                **item,
+                "label": morphology_label,
+                "source": item.get("source", "categorized_batch_review"),
+            }
+        )
+    if morphology_items:
+        save_teaching_labels(database, morphology_items, reviewer)
+    return saved
+
+
 def _human_cell_marker_counts(
     database: str | Path, candidates: pd.DataFrame
 ) -> pd.Series:
@@ -165,35 +223,265 @@ def _human_cell_marker_counts(
     return counts
 
 
+def _filter_unconfirmed_wall_queue_candidates(
+    config: dict[str, Any],
+    database: str | Path,
+    frame: pd.DataFrame,
+) -> pd.DataFrame:
+    """Keep clear wall-cell rescues, but stop reviewing empty wall residuals.
+
+    The targeted single/doublet queue is not the place to audit the physical
+    well rim.  ``wall_residual`` candidates are generated from the annular
+    wall channel and are often empty wall texture rather than cells.  They are
+    retained only when a human cell marker is already nearby.  The dedicated
+    cell-rescue and wall-buffer streams remain eligible when they carry clear
+    cell evidence, so genuine wall-attached cells are not removed from the
+    training data or from the general review workflow.
+    """
+
+    settings = config.get("multiplicity_review_queue", {})
+    if not bool(settings.get("wall_filter_enabled", True)) or frame.empty:
+        return frame
+    output = frame.copy()
+    marker_counts = _human_cell_marker_counts(database, output)
+    try:
+        with sqlite3.connect(database) as connection:
+            reviewed_ids = set(
+                pd.read_sql_query(
+                    """
+                    SELECT candidate_id
+                    FROM integrated_training_reviews
+                    WHERE reviewed_label IN (
+                      'single', 'touching_doublet', 'cluster_3plus'
+                    )
+                    """,
+                    connection,
+                )["candidate_id"].astype(str)
+            )
+    except (sqlite3.OperationalError, pd.errors.DatabaseError):
+        reviewed_ids = set()
+    marker_counts = marker_counts + output["candidate_id"].astype(str).isin(
+        reviewed_ids
+    ).astype(np.int64)
+    output["human_cell_markers_nearby"] = marker_counts
+    zone = output.get(
+        "candidate_zone", pd.Series("", index=output.index)
+    ).fillna("").astype(str)
+    source = output.get(
+        "candidate_source", pd.Series("", index=output.index)
+    ).fillna("").astype(str)
+    cell_probability = pd.to_numeric(
+        output.get("cell_probability", pd.Series(0.0, index=output.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    predicted_label = output.get(
+        "predicted_label", pd.Series("", index=output.index)
+    ).fillna("").astype(str)
+    blobness = pd.to_numeric(
+        output.get("wall_rescue_blobness", pd.Series(0.0, index=output.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    dense_response = pd.to_numeric(
+        output.get("dense_response", pd.Series(0.0, index=output.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    markers = marker_counts.astype(float)
+
+    wall_residual = zone.eq("wall_residual") | source.eq("wall_residual_peak")
+    wall_buffer = zone.eq("wall_cell_buffer")
+    wall_rescue = zone.eq("wall_cell_rescue") | source.eq("wall_cell_rescue_peak")
+    keep_residual = markers.gt(0)
+    keep_buffer = (
+        markers.gt(0)
+        | predicted_label.eq("cell")
+        | cell_probability.ge(
+            float(settings.get("wall_buffer_minimum_cell_probability", 0.55))
+        )
+    )
+    keep_rescue = (
+        markers.gt(0)
+        | (
+            cell_probability.ge(
+                float(settings.get("wall_rescue_minimum_cell_probability", 0.35))
+            )
+            & (
+                blobness.ge(
+                    float(settings.get("wall_rescue_minimum_blobness", 0.34))
+                )
+                | dense_response.ge(
+                    float(settings.get("wall_rescue_minimum_response", 40.0))
+                )
+            )
+        )
+    )
+    remove = (wall_residual & ~keep_residual) | (wall_buffer & ~keep_buffer)
+    remove |= wall_rescue & ~keep_rescue
+    return output.loc[~remove].copy()
+
+
+def _read_prediction_columns(
+    path: Path, columns: list[str]
+) -> pd.DataFrame:
+    """Read only the columns available in a prediction artifact.
+
+    Prediction files from older rounds do not all have the V2 contour and
+    integrated-label columns.  Reading the header first keeps this helper
+    compatible with those files while avoiding a full wide-table load for the
+    categorized review queue.
+    """
+
+    try:
+        header = pd.read_csv(path, nrows=0)
+        available = [column for column in columns if column in header.columns]
+        if "candidate_id" not in available:
+            return pd.DataFrame()
+        return pd.read_csv(path, usecols=available, low_memory=False)
+    except (OSError, ValueError, pd.errors.EmptyDataError, pd.errors.ParserError):
+        return pd.DataFrame()
+
+
+def _truthy_series(value: pd.Series, index: pd.Index) -> pd.Series:
+    """Normalize bool-like CSV values without treating NaN as true."""
+
+    if value.empty:
+        return pd.Series(False, index=index)
+    if value.dtype == bool:
+        return value.reindex(index, fill_value=False)
+    return value.reindex(index).fillna(False).astype(str).str.strip().str.lower().isin(
+        {"1", "true", "yes", "y"}
+    )
+
+
+def _model_category(frame: pd.DataFrame) -> pd.Series:
+    """Resolve the category shown to the reviewer.
+
+    The integrated V2 label is preferred because it already incorporates the
+    non-cell decision.  Older files fall back to the auto label and then the
+    multiplicity head prediction.
+    """
+
+    index = frame.index
+    integrated = frame.get(
+        "integrated_label", pd.Series("", index=index)
+    ).fillna("").astype(str)
+    predicted = frame.get(
+        "predicted_label", pd.Series("", index=index)
+    ).fillna("").astype(str)
+    multiplicity = frame.get(
+        "predicted_multiplicity", pd.Series("", index=index)
+    ).fillna("").astype(str)
+    category = pd.Series("", index=index, dtype="object")
+    for label in CATEGORIZED_MULTIPLICITY_CATEGORIES:
+        category = category.mask(integrated.eq(label), label)
+    for label in ("debris", "invalid"):
+        category = category.mask(category.eq(""), predicted.eq(label).map({True: label, False: ""}))
+    for label in MULTIPLICITY_CLASSES:
+        category = category.mask(category.eq(""), multiplicity.eq(label).map({True: label, False: ""}))
+    return category
+
+
 def multiplicity_queue(
     config: dict[str, Any],
     database: str | Path,
     mode: str,
     limit: int,
+    category: str | None = None,
 ) -> list[dict[str, Any]]:
-    source = artifact_path(
-        config, "predictions", "latest_auto_annotations.csv"
+    if category is not None and category not in CATEGORIZED_MULTIPLICITY_CATEGORIES:
+        raise ValueError(f"Invalid multiplicity category: {category}")
+
+    # The replacement review page asks for the model's five resolved
+    # categories.  V2 predictions are the preferred source because they carry
+    # integrated labels and instance contours.  The legacy page keeps using
+    # the recall-first auto-annotation queue when no category is requested.
+    source_name = (
+        "latest_v2_predictions.csv"
+        if category is not None
+        else "latest_auto_annotations.csv"
     )
+    source = artifact_path(config, "predictions", source_name)
+    if category is not None and not source.exists():
+        source = artifact_path(config, "predictions", "latest_auto_annotations.csv")
     if not source.exists():
         return []
-    frame = pd.read_csv(source)
+    if category is None:
+        frame = pd.read_csv(source, low_memory=False)
+    else:
+        frame = _read_prediction_columns(
+            source,
+            [
+                "candidate_id",
+                "well",
+                "timepoint",
+                "x_px",
+                "y_px",
+                "area_px",
+                "diameter_px",
+                "circularity",
+                "eccentricity",
+                "solidity",
+                "extent",
+                "cell_probability",
+                "debris_probability",
+                "invalid_probability",
+                "candidate_zone",
+                "candidate_source",
+                "radial_fraction",
+                "wall_neighbor_count",
+                "wall_rescue_blobness",
+                "dense_response",
+                "predicted_label",
+                "auto_status",
+                "single_probability",
+                "touching_doublet_probability",
+                "cluster_3plus_probability",
+                "predicted_multiplicity",
+                "multiplicity_confidence",
+                "multiplicity_uncertainty",
+                "integrated_label",
+                "v2_contour_json",
+                "v2_mask_valid",
+                "v2_mask_origin_x",
+                "v2_mask_origin_y",
+                "v2_instance_area_px",
+                "v2_instance_diameter_px",
+                "v2_instance_confidence",
+                "v2_wall_overlap",
+                "v2_wall_rejected",
+            ],
+        )
+    if frame.empty:
+        return []
     excluded = {
         str(well).upper()
         for well in config.get("review_queue", {}).get("excluded_wells", [])
     }
-    frame = frame[
-        frame["timepoint"].isin(["T0", "T1", "T2"])
-        & ~frame["well"].astype(str).str.upper().isin(excluded)
-        & (frame["auto_status"] != "deterministic_wall_invalid")
-        & frame["area_px"].astype(float).between(8, 1200)
-        & (
-            (frame["cell_probability"].astype(float) >= 0.12)
-            | (
-                (frame["predicted_label"] == "debris")
-                & (frame["debris_probability"].astype(float) >= 0.45)
+    if category is None:
+        frame = frame[
+            frame["timepoint"].isin(["T0", "T1", "T2"])
+            & ~frame["well"].astype(str).str.upper().isin(excluded)
+            & (frame["auto_status"] != "deterministic_wall_invalid")
+            & frame["area_px"].astype(float).between(8, 1200)
+            & (
+                (frame["cell_probability"].astype(float) >= 0.12)
+                | (
+                    (frame["predicted_label"] == "debris")
+                    & (frame["debris_probability"].astype(float) >= 0.45)
+                )
             )
-        )
-    ].copy()
+        ].copy()
+    else:
+        # Do not apply the targeted wall-residual filter here.  The new page
+        # has an explicit ``invalid (孔壁)`` bucket, so the reviewer must be
+        # able to inspect the model's wall decisions.  The old targeted queue
+        # still applies that filter below when ``category`` is omitted.
+        required = {"timepoint", "well", "candidate_id"}
+        if not required.issubset(frame.columns):
+            return []
+        frame = frame[
+            frame["timepoint"].isin(["T0", "T1", "T2"])
+            & ~frame["well"].astype(str).str.upper().isin(excluded)
+        ].copy()
     if frame.empty:
         return []
 
@@ -205,7 +493,132 @@ def multiplicity_queue(
     if frame.empty:
         return []
 
-    marker_counts = _human_cell_marker_counts(database, frame)
+    if category is None:
+        frame = _filter_unconfirmed_wall_queue_candidates(config, database, frame)
+        if frame.empty:
+            return []
+
+    # The auto-annotation queue is the recall-first candidate source, while
+    # the multiplicity model writes its class probabilities to a separate
+    # prediction table.  Join the two here so both the legacy teaching page
+    # and the focused single/doublet audit can show the model evidence that
+    # caused a candidate to enter the queue.
+    probability_columns = [
+        "single_probability",
+        "touching_doublet_probability",
+        "cluster_3plus_probability",
+        "predicted_multiplicity",
+        "multiplicity_confidence",
+        "multiplicity_uncertainty",
+    ]
+    probability_source = artifact_path(
+        config, "predictions", "multiplicity_predictions.csv"
+    )
+    if probability_source.exists():
+        try:
+            multiplicity = pd.read_csv(
+                probability_source,
+                usecols=["candidate_id", *probability_columns],
+            ).drop_duplicates("candidate_id", keep="last")
+            multiplicity["candidate_id"] = multiplicity["candidate_id"].astype(
+                str
+            )
+            frame["candidate_id"] = frame["candidate_id"].astype(str)
+            frame = frame.merge(
+                multiplicity,
+                on="candidate_id",
+                how="left",
+                suffixes=("", "_model"),
+            )
+        except (OSError, ValueError, pd.errors.EmptyDataError):
+            # A queue can be generated before the first multiplicity model
+            # round.  Keep the candidate queue usable in that state.
+            pass
+
+    # Attach V2 instance contours for the pale browser overlay.  Older rounds
+    # may not contain these columns; in that case the UI falls back to the
+    # candidate marker.
+    contour_columns = [
+        "v2_contour_json",
+        "v2_mask_valid",
+        "v2_mask_origin_x",
+        "v2_mask_origin_y",
+        "v2_instance_area_px",
+        "v2_instance_diameter_px",
+        "v2_instance_confidence",
+        "v2_wall_overlap",
+        "v2_wall_rejected",
+    ]
+    if "v2_contour_json" not in frame.columns:
+        contour_source = artifact_path(
+            config, "predictions", "latest_v2_predictions.csv"
+        )
+        if contour_source.exists():
+            contour = _read_prediction_columns(
+                contour_source, ["candidate_id", *contour_columns]
+            )
+            if not contour.empty:
+                contour["candidate_id"] = contour["candidate_id"].astype(str)
+                frame["candidate_id"] = frame["candidate_id"].astype(str)
+                frame = frame.merge(
+                    contour.drop_duplicates("candidate_id", keep="last"),
+                    on="candidate_id",
+                    how="left",
+                    suffixes=("", "_v2"),
+                )
+
+    frame["predicted_category"] = _model_category(frame)
+    if category is not None:
+        frame = frame[frame["predicted_category"].eq(category)].copy()
+        if frame.empty:
+            return []
+        if category == "invalid":
+            # The invalid bucket is specifically for well-wall material, but
+            # empty wall texture is not a useful human-review example.  Reuse
+            # the targeted queue guard so only wall cells with a marker,
+            # sufficient cell probability, or a rescue signal reach the page.
+            frame = _filter_unconfirmed_wall_queue_candidates(
+                config, database, frame
+            )
+            if frame.empty:
+                return []
+            zone = frame.get(
+                "candidate_zone", pd.Series("", index=frame.index)
+            ).fillna("").astype(str)
+            wall_rejected = _truthy_series(
+                frame.get(
+                    "v2_wall_rejected", pd.Series(False, index=frame.index)
+                ),
+                frame.index,
+            )
+            wall_mask = zone.str.startswith("wall_") | wall_rejected
+            if wall_mask.any():
+                frame = frame.loc[wall_mask].copy()
+                if frame.empty:
+                    return []
+
+        confidence_column = {
+            "single": "single_probability",
+            "touching_doublet": "touching_doublet_probability",
+            "cluster_3plus": "cluster_3plus_probability",
+            "debris": "debris_probability",
+            "invalid": "invalid_probability",
+        }[category]
+        confidence = pd.to_numeric(
+            frame.get(confidence_column, pd.Series(0.0, index=frame.index)),
+            errors="coerce",
+        ).fillna(0.0).clip(0.0, 1.0)
+        # Low-confidence examples are the most useful corrections; a small
+        # confidence term keeps clearly systematic examples in the batch too.
+        frame["category_priority"] = (1.0 - confidence) + 0.15 * confidence
+        frame = frame.sort_values(
+            ["category_priority", "area_px"], ascending=[False, False]
+        )
+
+    marker_counts = frame.get(
+        "human_cell_markers_nearby",
+        _human_cell_marker_counts(database, frame),
+    )
     area_score = np.clip(
         np.log1p(frame["area_px"].astype(float) / 28.0) / np.log(8.0),
         0,
@@ -230,25 +643,26 @@ def multiplicity_queue(
         default="model_shape_screen",
     )
 
-    if mode == "uncertain":
-        frame["_sort"] = (
-            frame["cell_probability"].astype(float) - 0.5
-        ).abs()
-        frame = frame.sort_values(
-            ["_sort", "doublet_priority"], ascending=[True, False]
-        )
-    elif mode == "diverse":
-        frame = (
-            frame.sort_values("doublet_priority", ascending=False)
-            .groupby(["well", "timepoint"], group_keys=False)
-            .head(2)
-            .sort_values("doublet_priority", ascending=False)
-        )
-    else:
-        frame = frame.sort_values(
-            ["doublet_priority", "cell_probability"],
-            ascending=[False, False],
-        )
+    if category is None:
+        if mode == "uncertain":
+            frame["_sort"] = (
+                frame["cell_probability"].astype(float) - 0.5
+            ).abs()
+            frame = frame.sort_values(
+                ["_sort", "doublet_priority"], ascending=[True, False]
+            )
+        elif mode == "diverse":
+            frame = (
+                frame.sort_values("doublet_priority", ascending=False)
+                .groupby(["well", "timepoint"], group_keys=False)
+                .head(2)
+                .sort_values("doublet_priority", ascending=False)
+            )
+        else:
+            frame = frame.sort_values(
+                ["doublet_priority", "cell_probability"],
+                ascending=[False, False],
+            )
 
     columns = [
         "candidate_id",
@@ -261,10 +675,42 @@ def multiplicity_queue(
         "cell_probability",
         "debris_probability",
         "invalid_probability",
+        "candidate_zone",
+        "candidate_source",
+        "radial_fraction",
+        "wall_neighbor_count",
+        "human_cell_markers_nearby",
         "doublet_priority",
         "candidate_rank_reason",
+        "predicted_category",
+        "category_priority",
+        *probability_columns,
+        *contour_columns,
     ]
     selected = frame.head(max(1, min(int(limit), 100))).copy()
+    # Keep the JSON schema stable across old and new prediction rounds.
+    for column in [
+        "x_px",
+        "y_px",
+        "area_px",
+        "diameter_px",
+        "cell_probability",
+        "debris_probability",
+        "invalid_probability",
+        "candidate_zone",
+        "candidate_source",
+        "radial_fraction",
+        "wall_neighbor_count",
+        "human_cell_markers_nearby",
+        "doublet_priority",
+        "candidate_rank_reason",
+        "predicted_category",
+        "category_priority",
+        *probability_columns,
+        *contour_columns,
+    ]:
+        if column not in selected.columns:
+            selected[column] = None
     return selected[columns].replace({np.nan: None}).to_dict(orient="records")
 
 
@@ -414,6 +860,15 @@ def train_multiplicity_classifier(
     counts = np.bincount(y.numpy(), minlength=len(MULTIPLICITY_CLASSES))
     class_weights = counts.sum() / np.maximum(counts, 1)
     class_weights = class_weights / class_weights.mean()
+    source_counts = targets["training_dataset"].value_counts()
+    source_target = float(source_counts.median()) if len(source_counts) else 1.0
+    source_weights = targets["training_dataset"].map(
+        lambda value: np.clip(
+            source_target / max(float(source_counts.get(value, 1)), 1.0),
+            0.5,
+            2.5,
+        )
+    ).to_numpy(np.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(config.get("teaching", {}).get("seed", 20260730)) + 17
@@ -428,6 +883,7 @@ def train_multiplicity_classifier(
         nn.Linear(48, len(MULTIPLICITY_CLASSES)),
     ).to(device)
     x, y = x.to(device), y.to(device)
+    source_weight_tensor = torch.from_numpy(source_weights).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0015, weight_decay=0.08)
     weight_tensor = torch.tensor(
         class_weights, dtype=torch.float32, device=device
@@ -437,9 +893,14 @@ def train_multiplicity_classifier(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         logits = model(x)
-        loss = torch.nn.functional.cross_entropy(
-            logits, y, weight=weight_tensor, label_smoothing=0.05
+        losses = torch.nn.functional.cross_entropy(
+            logits,
+            y,
+            weight=weight_tensor,
+            label_smoothing=0.05,
+            reduction="none",
         )
+        loss = (losses * source_weight_tensor).sum() / source_weight_tensor.sum()
         loss.backward()
         optimizer.step()
 
@@ -524,6 +985,17 @@ def train_multiplicity_classifier(
         "training_dataset_counts": {
             str(name): int(count)
             for name, count in targets["training_dataset"].value_counts().items()
+        },
+        "source_balance": {
+            str(name): float(weight)
+            for name, weight in zip(
+                source_counts.index,
+                source_counts.map(
+                    lambda count: np.clip(
+                        source_target / max(float(count), 1.0), 0.5, 2.5
+                    )
+                ),
+            )
         },
         "training_accuracy": fit_accuracy,
         "prediction_count": int(len(predictions)),

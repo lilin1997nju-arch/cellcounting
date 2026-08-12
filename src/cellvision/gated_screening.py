@@ -32,7 +32,7 @@ REASON_LABELS = {
     "t0_classification_uncertain": "T0细胞/杂质归类不确定",
     "t0_missing_later_detected": "T0缺失但后期出现细胞",
     "day14_growth_but_no_early_cell": "Day14有生长但T0～T2均未检出细胞",
-    "t0_t2_no_division": "T0～T2未见可信分裂",
+    "t0_t2_no_division": "T0-T2未分裂",
     "temporal_link_conflict": "早期时序关联冲突",
 }
 
@@ -116,8 +116,12 @@ def classify_gated_well(
     if temporal_link_conflict:
         return _decision("undetermined", "temporal_link_conflict", skip=False)
 
-    if early_division_evidence is None:
-        early_division_evidence = max(t1_cell_units, t2_cell_units) >= 2
+    # The unit counts are the authoritative multiplicity signal.  Do not let
+    # a stale/low-confidence boolean hide a T1/T2 touching doublet or cluster
+    # after a single T0 origin.
+    early_division_evidence = bool(early_division_evidence) or max(
+        t1_cell_units, t2_cell_units
+    ) >= 2
     if bool(early_division_evidence):
         return _decision("single_cell_origin", "", skip=False)
     return _decision("undetermined", "t0_t2_no_division", skip=False)
@@ -357,8 +361,6 @@ def build_gated_plate_report(
         evidence_notes: list[str] = []
         if _as_bool(early_row.get("has_debris"), False):
             evidence_notes.append("存在杂质")
-        if _as_bool(early_row.get("suspected_dead_cell"), False):
-            evidence_notes.append("存在疑似死细胞")
         if day14_positive and not is_control and not day7_result.get("regions"):
             evidence_notes.append("Day7未定位到代表性高密区域")
 
@@ -388,7 +390,9 @@ def build_gated_plate_report(
             "t0_cell_instances": t0_instances,
             "early_division_evidence": division_value if division_value is not None else max(t1, t2) >= 2,
             "has_debris": _as_bool(early_row.get("has_debris"), False),
-            "suspected_dead_cell": _as_bool(early_row.get("suspected_dead_cell"), False),
+            # The V2 dead-cell signal is retired.  Retain the field as a
+            # backwards-compatible false value for existing CSV consumers.
+            "suspected_dead_cell": False,
             **decision,
             "day7_available": bool(day7_result.get("available")),
             "day7_method": day7_result.get("method", ""),

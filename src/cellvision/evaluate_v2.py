@@ -95,6 +95,65 @@ def evaluate_v2_plate(config: dict[str, Any]) -> dict[str, Any]:
     near_wall = cell_truth[cell_truth["radial_fraction"] >= 0.40]
     multiplicity = cell_truth[cell_truth["detected"]]
     multiplicity_exact = int((multiplicity["truth"] == multiplicity["prediction"]).sum())
+    multiplicity_labels = sorted(CELL_LABELS)
+    multiplicity_matrix = pd.crosstab(
+        multiplicity["truth"], multiplicity["prediction"]
+    ).reindex(index=multiplicity_labels, columns=multiplicity_labels, fill_value=0)
+    multiplicity_per_class: dict[str, dict[str, float | int | None]] = {}
+    for label in multiplicity_labels:
+        true_positive = int(multiplicity_matrix.loc[label, label])
+        truth_count = int(multiplicity_matrix.loc[label].sum())
+        predicted_count = int(multiplicity_matrix[label].sum())
+        precision = _safe_ratio(true_positive, predicted_count)
+        recall = _safe_ratio(true_positive, truth_count)
+        f1 = (
+            float(2.0 * precision * recall / (precision + recall))
+            if precision is not None and recall is not None and precision + recall
+            else None
+        )
+        multiplicity_per_class[label] = {
+            "support": truth_count,
+            "predicted": predicted_count,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
+    # End-to-end class recall counts a missed/invalid prediction as a miss.
+    # The conditional confusion above is useful for measuring the head's
+    # discrimination after segmentation, but it must not hide segmentation
+    # misses when reporting the biological cell recall.
+    cell_predictions = np.where(
+        cell_truth["detected"].astype(bool), cell_truth["prediction"], "missed"
+    )
+    cell_truth_with_prediction = cell_truth.assign(
+        prediction_or_missed=cell_predictions
+    )
+    end_to_end_per_class: dict[str, dict[str, float | int | None]] = {}
+    for label in multiplicity_labels:
+        support = int((cell_truth_with_prediction["truth"] == label).sum())
+        true_positive = int(
+            (
+                (cell_truth_with_prediction["truth"] == label)
+                & (cell_truth_with_prediction["prediction_or_missed"] == label)
+            ).sum()
+        )
+        predicted_count = int(
+            (cell_truth_with_prediction["prediction_or_missed"] == label).sum()
+        )
+        precision = _safe_ratio(true_positive, predicted_count)
+        recall = _safe_ratio(true_positive, support)
+        f1 = (
+            float(2.0 * precision * recall / (precision + recall))
+            if precision is not None and recall is not None and precision + recall
+            else None
+        )
+        end_to_end_per_class[label] = {
+            "support": support,
+            "predicted": predicted_count,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+        }
     per_timepoint = {}
     for timepoint in ("T0", "T1", "T2"):
         local = positive[positive["timepoint"] == timepoint]
@@ -123,12 +182,20 @@ def evaluate_v2_plate(config: dict[str, Any]) -> dict[str, Any]:
             - _safe_ratio(int(positive["v1_detected"].sum()), len(positive))
             if len(positive) else None
         ),
+        "cell_level_recall": _safe_ratio(int(cell_truth["detected"].sum()), len(cell_truth)),
+        "cell_level_reviewed_objects": int(len(cell_truth)),
         "duplicate_candidate_rate": _safe_ratio(int(frame["v2_is_suppressed"].sum()), valid_count),
         "wall_false_positive_rate": _safe_ratio(int(invalid_truth["detected"].sum()), len(invalid_truth)),
         "single_doublet_cluster_confusion": {
             "evaluated": int(len(multiplicity)),
             "exact_rate": _safe_ratio(multiplicity_exact, len(multiplicity)),
             "matrix": pd.crosstab(multiplicity["truth"], multiplicity["prediction"]).to_dict(),
+            "per_class": multiplicity_per_class,
+            "touching_doublet_recall": multiplicity_per_class["touching_doublet"]["recall"],
+            "touching_doublet_f1": multiplicity_per_class["touching_doublet"]["f1"],
+            "end_to_end_per_class": end_to_end_per_class,
+            "touching_doublet_end_to_end_recall": end_to_end_per_class["touching_doublet"]["recall"],
+            "touching_doublet_end_to_end_f1": end_to_end_per_class["touching_doublet"]["f1"],
         },
         "near_wall_cell_recall": _safe_ratio(int(near_wall["detected"].sum()), len(near_wall)),
         "near_wall_reviewed_cells": int(len(near_wall)),

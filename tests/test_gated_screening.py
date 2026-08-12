@@ -44,6 +44,19 @@ def test_single_and_multi_origin_are_mutually_exclusive() -> None:
     assert touching_doublet["final_category"] == "multi_cell_origin"
 
 
+def test_later_touching_doublet_or_cluster_overrides_stale_no_division_flag() -> None:
+    result = classify_gated_well(
+        day14_available=True,
+        day14_obvious_growth=True,
+        t0_cell_units=1,
+        t1_cell_units=2,
+        t2_cell_units=3,
+        t0_cell_instances=1,
+        early_division_evidence=False,
+    )
+    assert result["final_category"] == "single_cell_origin"
+
+
 def test_required_undetermined_reasons() -> None:
     missing_t0 = classify_gated_well(
         day14_available=True,
@@ -115,6 +128,7 @@ def test_plate_report_has_96_wells_and_positive_queue(tmp_path) -> None:
             "t2_cell_units": 4,
             "t0_cell_instances": 1,
             "early_timepoints_complete": True,
+            "suspected_dead_cell": True,
         }
     ])
     day14_path = tmp_path / "day14.csv"
@@ -133,6 +147,8 @@ def test_plate_report_has_96_wells_and_positive_queue(tmp_path) -> None:
     rows = {row["well"]: row for row in result["wells"]}
     assert rows["A1"]["final_category"] == "positive_control"
     assert rows["A2"]["final_category"] == "single_cell_origin"
+    assert rows["A2"]["suspected_dead_cell"] is False
+    assert "疑似死细胞" not in rows["A2"]["evidence_notes"]
     assert rows["A3"]["final_category"] == "no_obvious_growth"
     assert rows["A4"]["undetermined_reason"] == "day14_missing_or_unreadable"
     parsed = json.loads((tmp_path / "report" / "plate_overview.json").read_text(encoding="utf-8"))

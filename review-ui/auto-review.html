@@ -18,6 +18,7 @@
     <div class="top-actions">
       <a id="backReviewList" class="secondary" href="/">返回审核列表</a>
       <button id="plateReportButton" class="secondary" type="button">96孔板结果</button>
+      <button id="undoButton" class="secondary undo-action" type="button" disabled title="撤销上一块板结果（Ctrl/Cmd+Z）">撤销上一块板结果 <kbd>Ctrl/Cmd+Z</kbd></button>
       <button id="newRoundButton" class="train">用本轮结果训练并生成下一轮</button>
     </div>
   </header>
@@ -42,12 +43,10 @@
         <select id="wellTypeFilter">
           <option value="all">全部类型</option>
           <option value="single_active">单细胞有活性</option>
-          <option value="single_growth_unconfirmed">生长待确认</option>
+          <option value="single_not_divided">T0-T2未分裂</option>
           <option value="multi_origin">多细胞来源</option>
-          <option value="missing_t0_or_late_object">T0缺失/后期出现</option>
-          <option value="no_cell_growth">后期无明显生长</option>
-          <option value="no_cell">未检出细胞</option>
-          <option value="ambiguous">判定不明确</option>
+          <option value="no_cell_growth">无明显生长</option>
+          <option value="t0_missing_late_cells">T0缺失但后期出现细胞</option>
         </select>
       </div>
       <div class="mode-tabs well-tabs">
@@ -68,7 +67,7 @@
           <span class="legend-single">单细胞</span>
           <span class="legend-doublet">粘连2细胞</span>
           <span class="legend-cluster">3+细胞团</span>
-          <span class="legend-dead">疑似死细胞</span>
+          <span class="legend-dead">V3统一死细胞轨迹</span>
           <span class="legend-debris">杂质</span>
           <span class="legend-uncertain">待定</span>
         </div>
@@ -93,6 +92,8 @@
         <div id="timepointGrid" class="timepoint-grid"></div>
       </section>
 
+      <div id="v3WellSummary" class="v3-well-summary" hidden></div>
+
       <section id="selectionEditor" class="selection-editor empty-selection">
         <div class="selected-preview">
           <img id="selectedPatch" alt="选中目标局部图">
@@ -101,7 +102,41 @@
           <p class="eyebrow dark">选中目标</p>
           <h3 id="selectedTitle">点击图中的标记进行判定</h3>
           <p id="selectedDetail">每个标记均可修改分类；标记圈根据目标实际直径绘制。</p>
-          <div class="probability-row" id="selectedProbabilities"></div>
+          <div id="finalDecision" class="final-decision" hidden>
+            <div class="final-decision-heading">
+              <span>最终分类</span>
+              <strong id="finalDecisionLabel"></strong>
+              <em id="finalDecisionMeta"></em>
+            </div>
+            <p id="finalDecisionReason"></p>
+          </div>
+          <details id="decisionEvidence" class="decision-evidence" hidden>
+            <summary>查看判定证据</summary>
+            <div class="evidence-group">
+              <b>时序证据</b>
+              <div class="probability-row" id="selectedTemporalEvidence"></div>
+            </div>
+            <div class="evidence-group">
+              <b>单帧模型（仅供参考）</b>
+              <div class="probability-row" id="selectedProbabilities"></div>
+            </div>
+          </details>
+          <div id="v3TrackNotice" class="v3-track-notice" hidden>
+            <strong>V3 统一轨迹结论</strong>
+            <p id="v3TrackDetail"></p>
+            <label>统一标签
+              <select id="v3TrackLabel">
+                <option value="dead_cell">V3统一死细胞</option>
+                <option value="single">统一单细胞</option>
+                <option value="touching_doublet">统一粘连2细胞</option>
+                <option value="cluster_3plus">统一3+细胞团</option>
+                <option value="uncertain">统一待定</option>
+                <option value="debris">统一杂质</option>
+                <option value="invalid">统一无效</option>
+                <option value="unmarked">不标记</option>
+              </select>
+            </label>
+          </div>
           <div class="diameter-control" id="diameterControl" hidden>
             <span>标记直径</span>
             <button id="diameterDown">−</button>
@@ -125,6 +160,7 @@
         <span>选中标记后按 <kbd>1–5</kbd> 改类</span>
         <span><kbd>0</kbd> 排除误检</span>
         <span><kbd>Enter</kbd> 保存修正并下一个</span>
+        <span><kbd>Ctrl/Cmd+Z</kbd> 撤销上一块板结果</span>
         <strong id="message">正在载入最新结果…</strong>
       </section>
 
@@ -175,16 +211,16 @@
       </header>
       <div class="plate-dialog-legend">
         <span data-status="single_active">单细胞有活性</span>
-        <span data-status="single_growth_unconfirmed">生长待确认</span>
+        <span data-status="single_not_divided">T0-T2未分裂</span>
         <span data-status="multi_origin">多细胞来源</span>
         <span data-status="no_cell_growth">无明显生长</span>
-        <span data-status="ambiguous">需复核</span>
+        <span data-status="t0_missing_late_cells">T0缺失但后期出现细胞</span>
         <span data-status="positive_control">阳性对照</span>
       </div>
       <div id="plateDialogGrid" class="plate-dialog-grid"></div>
     </form>
   </dialog>
 
-  <script src="assets/auto-review.js?v=20260807-growth-layout-v2"></script>
+  <script src="assets/auto-review.js?v=20260810-authoritative-final-label"></script>
 </body>
 </html>

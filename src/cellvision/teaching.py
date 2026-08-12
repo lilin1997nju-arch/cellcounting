@@ -14,7 +14,7 @@ from PIL import Image
 from torch import nn
 from torchvision.models import ResNet18_Weights, resnet18
 
-from .config import artifact_path, load_config
+from .config import artifact_path, is_validation_holdout, load_config
 from .dense_candidates import add_wall_neighbor_counts
 from .pseudo_labels import _background_anisotropy, _crop_with_padding
 
@@ -448,6 +448,8 @@ def joint_training_sources(
     ]
     primary_root = Path(config["paths"]["artifact_root"]).resolve()
     for entry in config.get("joint_training", {}).get("sources", []):
+        if is_validation_holdout(config, str(entry["config"])):
+            continue
         source_config = load_config(str(entry["config"]))
         source_root = Path(source_config["paths"]["artifact_root"]).resolve()
         if source_root == primary_root:
@@ -559,6 +561,18 @@ def train_teaching_classifier(
     class_weights = counts.sum() / np.maximum(counts, 1)
     class_weights /= class_weights.mean()
     sample_weights *= torch.from_numpy(class_weights[y.numpy()])
+    # Keep one large 2603 plate from overwhelming the older reviewed sources
+    # while retaining the class/timepoint balancing above.
+    source_counts = targets["training_dataset"].value_counts()
+    source_target = float(source_counts.median()) if len(source_counts) else 1.0
+    source_weights = targets["training_dataset"].map(
+        lambda value: np.clip(
+            source_target / max(float(source_counts.get(value, 1)), 1.0),
+            0.5,
+            2.5,
+        )
+    ).to_numpy(np.float32)
+    sample_weights *= torch.from_numpy(source_weights)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     x, y, sample_weights = (
@@ -727,6 +741,17 @@ def train_teaching_classifier(
         "training_dataset_counts": {
             str(name): int(count)
             for name, count in targets["training_dataset"].value_counts().items()
+        },
+        "source_balance": {
+            str(name): float(weight)
+            for name, weight in zip(
+                source_counts.index,
+                source_counts.map(
+                    lambda count: np.clip(
+                        source_target / max(float(count), 1.0), 0.5, 2.5
+                    )
+                ),
+            )
         },
         "human_teaching_samples": int(
             (targets["label_source"] == "quick_teaching").sum()

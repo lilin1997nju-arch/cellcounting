@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CellVision · 时序 Shadow 审核</title>
+  <link rel="stylesheet" href="/assets/temporal-shadow-review.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">CELLVISION / TEMPORAL SHADOW</div>
+        <h1>时序模型独立审核</h1>
+        <p class="subtitle">集中检查 V2 最终结论与 V3 行为层提议，审核结果只写入 Shadow 目录。</p>
+      </div>
+      <div class="server-status" title="本地审核服务状态">
+        <span id="healthDot" class="status-dot status-pending"></span>
+        <span id="healthText">连接中</span>
+      </div>
+    </header>
+
+    <section class="toolbar card">
+      <div class="control control-run">
+        <label for="runSelect">Shadow Run</label>
+        <select id="runSelect"></select>
+      </div>
+      <div class="control">
+        <label for="plateSelect">Plate</label>
+        <select id="plateSelect"></select>
+      </div>
+      <div class="control">
+        <label for="behaviorSelect">行为类型</label>
+        <select id="behaviorSelect">
+          <option value="all">全部行为</option>
+          <option value="cell_to_debris">细胞 → 杂质</option>
+          <option value="division_or_growth">分裂 / 生长</option>
+          <option value="stable_debris">稳定杂质</option>
+          <option value="wall_structure_invalid">孔壁结构 → 无效</option>
+          <option value="wall_independent_object">孔壁独立对象</option>
+          <option value="wall_uncertain">孔壁不确定</option>
+          <option value="stable_cell_or_conflict">稳定细胞 / 冲突</option>
+          <option value="decline_without_morphology_evidence">置信度下降但证据不足</option>
+          <option value="no_decisive_temporal_evidence">无决定性时序证据</option>
+        </select>
+      </div>
+      <div class="control">
+        <label for="focusSelect">重点审核队列</label>
+        <select id="focusSelect">
+          <option value="focus">V2/V3差异 + 三帧低置信</option>
+          <option value="v2_v3_diff">仅 V2/V3 结论差异</option>
+          <option value="low_match_confidence">仅三帧匹配低置信</option>
+          <option value="all">全部时序轨迹</option>
+        </select>
+      </div>
+      <label class="check-control" for="changedOnly">
+        <input id="changedOnly" type="checkbox">
+        <span>只看旧基线会变化</span>
+      </label>
+      <div class="control">
+        <label for="reviewStatus">审核状态</label>
+        <select id="reviewStatus">
+          <option value="all">全部</option>
+          <option value="pending">待审核</option>
+          <option value="reviewed">已审核</option>
+        </select>
+      </div>
+      <div class="control search-control">
+        <label for="searchInput">搜索</label>
+        <input id="searchInput" type="search" placeholder="孔位或轨迹 ID">
+      </div>
+      <button id="refreshButton" class="button button-light" type="button">刷新</button>
+    </section>
+
+    <section id="stats" class="stats-grid" aria-label="概览统计">
+      <div class="stat-card"><span class="stat-label">候选轨迹</span><strong id="statTotal">—</strong><span class="stat-note">当前 Shadow run</span></div>
+      <div class="stat-card"><span class="stat-label">已审核</span><strong id="statReviewed">—</strong><span class="stat-note">已保存人工结论</span></div>
+      <div class="stat-card accent"><span class="stat-label">旧基线会变化</span><strong id="statChanged">—</strong><span class="stat-note">辅助筛选，不等同于 V2/V3 差异</span></div>
+      <div class="stat-card warning"><span class="stat-label">细胞 → 杂质</span><strong id="statCellDebris">—</strong><span class="stat-note">重点排查死亡误判</span></div>
+      <div class="stat-card green"><span class="stat-label">分裂 / 生长</span><strong id="statDivision">—</strong><span class="stat-note">用于保护细胞轨迹</span></div>
+      <div class="stat-card purple"><span class="stat-label">稳定杂质</span><strong id="statStableDebris">—</strong><span class="stat-note">三帧稳定证据</span></div>
+      <div class="stat-card blue"><span class="stat-label">孔壁独立对象</span><strong id="statWallObject">—</strong><span class="stat-note">保留为候选对象</span></div>
+      <div class="stat-card accent"><span class="stat-label">V2/V3 差异孔</span><strong id="statV2V3Wells">—</strong><span class="stat-note">按 V2 最终标签与 V3 建议比较</span></div>
+      <div class="stat-card warning"><span class="stat-label">三帧低置信孔</span><strong id="statLowMatchWells">—</strong><span class="stat-note">匹配成功但未充分通过稳定门槛</span></div>
+      <div class="stat-card green"><span class="stat-label">重点审核孔</span><strong id="statFocusWells">—</strong><span class="stat-note">以上两类去重后的孔位</span></div>
+    </section>
+
+    <main class="workspace">
+      <aside class="track-panel card">
+        <div class="panel-heading">
+          <div>
+            <div class="section-kicker">TRACK QUEUE</div>
+            <h2>审核队列</h2>
+          </div>
+          <span id="queueCount" class="count-pill">—</span>
+        </div>
+        <p class="queue-help">当前队列按轨迹展示；同一孔可能包含多个候选轨迹。点击轨迹后可查看 T0/T1/T2 原图和 V2/V3 标签。</p>
+        <div id="plateSummary" class="plate-summary"></div>
+        <div id="trackList" class="track-list">
+          <div class="empty-state compact">正在加载轨迹…</div>
+        </div>
+        <div class="pagination">
+          <button id="prevPageButton" class="icon-button" type="button" aria-label="上一页">←</button>
+          <span id="pageText">—</span>
+          <button id="nextPageButton" class="icon-button" type="button" aria-label="下一页">→</button>
+        </div>
+      </aside>
+
+      <section class="detail-panel card">
+        <div id="detailEmpty" class="empty-state detail-empty">
+          <div class="empty-icon">◌</div>
+          <h2>选择一条轨迹开始审核</h2>
+          <p>左侧队列会按优先级展示分裂、细胞形态退化和孔壁候选。</p>
+        </div>
+
+        <div id="detailView" class="detail-view hidden">
+          <div class="detail-heading">
+            <div>
+              <div class="section-kicker">TRACK DETAIL</div>
+              <div class="title-line">
+                <h2 id="detailTitle">—</h2>
+                <span id="detailBehavior" class="behavior-badge">—</span>
+                <span id="detailReviewBadge" class="review-badge">待审核</span>
+              </div>
+              <p id="detailMeta" class="detail-meta">—</p>
+            </div>
+            <div class="detail-nav">
+              <button id="prevTrackButton" class="button button-light" type="button">上一条</button>
+              <button id="nextTrackButton" class="button button-light" type="button">下一条</button>
+            </div>
+          </div>
+
+          <div class="evidence-strip">
+            <div><span>行为分数</span><strong id="evidenceBehavior">—</strong></div>
+            <div><span>身份分数</span><strong id="evidenceIdentity">—</strong></div>
+            <div><span>静态相似</span><strong id="evidenceStatic">—</strong></div>
+            <div><span>形态相似</span><strong id="evidenceShape">—</strong></div>
+            <div><span>形态变化</span><strong id="evidenceMorphology">—</strong></div>
+            <div><span>语义退化</span><strong id="evidenceDegradation">—</strong></div>
+            <div><span>分裂保护</span><strong id="evidenceDivision">—</strong></div>
+          </div>
+
+          <div class="comparison-note">
+            <div class="note-label">V3 判定理由</div>
+            <div id="detailReason">—</div>
+          </div>
+
+          <div id="unifiedConclusionBox" class="unified-conclusion hidden">
+            <div>
+              <div class="section-kicker">UNIFIED TRACK LABEL</div>
+              <h3>细胞 → 杂质：统一轨迹结论</h3>
+              <p id="unifiedConclusionHint">这是一条生物学事件轨迹，T0/T1/T2 作为证据帧，不分别保存为细胞 / 不确定 / 杂质。</p>
+            </div>
+            <label for="trackLabelSelect">统一标签
+              <select id="trackLabelSelect">
+                <option value="dead_cell">死细胞</option>
+                <option value="uncertain">统一不确定</option>
+                <option value="debris">统一杂质</option>
+                <option value="invalid">统一无效</option>
+                <option value="unmarked">不标记</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="timepoint-heading">
+            <div>
+              <div class="section-kicker">TEMPORAL EVIDENCE</div>
+              <h3>T0 / T1 / T2 同轨迹对比</h3>
+            </div>
+            <div class="legend"><span class="legend-dot legacy"></span>V2 最终 <span class="legend-dot v3"></span>V3 提议</div>
+          </div>
+          <div id="timepointGrid" class="timepoint-grid"></div>
+
+          <div class="table-heading">
+            <div>
+              <div class="section-kicker">FRAME RECORDS</div>
+              <h3>逐帧判定与人工标签</h3>
+            </div>
+            <span class="muted">人工标签只保存在 Shadow review JSON</span>
+          </div>
+          <div class="table-wrap">
+            <table class="frame-table">
+              <thead>
+                <tr>
+                  <th>时间</th>
+                  <th>候选</th>
+                  <th>V2 最终</th>
+                  <th>V3 帧证据</th>
+                  <th>统一结论</th>
+                  <th>匹配指标<br><small>identity / static / shape</small></th>
+                  <th>细胞概率</th>
+                  <th>杂质概率</th>
+                  <th>状态 / 证据</th>
+                  <th>人工标签</th>
+                </tr>
+              </thead>
+              <tbody id="frameTableBody"></tbody>
+            </table>
+          </div>
+
+          <div class="review-editor">
+            <div class="editor-heading">
+              <div>
+                <div class="section-kicker">HUMAN REVIEW</div>
+                <h3>保存审核结论</h3>
+              </div>
+              <span id="saveStatus" class="save-status"></span>
+            </div>
+            <div class="editor-fields">
+              <label>审核人<input id="reviewerInput" type="text" maxlength="120" placeholder="local_user"></label>
+              <label class="notes-field">备注<textarea id="notesInput" maxlength="4000" rows="3" placeholder="例如：T1/T2 形态仍像细胞，不能按静态杂质处理"></textarea></label>
+            </div>
+            <div class="decision-buttons">
+              <button class="button button-primary" data-decision="accept_v3" type="button">接受 V3 提议</button>
+              <button class="button button-outline" data-decision="keep_legacy" type="button">保留 V2</button>
+              <button id="manualSaveButton" class="button button-outline" data-decision="manual_labels" type="button">保存人工逐帧标签</button>
+              <button class="button button-quiet" data-decision="needs_more" type="button">需要更多证据</button>
+              <button class="button button-quiet" data-decision="skip" type="button">跳过</button>
+            </div>
+            <p class="editor-help">快捷键：← / → 切换轨迹；1 接受 V3；2 保留 V2；3 保存人工标签。</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/temporal-shadow-review.js" defer></script>
+</body>
+</html>

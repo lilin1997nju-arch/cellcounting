@@ -1,0 +1,67 @@
+base_config: configs/generated/ql2603-t1-1.yaml
+
+# The two complete boards below are frozen for comparison and must not
+# contribute to any classifier target or V2 cache.
+validation_holdout_sources:
+  - configs/generated/ql2603-t1-2.yaml
+  - configs/generated/ql2603-t4-2.yaml
+
+joint_training:
+  sources:
+    - name: QL11111_reviewed
+      config: configs/default.yaml
+      require_human_labels: true
+    - name: QL2202_reviewed
+      config: configs/ql2202_validation.yaml
+      require_human_labels: true
+    - name: QL2603_T1_3_reviewed
+      config: configs/generated/ql2603-t1-3.yaml
+      require_human_labels: true
+    - name: QL2603_T1_4_reviewed
+      config: configs/generated/ql2603-t1-4.yaml
+      require_human_labels: true
+    - name: QL2603_T1_5_reviewed
+      config: configs/generated/ql2603-t1-5.yaml
+      require_human_labels: true
+    - name: QL2603_T2_1_reviewed
+      config: configs/generated/ql2603-t2-1.yaml
+      require_human_labels: true
+    - name: QL2603_T2_2_reviewed
+      config: configs/generated/ql2603-t2-2.yaml
+      require_human_labels: true
+    - name: QL2603_T2_3_reviewed
+      config: configs/generated/ql2603-t2-3.yaml
+      require_human_labels: true
+    - name: QL2603_T2_4_reviewed
+      config: configs/generated/ql2603-t2-4.yaml
+      require_human_labels: true
+    - name: QL2603_T2_5_reviewed
+      config: configs/generated/ql2603-t2-5.yaml
+      require_human_labels: true
+    - name: QL2603_T3_1_reviewed
+      config: configs/generated/ql2603-t3-1.yaml
+      require_human_labels: true
+    - name: QL2603_T3_2_reviewed
+      config: configs/generated/ql2603-t3-2.yaml
+      require_human_labels: true
+    - name: QL2603_T3_3_reviewed
+      config: configs/generated/ql2603-t3-3.yaml
+      require_human_labels: true
+    - name: QL2603_T4_1_reviewed
+      config: configs/generated/ql2603-t4-1.yaml
+      require_human_labels: true
+    - name: QL2603_T4_3_reviewed
+      config: configs/generated/ql2603-t4-3.yaml
+      require_human_labels: true
+    - name: QL2603_T5_1_reviewed
+      config: configs/generated/ql2603-t5-1.yaml
+      require_human_labels: true
+    - name: QL2603_T5_2_reviewed
+      config: configs/generated/ql2603-t5-2.yaml
+      require_human_labels: true
+    - name: QL2603_T6_1_reviewed
+      config: configs/generated/ql2603-t6-1.yaml
+      require_human_labels: true
+    - name: QL2603_T6_2_reviewed
+      config: configs/generated/ql2603-t6-2.yaml
+      require_human_labels: true

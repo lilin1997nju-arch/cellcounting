@@ -5,7 +5,24 @@ import pandas as pd
 from cellvision.late_full_inference import (
     _dense_late_group_mask,
     _dense_v2_passthrough,
+    _selected_late_timepoints,
 )
+
+
+def test_late_cell_inference_uses_only_configured_endpoint() -> None:
+    images = pd.DataFrame({"timepoint": ["T3", "T4"]})
+
+    assert _selected_late_timepoints(
+        {"late_growth": {"endpoint_timepoint": "T4"}}, images
+    ) == ("T4",)
+
+
+def test_late_cell_inference_falls_back_to_day7_when_it_is_the_only_endpoint() -> None:
+    images = pd.DataFrame({"timepoint": ["T3"]})
+
+    assert _selected_late_timepoints(
+        {"late_growth": {"endpoint_timepoint": "T4"}}, images
+    ) == ("T3",)
 
 
 def test_dense_late_mask_selects_whole_image_and_ignores_suppressed_rows() -> None:

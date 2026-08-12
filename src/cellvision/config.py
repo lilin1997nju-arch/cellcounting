@@ -139,3 +139,20 @@ def artifact_path(config: dict[str, Any], *parts: str) -> Path:
     path = Path(config["paths"]["artifact_root"]).joinpath(*parts)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def is_validation_holdout(config: dict[str, Any], source_path: str | Path) -> bool:
+    """Whether a source config is explicitly frozen for evaluation."""
+
+    candidate = Path(source_path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (PROJECT_ROOT / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    configured = config.get("validation_holdout_sources", [])
+    return any(
+        candidate == Path(str(value)).expanduser().resolve()
+        if Path(str(value)).expanduser().is_absolute()
+        else candidate == (PROJECT_ROOT / str(value)).resolve()
+        for value in configured
+    )

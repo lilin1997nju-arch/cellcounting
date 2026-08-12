@@ -3,6 +3,12 @@ base_config: configs/default.yaml
 algorithm:
   version: v2
 
+# Frozen, complete QL2603 boards used only for post-training comparison.
+# They stay out of both V2 caches and the classifier joint-training manifest.
+validation_holdout_sources:
+  - configs/generated/ql2603-t1-2.yaml
+  - configs/generated/ql2603-t4-2.yaml
+
 v2_instance_segmentation:
   enabled: true
   patch_size_px: 96
@@ -12,7 +18,8 @@ v2_instance_segmentation:
   base_channels: 16
   epochs: 10
   batch_size: 32
-  learning_rate: 0.0003
+  # Warm-start the existing boundary with a conservative 1/3 learning rate.
+  learning_rate: 0.0001
   weight_decay: 0.0001
   wall_loss_weight: 0.45
   presence_loss_weight: 0.70
@@ -20,14 +27,37 @@ v2_instance_segmentation:
   wall_threshold: 0.50
   presence_threshold: 0.55
   seed: 20260802
+  balance_by_plate_and_class: true
+  per_source_cap: 700
+  # Unreviewed 2603 boards contribute no trusted object labels yet; keep them
+  # out of this round's cache so the reviewed sources are not drowned by
+  # pseudo-negative hard negatives.
+  include_unreviewed_hard_negatives: false
   # Incremental fine-tuning preserves the already learned cell/debris boundary.
   initial_checkpoint: artifacts/v2/models/latest_instance_segmenter.pt
-  reuse_training_cache: false
+  # The round cache was rebuilt from the old replay plus reviewed 2603 add-on.
+  reuse_training_cache: true
   training_sources:
     - configs/default.yaml
     - configs/ql2202_validation.yaml
-    - configs/ql2603_t1_1_validation.yaml
-    - configs/ql2603_t1_2_validation.yaml
+    - configs/generated/ql2603-t1-1.yaml
+    - configs/generated/ql2603-t1-3.yaml
+    - configs/generated/ql2603-t1-4.yaml
+    - configs/generated/ql2603-t1-5.yaml
+    - configs/generated/ql2603-t2-1.yaml
+    - configs/generated/ql2603-t2-2.yaml
+    - configs/generated/ql2603-t2-3.yaml
+    - configs/generated/ql2603-t2-4.yaml
+    - configs/generated/ql2603-t2-5.yaml
+    - configs/generated/ql2603-t3-1.yaml
+    - configs/generated/ql2603-t3-2.yaml
+    - configs/generated/ql2603-t3-3.yaml
+    - configs/generated/ql2603-t4-1.yaml
+    - configs/generated/ql2603-t4-3.yaml
+    - configs/generated/ql2603-t5-1.yaml
+    - configs/generated/ql2603-t5-2.yaml
+    - configs/generated/ql2603-t6-1.yaml
+    - configs/generated/ql2603-t6-2.yaml
   excluded_external_validation_sources:
     - configs/a12_22_training.yaml
 
@@ -46,14 +76,40 @@ v2_temporal_model:
   static_wall_overlap_threshold: 0.90
   static_wall_maximum_motion_px: 5
   static_wall_maximum_area_ratio: 2.20
-  epochs: 80
-  batch_size: 16
-  learning_rate: 0.0008
+  epochs: 40
+  batch_size: 64
+  # Warm-start the latest temporal model; replay sampling prevents 2603 from
+  # displacing the older temporal boundary.
+  learning_rate: 0.0002
+  # Continue from the current temporal model after adding the reviewed 2603
+  # triplets, instead of discarding the learned temporal boundary.
+  initial_checkpoint: artifacts/v2/models/latest_temporal_evidence.pt
+  balance_by_plate_and_class: true
+  reuse_training_cache: true
   training_sources:
     - configs/default.yaml
     - configs/ql2202_validation.yaml
-    - configs/ql2603_t1_1_validation.yaml
-    - configs/ql2603_t1_2_validation.yaml
+    # The canonical QL2603 project sources cover all 20 boards.  Boards with
+    # existing integrated_training_reviews contribute supervised examples;
+    # the remaining boards are retained here so the source scope is explicit.
+    - configs/generated/ql2603-t1-1.yaml
+    - configs/generated/ql2603-t1-3.yaml
+    - configs/generated/ql2603-t1-4.yaml
+    - configs/generated/ql2603-t1-5.yaml
+    - configs/generated/ql2603-t2-1.yaml
+    - configs/generated/ql2603-t2-2.yaml
+    - configs/generated/ql2603-t2-3.yaml
+    - configs/generated/ql2603-t2-4.yaml
+    - configs/generated/ql2603-t2-5.yaml
+    - configs/generated/ql2603-t3-1.yaml
+    - configs/generated/ql2603-t3-2.yaml
+    - configs/generated/ql2603-t3-3.yaml
+    - configs/generated/ql2603-t4-1.yaml
+    - configs/generated/ql2603-t4-3.yaml
+    - configs/generated/ql2603-t5-1.yaml
+    - configs/generated/ql2603-t5-2.yaml
+    - configs/generated/ql2603-t6-1.yaml
+    - configs/generated/ql2603-t6-2.yaml
 
 v2_review_performance:
   initial_image_size_px: 1400

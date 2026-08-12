@@ -51,7 +51,9 @@ GET /api/ready
 ```text
 GET  /api/project/tasks
 GET  /api/project/tasks/{task_id}
+POST /api/project/tasks/{task_id}/start
 POST /api/project/tasks/{task_id}/cancel
+DELETE /api/project/tasks/{task_id}
 ```
 
 队列状态已经采用原子JSON写入并支持queued/running/completed/error/cancelled状态；实际项目推理executor应由独立GPU worker调用，不应放在HTTP请求线程中。
@@ -89,6 +91,8 @@ POST /api/project/tasks/{task_id}/cancel
 
 ## CUDA
 
+worker 现在会自动检测 CUDA；没有可用 GPU 时直接使用 CPU，不需要人工先确认 GPU 才能运行。启动命令和 CPU-only 部署方式见 [`docs/worker-deployment.md`](worker-deployment.md)。
+
 `deploy/Dockerfile`是便于验收的CPU基础镜像。正式GPU部署应选择与服务器驱动匹配的CUDA基础镜像，并安装对应的Torch/Torchvision版本；部署前执行：
 
 ```text
@@ -97,3 +101,6 @@ python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
 ```
 
 只有确认GPU可用后才启动推理worker，避免服务端误退回CPU导致任务耗时大幅增加。
+## 自适应 worker
+
+当前部署已支持启动时自动检测 CUDA；检测到可用 GPU 时选择 GPU worker，否则选择 CPU worker。详细启动命令、独立 worker 部署和状态接口见 [`docs/worker-deployment.md`](worker-deployment.md)。

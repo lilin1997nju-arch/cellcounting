@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -6,12 +7,128 @@ import pandas as pd
 from cellvision.review_server import (
     _growth_region_contours,
     _visible_v2_review_instances,
+    _with_final_decisions,
     PointSelection,
     initialize_database,
     save_annotation,
     save_lineage_review,
 )
 from PIL import Image
+
+
+def test_final_decision_contract_uses_v3_wall_structure_result():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "invalid",
+                "current_label": "invalid",
+                "integrated_confidence": 0.67,
+                "reviewed_label": None,
+                "v3_reviewed_label": None,
+                "v3_track_behavior": "wall_structure_invalid",
+                "v3_proposed_label": "invalid",
+                "v3_reason": "stable_wall_site_structure",
+                "v3_behavior_score": 0.89,
+                "v3_label_mode": "per_frame_evidence",
+            }
+        ]
+    )
+
+    result = _with_final_decisions(frame).iloc[0]
+
+    assert result["final_label"] == "invalid"
+    assert result["final_source"] == "v3_temporal"
+    assert result["final_reason_code"] == "stable_wall_site_structure"
+    assert "孔壁结构伪目标" in result["final_reason_text"]
+    assert result["final_confidence"] == 0.89
+    assert result["final_status"] == "determined"
+
+
+def test_final_decision_contract_prefers_unified_human_track_review():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "debris",
+                "current_label": "debris",
+                "integrated_confidence": 0.70,
+                "reviewed_label": "debris",
+                "v3_reviewed_label": "dead_cell",
+                "v3_track_behavior": "cell_to_debris",
+                "v3_track_conclusion": "dead_cell",
+                "v3_proposed_label": "debris",
+                "v3_reason": "strong_t0_cell_monotonic_decline_with_morphology_degradation",
+                "v3_behavior_score": 0.81,
+                "v3_label_mode": "unified_track",
+            }
+        ]
+    )
+
+    result = _with_final_decisions(frame).iloc[0]
+
+    assert result["final_label"] == "dead_cell"
+    assert result["final_review_label"] == "debris"
+    assert result["final_source"] == "human_track_review"
+    assert result["final_confidence"] == 1.0
+
+
+def test_final_decision_contract_exposes_v3_override_as_review_label():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "single",
+                "current_label": "single",
+                "integrated_confidence": 0.81,
+                "reviewed_label": None,
+                "v3_reviewed_label": None,
+                "v3_track_behavior": "stable_debris",
+                "v3_proposed_label": "debris",
+                "v3_reason": "stable_three_frame_debris",
+                "v3_behavior_score": 0.72,
+                "v3_label_mode": "per_frame_evidence",
+            }
+        ]
+    )
+
+    result = _with_final_decisions(frame).iloc[0]
+
+    assert result["current_label"] == "single"
+    assert result["final_label"] == "debris"
+    assert result["final_review_label"] == "debris"
+
+
+def test_auto_review_uses_authoritative_label_for_controls_and_save():
+    source = (
+        Path(__file__).parents[1] / "review-ui" / "auto-review.js"
+    ).read_text(encoding="utf-8")
+
+    assert "button.dataset.label === editableDecisionLabel(object)" in source
+    assert "const label = editableDecisionLabel(object);" in source
+    assert "reviewed_label: editableDecisionLabel(object)" in source
+
+
+def test_final_decision_contract_keeps_v2_label_for_review_only_v3_state():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "single",
+                "current_label": "single",
+                "integrated_confidence": 0.74,
+                "reviewed_label": None,
+                "v3_reviewed_label": None,
+                "v3_track_behavior": "wall_uncertain",
+                "v3_proposed_label": "uncertain",
+                "v3_reason": "wall_site_insufficient_structure_evidence",
+                "v3_behavior_score": 0.68,
+                "v3_label_mode": "per_frame_evidence",
+            }
+        ]
+    )
+
+    result = _with_final_decisions(frame).iloc[0]
+
+    assert result["final_label"] == "single"
+    assert result["final_source"] == "integrated_model"
+    assert result["final_status"] == "needs_review"
 
 
 def test_v2_review_visibility_removes_suppressed_rows_after_manual_concat():

@@ -20,12 +20,15 @@ from .train import train_weak_segmenter
 from .train_morphology import train_morphology_classifier
 from .train_v2_instance import train_v2_instance_segmenter
 from .train_v2_temporal import train_v2_temporal_model
+from .temporal_pairwise import train_temporal_pairwise_model
 from .v2_instance_inference import infer_v2_instances, refinalize_v2_file
 from .evaluate_v2 import write_v2_evaluation
 from .v2_temporal_inference import infer_v2_temporal_evidence, refinalize_v2_temporal_noncell_labels
 from .review_image_cache import precache_review_images
 from .late_growth_inference import infer_late_growth
 from .gated_screening import build_gated_plate_report
+from .project_worker import ProjectTaskWorker
+from .runtime import SUPPORTED_DEVICE_REQUESTS
 
 
 # Keep one stable project-review endpoint.  Starting a new task should reuse
@@ -60,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--wells", default="A1,B3,F12,G2,H6")
     train = subparsers.add_parser("train")
     train.add_argument(
-        "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v2-temporal-model"]
+        "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v2-temporal-model", "v3-temporal-pairwise-model"]
     )
     train.add_argument("--config", default="configs/default.yaml")
     infer = subparsers.add_parser("infer")
@@ -114,6 +117,32 @@ def build_parser() -> argparse.ArgumentParser:
     project_review.add_argument("--host", default=os.getenv("CELLVISION_HOST", "127.0.0.1"))
     project_review.add_argument("--port", type=int, default=int(os.getenv("CELLVISION_PORT", str(PROJECT_REVIEW_PORT))))
     project_review.add_argument("--allow-remote", action="store_true", help="Allow binding beyond loopback")
+    project_review.add_argument(
+        "--no-worker",
+        action="store_true",
+        help="Do not start the adaptive project worker alongside the review service",
+    )
+    project_review.add_argument(
+        "--worker-device",
+        choices=SUPPORTED_DEVICE_REQUESTS,
+        default=os.getenv("CELLVISION_WORKER_DEVICE", "auto"),
+        help="Worker device: auto detects CUDA and falls back to CPU",
+    )
+    project_review.add_argument("--worker-poll-seconds", type=float, default=2.0)
+    project_worker = subparsers.add_parser(
+        "project-worker",
+        help="Run the adaptive project queue worker (CUDA when available, otherwise CPU)",
+    )
+    project_worker.add_argument("--manifest", required=True, help="Project JSON manifest that owns task_queue.json")
+    project_worker.add_argument(
+        "--device",
+        choices=SUPPORTED_DEVICE_REQUESTS,
+        default=os.getenv("CELLVISION_WORKER_DEVICE", "auto"),
+        help="auto detects CUDA; cpu/cuda can be used as an explicit preference",
+    )
+    project_worker.add_argument("--worker-id", default="")
+    project_worker.add_argument("--poll-seconds", type=float, default=2.0)
+    project_worker.add_argument("--once", action="store_true", help="Claim at most one started task and exit")
     return parser
 
 
@@ -140,7 +169,42 @@ def main(argv: list[str] | None = None) -> None:
             args.allow_remote or os.getenv("CELLVISION_ALLOW_REMOTE") == "1"
         ):
             raise SystemExit("Remote binding requires --allow-remote or CELLVISION_ALLOW_REMOTE=1")
-        uvicorn.run(create_project_app(args.manifest), host=args.host, port=args.port)
+        worker = None
+        if not args.no_worker:
+            worker = ProjectTaskWorker.from_manifest(
+                args.manifest,
+                requested_device=args.worker_device,
+            )
+            print(json.dumps({
+                "event": "worker_started",
+                **worker.runtime.as_dict(),
+                "worker_id": worker.worker_id,
+                "mode": "background",
+            }, ensure_ascii=False), flush=True)
+            worker.start_background(poll_seconds=args.worker_poll_seconds)
+        try:
+            uvicorn.run(create_project_app(args.manifest), host=args.host, port=args.port)
+        finally:
+            if worker is not None:
+                worker.stop()
+        return
+    if args.command == "project-worker":
+        worker = ProjectTaskWorker.from_manifest(
+            args.manifest,
+            requested_device=args.device,
+            worker_id=args.worker_id or None,
+        )
+        print(json.dumps({
+            "event": "worker_started",
+            **worker.runtime.as_dict(),
+            "worker_id": worker.worker_id,
+            "mode": "once" if args.once else "foreground",
+        }, ensure_ascii=False), flush=True)
+        if args.once:
+            result = worker.run_once()
+            print(json.dumps({"event": "worker_once_finished", "task": result}, ensure_ascii=False, indent=2), flush=True)
+        else:
+            worker.run_forever(poll_seconds=args.poll_seconds)
         return
     config = load_config(args.config)
     if args.command == "audit":
@@ -164,6 +228,8 @@ def main(argv: list[str] | None = None) -> None:
             run_dir = train_morphology_classifier(config)
         elif args.model == "v2-instance-segmenter":
             run_dir = train_v2_instance_segmenter(config)
+        elif args.model == "v3-temporal-pairwise-model":
+            run_dir = train_temporal_pairwise_model(config)
         else:
             run_dir = train_v2_temporal_model(config)
         print(str(run_dir))

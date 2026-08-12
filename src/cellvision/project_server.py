@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import html
 import os
 import re
 import sqlite3
@@ -26,8 +27,20 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from .config import PROJECT_ROOT, load_config
+from .config import PROJECT_ROOT, artifact_path, load_config
+from .multiplicity import (
+    ensure_multiplicity_table,
+    multiplicity_queue,
+    multiplicity_stats,
+    save_categorized_review_labels,
+)
 from .review_server import _visible_v2_review_instances, create_app
+from .review_summary import (
+    latest_prediction_path,
+    read_summary,
+    summary_path,
+    summary_signature,
+)
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
 
@@ -106,28 +119,65 @@ def _empty_review_progress(*, available: bool) -> dict[str, Any]:
 
 def _latest_prediction_path(config: dict[str, Any]) -> Path:
     prediction_root = Path(config["paths"]["artifact_root"]) / "predictions"
-    base = prediction_root / "latest_integrated_predictions.csv"
-    source = base
-    for name in (
-        "latest_temporally_completed_predictions.csv",
-        "latest_v2_predictions.csv",
-    ):
-        candidate = prediction_root / name
-        if candidate.exists() and (
-            not source.exists() or candidate.stat().st_mtime_ns >= source.stat().st_mtime_ns
-        ):
-            source = candidate
-    return source
+    return latest_prediction_path(config["paths"]["artifact_root"]) or (
+        prediction_root / "latest_integrated_predictions.csv"
+    )
+
+
+def _plate_artifact_root(plate: dict[str, Any]) -> Path | None:
+    value = plate.get("artifact_root")
+    return _resolve(value) if value else None
+
+
+def _review_summary_for_plate(plate: dict[str, Any]) -> dict[str, Any] | None:
+    """Read a current persisted summary without loading prediction rows."""
+
+    root = _plate_artifact_root(plate)
+    if root is None:
+        return None
+    report_root = plate.get("gated_output_dir")
+    report_path = (
+        _resolve(report_root) / "plate_overview.csv"
+        if report_root
+        else root / "gated" / "plate_overview.csv"
+    )
+    signature = summary_signature(root, report_path=report_path)
+    return read_summary(summary_path(root), signature)
+
+
+def _review_progress_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    if summary.get("status") != "ready":
+        return _empty_review_progress(available=False)
+    rows = summary.get("wells") if isinstance(summary.get("wells"), list) else []
+    well_count = int(summary.get("well_count", len(rows)) or 0)
+    completed = int(
+        summary.get(
+            "completed_well_count",
+            sum(bool(row.get("completed")) for row in rows if isinstance(row, dict)),
+        )
+        or 0
+    )
+    return {
+        "review_data_available": True,
+        "reviewable_well_count": well_count,
+        "reviewed_well_count": completed,
+        "reviewable_object_count": int(summary.get("object_count", 0) or 0),
+        "reviewed_object_count": int(summary.get("reviewed_object_count", 0) or 0),
+        "review_complete": not rows or completed >= well_count,
+    }
 
 
 def _review_progress_for_plate(plate: dict[str, Any]) -> dict[str, Any]:
     """Read lightweight well-review progress without starting a plate app.
 
     The project hub must not construct every review application just to render
-    a table.  The prediction table and annotation database already contain the
-    information needed to count reviewable wells, so use them directly and
-    invalidate the small cache when either file changes.
+    a table.  Prefer the persisted per-plate summary and keep the old direct
+    prediction/database scan as a compatibility fallback for legacy plates.
     """
+
+    persisted = _review_summary_for_plate(plate)
+    if persisted is not None:
+        return _review_progress_from_summary(persisted)
 
     config_value = plate.get("config")
     if not config_value:
@@ -327,7 +377,28 @@ class FolderPayload(BaseModel):
 
 class TaskPayload(FolderPayload):
     name: str = Field(default="新建项目任务", min_length=1, max_length=120)
+    created_by: str = Field(default="未填写", min_length=1, max_length=80)
     selected_timepoint_labels: list[str] = Field(default_factory=list)
+
+
+class ProjectRenamePayload(BaseModel):
+    project_name: str = Field(min_length=1, max_length=120)
+
+
+class ProjectMultiplicityLabelItem(BaseModel):
+    plate_slug: str
+    candidate_id: str
+    well: str
+    timepoint: str
+    x_px: float
+    y_px: float
+    label: str
+    source: str = "quick_single_doublet"
+
+
+class ProjectMultiplicityLabelsPayload(BaseModel):
+    items: list[ProjectMultiplicityLabelItem]
+    reviewer: str = "local_user"
 
 
 _DAY_RE = re.compile(r"^day\s*(?P<day>-?\d+)$", re.IGNORECASE)
@@ -380,7 +451,12 @@ def _timepoint_options(sessions: pd.DataFrame) -> list[dict[str, Any]]:
 
 def _default_timepoint_selection(options: list[dict[str, Any]]) -> list[str]:
     selected = [str(item["day_label"]) for item in options if int(item["day_number"]) in {0, 1, 2}]
-    later = [item for item in options if bool(item.get("eligible_endpoint"))]
+    later = [
+        item
+        for item in options
+        if bool(item.get("eligible_endpoint"))
+        or int(item.get("day_number", -1)) >= 7
+    ]
     if later:
         selected.append(str(max(later, key=lambda item: int(item["day_number"]))["day_label"]))
     return list(dict.fromkeys(selected))
@@ -482,6 +558,7 @@ def _parse_folder(path_value: str) -> dict[str, Any]:
     )
     return {
         "root": str(root),
+        "folder_name": _folder_name(root),
         "index": str(index),
         "session_count": int(len(sessions)),
         "group_count": int(len(groups)),
@@ -520,12 +597,38 @@ def _project_manifest_paths(current: Path) -> list[Path]:
     return sorted(set(paths), key=lambda path: path.as_posix().casefold())
 
 
+def _find_project_manifest(current: Path, project_id: str) -> Path | None:
+    wanted = _slug(project_id)
+    for path in _project_manifest_paths(current):
+        value = _read_manifest(path) or {}
+        candidate = _slug(str(value.get("project_id") or path.parent.name))
+        if candidate == wanted:
+            return path
+    return None
+
+
 def _read_manifest(path: Path) -> dict[str, Any] | None:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
     return value if isinstance(value, dict) else None
+
+
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _folder_name(path_value: str | Path) -> str:
+    path = Path(os.path.expandvars(str(path_value))).expanduser()
+    if path.name.casefold() == "sessions.idx":
+        path = path.parent
+    return path.name or "新建项目"
 
 
 def _project_card(path: Path) -> dict[str, Any]:
@@ -537,11 +640,24 @@ def _project_card(path: Path) -> dict[str, Any]:
     for plate in plates:
         if not isinstance(plate, dict):
             continue
-        report, _ = _report_for_plate(plate)
-        if report:
+        stored_counts = plate.get("category_counts")
+        has_stored_result = (
+            isinstance(stored_counts, dict)
+            and (
+                str(plate.get("status", "")).lower() == "completed"
+                or bool(stored_counts)
+            )
+        )
+        if has_stored_result:
             completed += 1
-            for key, count in (report.get("category_counts") or {}).items():
+            for key, count in stored_counts.items():
                 aggregate[str(key)] = aggregate.get(str(key), 0) + int(count or 0)
+        else:
+            report, _ = _report_for_plate(plate)
+            if report:
+                completed += 1
+                for key, count in (report.get("category_counts") or {}).items():
+                    aggregate[str(key)] = aggregate.get(str(key), 0) + int(count or 0)
         if _review_progress_for_plate(plate).get("review_complete"):
             reviewed += 1
     project_id = str(value.get("project_id") or path.parent.name)
@@ -662,6 +778,230 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             plate["mount_error"] = str(exc)
     manifest["mounted_plates"] = mounted
 
+    def multiplicity_plate_contexts() -> list[dict[str, Any]]:
+        """Return the lightweight per-board context for the project queue."""
+
+        contexts: list[dict[str, Any]] = []
+        for plate in manifest.get("plates", []):
+            slug = str(plate.get("slug") or _slug(plate.get("board_id", "")))
+            config_value = plate.get("config")
+            if not slug or slug not in mounted or not config_value:
+                continue
+            config_path = _resolve(config_value)
+            if not config_path.exists():
+                continue
+            try:
+                config = load_config(config_path)
+                database = artifact_path(config, "annotations", "annotations.db")
+            except (OSError, KeyError, TypeError, ValueError):
+                continue
+            contexts.append({
+                "slug": slug,
+                "label": str(plate.get("board_id") or plate.get("group_id") or slug),
+                "config": config,
+                "database": database,
+            })
+        return contexts
+
+    @app.get("/single-doublet-review", response_class=HTMLResponse)
+    def single_doublet_review() -> str:
+        page = (ui_root / "single-doublet-review.html").read_text(encoding="utf-8")
+        page = page.replace('content="plate"', 'content="project"', 1)
+        page = page.replace(
+            '<meta name="project-back-url" content="">',
+            f'<meta name="project-back-url" content="{html.escape(project_back_url, quote=True)}">',
+            1,
+        )
+        page = page.replace(
+            '<meta name="project-name" content="">',
+            f'<meta name="project-name" content="{html.escape(project_name, quote=True)}">',
+            1,
+        )
+        page = page.replace('href="assets/', 'href="/project-assets/', 1)
+        page = page.replace('src="assets/', 'src="/project-assets/', 1)
+        return page
+
+    @app.get("/api/multiplicity-training-candidates")
+    def multiplicity_training_candidates(
+        mode: str = "likely_doublet",
+        limit: int = 48,
+        category: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if mode not in {"likely_doublet", "uncertain", "diverse"}:
+            raise HTTPException(status_code=422, detail="Invalid queue mode")
+        if category is not None and category not in {
+            "single",
+            "touching_doublet",
+            "cluster_3plus",
+            "debris",
+            "invalid",
+        }:
+            raise HTTPException(status_code=422, detail="Invalid multiplicity category")
+        requested = max(1, min(int(limit), 240))
+        candidates: list[dict[str, Any]] = []
+        for context in multiplicity_plate_contexts():
+            try:
+                rows = multiplicity_queue(
+                    context["config"],
+                    context["database"],
+                    mode,
+                    min(100, requested),
+                    category=category,
+                )
+            except (OSError, KeyError, TypeError, ValueError, pd.errors.ParserError):
+                continue
+            for row in rows:
+                item = dict(row)
+                item["plate_slug"] = context["slug"]
+                item["plate_label"] = context["label"]
+                item["patch_base"] = f"/plates/{context['slug']}"
+                item["review_id"] = f"{context['slug']}::{item['candidate_id']}"
+                candidates.append(item)
+
+        def numeric(item: dict[str, Any], key: str, default: float = 0.0) -> float:
+            try:
+                value = item.get(key)
+                return default if value is None else float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def binary_priority(item: dict[str, Any]) -> float:
+            """Prefer single/doublet evidence and demote clear 3+ groups."""
+
+            single = numeric(item, "single_probability", -1.0)
+            doublet = numeric(item, "touching_doublet_probability", -1.0)
+            cluster = numeric(item, "cluster_3plus_probability", -1.0)
+            if min(single, doublet, cluster) < 0:
+                return numeric(item, "doublet_priority")
+            return max(single, doublet) - 0.35 * cluster
+
+        for item in candidates:
+            item["_binary_priority"] = binary_priority(item)
+
+        if category is not None:
+            # ``multiplicity_uncertainty`` is unrelated to the debris/wall
+            # buckets.  Keep the category-specific low-confidence ordering
+            # produced by ``multiplicity_queue`` for every tab.
+            candidates.sort(
+                key=lambda item: (
+                    -numeric(item, "category_priority"),
+                    -numeric(item, "multiplicity_uncertainty", 0.0),
+                )
+            )
+        elif mode == "uncertain":
+            candidates.sort(
+                key=lambda item: (
+                    -numeric(item, "multiplicity_uncertainty", 0.0),
+                    -numeric(item, "_binary_priority"),
+                )
+            )
+        elif mode == "diverse":
+            candidates_by_plate: dict[str, list[dict[str, Any]]] = {}
+            for item in candidates:
+                candidates_by_plate.setdefault(str(item["plate_slug"]), []).append(item)
+            for bucket in candidates_by_plate.values():
+                bucket.sort(key=lambda item: -numeric(item, "_binary_priority"))
+            candidates = []
+            buckets = list(candidates_by_plate.values())
+            while buckets and len(candidates) < requested:
+                next_buckets: list[list[dict[str, Any]]] = []
+                for bucket in buckets:
+                    if bucket:
+                        candidates.append(bucket.pop(0))
+                    if bucket:
+                        next_buckets.append(bucket)
+                    if len(candidates) >= requested:
+                        break
+                buckets = next_buckets
+        else:
+            candidates.sort(
+                key=lambda item: (
+                    -numeric(item, "_binary_priority"),
+                    -numeric(item, "cell_probability"),
+                )
+            )
+        for item in candidates:
+            item.pop("_binary_priority", None)
+        return [_safe(item) for item in candidates[:requested]]
+
+    @app.get("/api/multiplicity-training-stats")
+    def multiplicity_training_stats() -> dict[str, Any]:
+        totals = {
+            "single": 0,
+            "touching_doublet": 0,
+            "cluster_3plus": 0,
+            "debris": 0,
+            "invalid": 0,
+            "approved": 0,
+            "not_cell": 0,
+            "skip": 0,
+        }
+        plates: list[dict[str, Any]] = []
+        for context in multiplicity_plate_contexts():
+            stats = multiplicity_stats(context["database"])
+            counts = stats.get("counts", {})
+            for label in totals:
+                totals[label] += int(counts.get(label, 0) or 0)
+            plates.append({
+                "plate_slug": context["slug"],
+                "plate_label": context["label"],
+                "total": int(stats.get("total", 0) or 0),
+                "counts": counts,
+            })
+        return {
+            "total": int(sum(totals.values())),
+            "counts": totals,
+            "recommended_minimums": {
+                "single": 40,
+                "touching_doublet": 20,
+                "cluster_3plus": 10,
+                "debris": 0,
+                "invalid": 0,
+                "approved": 0,
+                "not_cell": 20,
+            },
+            "plates": plates,
+        }
+
+    @app.post("/api/multiplicity-training-labels")
+    def multiplicity_training_labels(
+        payload: ProjectMultiplicityLabelsPayload,
+    ) -> dict[str, Any]:
+        contexts = {item["slug"]: item for item in multiplicity_plate_contexts()}
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for item in payload.items:
+            if item.plate_slug not in contexts:
+                raise HTTPException(status_code=422, detail="Unknown plate")
+            grouped.setdefault(item.plate_slug, []).append(
+                item.model_dump(exclude={"plate_slug"})
+            )
+        saved = 0
+        by_plate: dict[str, int] = {}
+        for slug, items in grouped.items():
+            count = save_categorized_review_labels(
+                contexts[slug]["database"], items, payload.reviewer
+            )
+            saved += int(count)
+            by_plate[slug] = int(count)
+        return {"status": "saved", "saved": saved, "by_plate": by_plate}
+
+    @app.delete("/api/multiplicity-training-labels/{plate_slug}/{candidate_id}")
+    def multiplicity_training_label_delete(
+        plate_slug: str, candidate_id: str
+    ) -> dict[str, Any]:
+        contexts = {item["slug"]: item for item in multiplicity_plate_contexts()}
+        context = contexts.get(plate_slug)
+        if context is None:
+            raise HTTPException(status_code=404, detail="Unknown plate")
+        ensure_multiplicity_table(context["database"])
+        with sqlite3.connect(context["database"]) as connection:
+            cursor = connection.execute(
+                "DELETE FROM multiplicity_labels WHERE candidate_id = ?",
+                (candidate_id,),
+            )
+            deleted = int(cursor.rowcount or 0)
+        return {"status": "deleted", "deleted": deleted}
+
     @app.get("/", response_class=HTMLResponse)
     def root() -> str:
         # The landing page is deliberately project-level.  Opening a board is
@@ -756,6 +1096,101 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     @app.get("/api/project/tasks")
     def tasks() -> list[dict[str, Any]]:
         return queue_store.list()
+
+    @app.get("/api/project/worker-runtime")
+    def worker_runtime() -> dict[str, Any]:
+        """Expose the adaptive worker's last hardware/status snapshot."""
+
+        runtime_path = queue_file.parent / "worker_runtime.json"
+        if not runtime_path.exists():
+            return {
+                "status": "offline",
+                "selected_device": "unknown",
+                "message": "项目 worker 尚未启动",
+            }
+        try:
+            value = json.loads(runtime_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {
+                "status": "unknown",
+                "selected_device": "unknown",
+                "message": "worker 状态文件暂不可读",
+            }
+        return value if isinstance(value, dict) else {
+            "status": "unknown",
+            "selected_device": "unknown",
+        }
+
+    @app.patch("/api/project/{project_id}")
+    def rename_project(project_id: str, payload: ProjectRenamePayload) -> dict[str, Any]:
+        selected_path = _find_project_manifest(manifest_file, project_id)
+        if selected_path is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        value = _read_manifest(selected_path)
+        if value is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        project_name = payload.project_name.strip()
+        if not project_name:
+            raise HTTPException(status_code=422, detail="project name cannot be empty")
+        value["project_name"] = project_name
+        value["renamed_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json_atomic(selected_path, value)
+        return {
+            "status": "renamed",
+            "project_id": str(value.get("project_id") or selected_path.parent.name),
+            "project_name": project_name,
+        }
+
+    @app.delete("/api/project/{project_id}")
+    def delete_empty_project(project_id: str) -> dict[str, Any]:
+        selected_path = _find_project_manifest(manifest_file, project_id)
+        if selected_path is None:
+            raise HTTPException(status_code=404, detail="project not found")
+        if selected_path.resolve() == manifest_file.resolve():
+            raise HTTPException(status_code=409, detail="主项目不能删除")
+        value = _read_manifest(selected_path)
+        if value is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        plates = value.get("plates") if isinstance(value.get("plates"), list) else []
+        if plates:
+            raise HTTPException(status_code=409, detail="只有内容为空、没有板子的项目可以删除")
+
+        related = [
+            task
+            for task in queue_store.list()
+            if Path(str(task.get("project_manifest", ""))).expanduser().resolve() == selected_path.resolve()
+        ]
+        blocked = [
+            task for task in related
+            if str(task.get("status")) in {"running", "completed"}
+        ]
+        if blocked:
+            raise HTTPException(status_code=409, detail="关联任务正在运行或已完成，不能删除项目")
+
+        selected_path.unlink(missing_ok=False)
+        deleted_tasks: list[str] = []
+        plan_root = (queue_file.parent / "task_plans").resolve()
+        for task in related:
+            task_key = str(task.get("task_id", ""))
+            if task_key and queue_store.delete(task_key) is not None:
+                deleted_tasks.append(task_key)
+            plan_value = task.get("plan_path")
+            if plan_value:
+                plan_path = Path(str(plan_value)).expanduser().resolve()
+                if plan_path.parent == plan_root:
+                    plan_path.unlink(missing_ok=True)
+        try:
+            selected_path.parent.rmdir()
+        except OSError:
+            # Generated artifacts or an empty parent retained by the OS are
+            # harmless; the manifest is the project registry entry.
+            pass
+        return {
+            "status": "deleted",
+            "project_id": str(value.get("project_id") or project_id),
+            "project_name": str(value.get("project_name") or project_id),
+            "deleted_tasks": deleted_tasks,
+        }
 
     @app.post("/api/project/browse-folder")
     def browse_folder() -> dict[str, str]:
@@ -940,6 +1375,10 @@ public static class CellVisionWindowFocus
     @app.post("/api/project/tasks")
     def add_task(payload: TaskPayload) -> dict[str, Any]:
         analysis = _parse_folder(payload.path)
+        folder_name = str(analysis.get("folder_name") or _folder_name(analysis["root"]))
+        task_name = payload.name.strip() or folder_name
+        project_name = folder_name
+        created_by = payload.created_by.strip() or "未填写"
         selected, endpoint_label, endpoint_day = _validate_timepoint_selection(
             analysis["timepoint_options"], payload.selected_timepoint_labels
         )
@@ -962,7 +1401,9 @@ public static class CellVisionWindowFocus
         plan_path = plan_dir / f"{new_task_id}.json"
         plan = {
             "task_id": new_task_id,
-            "name": payload.name.strip() or "新建项目任务",
+            "name": task_name,
+            "project_name": project_name,
+            "created_by": created_by,
             "root": analysis["root"],
             "index": analysis["index"],
             "selected_timepoint_labels": selected,
@@ -979,7 +1420,7 @@ public static class CellVisionWindowFocus
             "created_at": now,
         }
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
-        project_id = _slug(payload.name.strip()) or new_task_id
+        project_id = _slug(project_name) or new_task_id
         project_dir = manifest_file.parent.parent / project_id
         project_manifest_path = project_dir / "project.json"
         if project_manifest_path.exists():
@@ -990,7 +1431,8 @@ public static class CellVisionWindowFocus
         project_manifest_path.write_text(
             json.dumps({
                 "project_id": project_id,
-                "project_name": payload.name.strip() or "新建项目任务",
+                "project_name": project_name,
+                "created_by": created_by,
                 "root": analysis["root"],
                 "generated_at": now,
                 "task_id": new_task_id,
@@ -1004,7 +1446,9 @@ public static class CellVisionWindowFocus
         )
         task = {
             "task_id": new_task_id,
-            "name": payload.name.strip() or "新建项目任务",
+            "name": task_name,
+            "project_name": project_name,
+            "created_by": created_by,
             "path": analysis["root"],
             "index": analysis["index"],
             "status": "queued",
@@ -1036,11 +1480,48 @@ public static class CellVisionWindowFocus
             raise HTTPException(status_code=404, detail="task not found")
         return task
 
-    @app.post("/api/project/tasks/{task_id}/cancel")
-    def cancel_task(task_id: str) -> dict[str, Any]:
-        task = queue_store.cancel(task_id)
+    @app.post("/api/project/tasks/{task_id}/start")
+    def start_task(task_id: str) -> dict[str, Any]:
+        task = queue_store.get(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
-        return task
+        if str(task.get("status")) != "queued":
+            raise HTTPException(
+                status_code=409,
+                detail=f"task cannot start from status {task.get('status')}",
+            )
+        started = queue_store.start(task_id, worker_id="manual")
+        if started is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return started
+
+    @app.post("/api/project/tasks/{task_id}/cancel")
+    def cancel_task(task_id: str) -> dict[str, Any]:
+        current = queue_store.get(task_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        status = str(current.get("status"))
+        if status not in {"queued", "running", "cancelled"}:
+            raise HTTPException(
+                status_code=409,
+                detail=f"task cannot cancel from status {status}",
+            )
+        task = queue_store.cancel(task_id)
+        return task or current
+
+    @app.delete("/api/project/tasks/{task_id}")
+    def delete_task(task_id: str) -> dict[str, Any]:
+        current = queue_store.get(task_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        status = str(current.get("status"))
+        if status == "completed":
+            raise HTTPException(status_code=409, detail="completed tasks cannot be deleted")
+        if status == "running":
+            raise HTTPException(status_code=409, detail="cancel the running task before deleting it")
+        deleted = queue_store.delete(task_id)
+        if deleted is None:
+            raise HTTPException(status_code=404, detail="task not found")
+        return {"status": "deleted", "task": deleted}
 
     return app

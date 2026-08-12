@@ -32,6 +32,7 @@ def _latest_prediction_source(config: dict[str, Any]) -> Path:
     for name in (
         "latest_temporally_completed_predictions.csv",
         "latest_v2_predictions.csv",
+        "latest_v3_predictions.csv",
     ):
         path = artifact_path(config, "predictions", name)
         if path.exists():
@@ -296,18 +297,22 @@ def _classify_well_status(
         and growth_active
         and (confidence >= 0.82 or late_growth)
     )
-    if high_confidence:
+    # Multiplicity in T1/T2 is direct activity evidence even when the
+    # individual frame confidence is below the high-confidence reporting
+    # threshold.  A single T0 cell followed by one touching doublet or a
+    # 3+ cluster is therefore active, not "growth pending".
+    if growth_active:
         status = "single_active"
     elif single_origin:
-        status = "single_growth_unconfirmed"
+        status = "single_not_divided"
     elif multi_origin:
         status = "multi_origin"
     elif counts["T0"] == 0 and max(counts["T1"], counts["T2"]) > 0:
-        status = "missing_t0_or_late_object"
+        status = "t0_missing_late_cells"
     elif max(counts.values()) == 0:
-        status = "no_cell"
+        status = "no_cell_growth"
     else:
-        status = "ambiguous"
+        status = "t0_missing_late_cells"
     return status, single_origin, multi_origin, growth_active, high_confidence
 
 
@@ -496,12 +501,10 @@ def build_well_screening(
         for timepoint in ("T0", "T1", "T2"):
             selected = _nonmaximum_objects(local[local["timepoint"] == timepoint])
             by_timepoint[timepoint] = selected
-            suspected_dead = _boolean_series(
-                selected.get(
-                    "v2_suspected_dead_cell",
-                    pd.Series(False, index=selected.index),
-                )
-            )
+            # V2 dead-cell inference has been retired.  Keep the legacy
+            # columns in the screening output for schema compatibility, but
+            # never use them to remove a counted cell.
+            suspected_dead = pd.Series(False, index=selected.index)
             active_selected = selected.loc[~suspected_dead]
             cells = active_selected[active_selected["screen_label"].isin(CELL_LABELS)]
             counts[timepoint] = int(sum(CELL_UNITS[label] for label in cells["screen_label"]))
@@ -509,24 +512,14 @@ def build_well_screening(
             if not selected.empty:
                 object_rows.append(selected.assign(screen_well=well))
 
-        t0_suspected_dead = _boolean_series(
-            by_timepoint["T0"].get(
-                "v2_suspected_dead_cell",
-                pd.Series(False, index=by_timepoint["T0"].index),
-            )
-        )
+        t0_suspected_dead = pd.Series(False, index=by_timepoint["T0"].index)
         t0_cells = by_timepoint["T0"][
             by_timepoint["T0"]["screen_label"].isin(CELL_LABELS)
             & ~t0_suspected_dead
         ]
         t0_uncertain = by_timepoint["T0"][by_timepoint["T0"]["screen_label"] == "uncertain"]
         evidence = pd.concat([by_timepoint[tp] for tp in ("T0", "T1", "T2")])
-        evidence_suspected_dead = _boolean_series(
-            evidence.get(
-                "v2_suspected_dead_cell",
-                pd.Series(False, index=evidence.index),
-            )
-        )
+        evidence_suspected_dead = pd.Series(False, index=evidence.index)
         cell_evidence = evidence[
             evidence["screen_label"].isin(CELL_LABELS)
             & ~evidence_suspected_dead
@@ -682,7 +675,7 @@ def build_well_screening(
     summary = {
         "well_count": int(len(result)),
         "high_confidence_single_active": int(result["high_confidence_single_active"].sum()),
-        "single_growth_unconfirmed": int((result["screening_status"] == "single_growth_unconfirmed").sum()),
+        "single_not_divided": int((result["screening_status"] == "single_not_divided").sum()),
         "multi_origin": int((result["screening_status"] == "multi_origin").sum()),
         "pending_review": int((result["review_decision"] == "pending").sum()),
         "late_growth_no_growth": int((result["late_growth_status"] == "no_growth").sum()),

@@ -15,13 +15,16 @@ const lateTimepoints = ["T3", "T4"];
 const timepoints = [...reviewTimepoints, ...lateTimepoints];
 const wellTypeNames = {
   single_active: "单细胞有活性",
-  single_growth_unconfirmed: "生长待确认",
+  single_not_divided: "T0-T2未分裂",
   multi_origin: "多细胞来源",
-  missing_t0_or_late_object: "T0缺失/后期出现",
-  no_cell_growth: "后期无明显生长",
-  no_cell: "未检出细胞",
-  ambiguous: "判定不明确",
-  positive_control: "阳性对照"
+  no_cell_growth: "无明显生长",
+  t0_missing_late_cells: "T0缺失但后期出现细胞",
+  positive_control: "阳性对照",
+  // Keep old artifact keys readable while plates are rebuilt incrementally.
+  single_growth_unconfirmed: "T0-T2未分裂",
+  missing_t0_or_late_object: "T0缺失但后期出现细胞",
+  no_cell: "无明显生长",
+  ambiguous: "T0缺失但后期出现细胞"
 };
 const growthDecisionNames = {
   obvious_growth: "明显生长",
@@ -37,6 +40,7 @@ const labelNames = {
   uncertain: "待定",
   invalid: "无关/误检"
 };
+labelNames.dead_cell = "V3统一死细胞";
 const labelColors = {
   single: "#27d79a",
   touching_doublet: "#24c7d9",
@@ -52,9 +56,11 @@ const state = {
   detail: null,
   selectedId: null,
   dirty: new Set(),
+  undoAction: null,
   busy: false,
   canvases: new Map(),
   views: new Map(),
+  v3TrackLabels: new Map(),
   wellLoadedAt: null,
   prefetchedDetails: new Map(),
   prefetchingDetails: new Map()
@@ -69,6 +75,26 @@ async function api(url, options) {
 function setMessage(text, error = false) {
   $("message").textContent = text;
   $("message").classList.toggle("error", error);
+}
+
+function renderUndoButton() {
+  const button = $("undoButton");
+  if (!button) return;
+  const available = Boolean(state.undoAction);
+  button.disabled = !available || state.busy;
+  button.title = available
+    ? `撤销 ${state.undoAction.well} 的上一块板结果（Ctrl/Cmd+Z）`
+    : "暂无可撤销的已保存结果（Ctrl/Cmd+Z）";
+}
+
+async function refreshUndoAction() {
+  try {
+    const result = await api("/api/quick-review-undo");
+    state.undoAction = result.available ? result.action : null;
+  } catch (error) {
+    state.undoAction = null;
+  }
+  renderUndoButton();
 }
 
 function pct(value) {
@@ -165,6 +191,7 @@ function renderWellList() {
         ${item.cell_count}细胞 · ${item.debris_count}杂质
         ${item.uncertain_count ? ` · ${item.uncertain_count}待定` : ""}
         ${item.temporal_review_count ? ` · ${item.temporal_review_count}时序复核` : ""}
+        ${item.v3_cell_to_debris_count ? ` · ${item.v3_cell_to_debris_count} 条V3统一死细胞轨迹` : ""}
       </span>
       <span class="well-type ${item.screening_status}">
         ${wellTypeNames[item.screening_status] || "判定不明确"}
@@ -192,7 +219,8 @@ function updateCurrentWellSummary() {
   const detail = state.detail;
   if (!detail) return;
   const reviewed = detail.objects.filter(object => object.reviewed_label).length;
-  const reportLabel = detail.report?.final_category_label;
+  const reportLabel = wellTypeNames[detail.screening?.screening_status]
+    || detail.report?.final_category_label;
   const reportReason = detail.report?.undetermined_reason_label;
   $("currentWellState").textContent =
     reportLabel || (reviewed === detail.objects.length ? "本孔已完成" : `${detail.objects.length} 个目标`);
@@ -215,6 +243,7 @@ async function loadWell(well) {
     state.wellLoadedAt = performance.now();
     state.selectedId = null;
     state.dirty.clear();
+    state.v3TrackLabels.clear();
     state.canvases.clear();
     state.views.clear();
     renderWellList();
@@ -248,7 +277,36 @@ function renderWell() {
     }
   }
   $("lateTimepointSection").hidden = !lateAvailable;
+  renderV3WellSummary();
   renderSelection();
+}
+
+function renderV3WellSummary() {
+  const summary = $("v3WellSummary");
+  if (!summary) return;
+  const tracks = (state.detail?.v3_tracks || []).filter(track =>
+    String(track.label_mode || "") === "unified_track"
+    || track.conclusion
+    || track.unified_label
+    || track.division_rescue
+  );
+  if (!tracks.length) {
+    summary.hidden = true;
+    summary.textContent = "";
+    return;
+  }
+  const deadCellCount = tracks.filter(track =>
+    track.conclusion === "dead_cell" || track.unified_label === "dead_cell"
+  ).length;
+  const preview = tracks.slice(0, 5).map(track => {
+    const label = track.division_rescue
+      ? "跨轨迹分裂补救"
+      : track.reviewed_label || track.conclusion || track.unified_label || "unmarked";
+    return `${labelNames[label] || label} (${Number(track.frame_count || 3)}帧)`;
+  }).join("；");
+  const remaining = tracks.length > 5 ? `；另有 ${tracks.length - 5} 条` : "";
+  summary.hidden = false;
+  summary.textContent = `V3统一轨迹：本孔 ${tracks.length} 条，${deadCellCount} 条为V3统一死细胞。${preview}${remaining}。点击任一轨迹对象可统一复核 T0/T1/T2。`;
 }
 
 function renderTimepointCard(timepoint, container, annotatable) {
@@ -355,7 +413,8 @@ function applyRepresentativeLateView(timepoint) {
 function breakdownText(objects) {
   const counts = {};
   for (const object of objects) {
-    counts[object.current_label] = (counts[object.current_label] || 0) + 1;
+    const label = editableDecisionLabel(object);
+    counts[label] = (counts[label] || 0) + 1;
   }
   const cell = (counts.single || 0)
     + (counts.touching_doublet || 0)
@@ -484,10 +543,8 @@ function drawSearchHint(ctx, entry, hint) {
 
 function drawObject(ctx, entry, object) {
   const { x, y, radius } = markerGeometry(entry, object);
-  const label = object.current_label;
-  const suspectedDead = Boolean(object.v2_suspected_dead_cell)
-    && ["single", "touching_doublet", "cluster_3plus"].includes(label);
-  const color = suspectedDead ? "#ef476f" : (labelColors[label] || labelColors.uncertain);
+  const label = editableDecisionLabel(object);
+  const color = labelColors[label] || labelColors.uncertain;
   const selected = object.candidate_id === state.selectedId;
   const view = state.views.get(object.timepoint);
   const markerOpacity = Math.max(
@@ -499,7 +556,7 @@ function drawObject(ctx, entry, object) {
   ctx.lineWidth = selected ? 3 : 2;
   ctx.strokeStyle = color;
   ctx.fillStyle = `${color}22`;
-  ctx.setLineDash(label === "uncertain" ? [5, 4] : (suspectedDead ? [3, 2] : []));
+  ctx.setLineDash(label === "uncertain" ? [5, 4] : []);
   const contour = contourGeometry(entry, object);
   if (contour.length >= 3 && label !== "invalid") {
     ctx.beginPath();
@@ -842,6 +899,10 @@ function addMissedObject(timepoint, displayX, displayY) {
 }
 
 function temporalAppearanceText(object) {
+  // The legacy patch matcher is only a fallback when the object graph has not
+  // formed a usable multi-frame trajectory.  Once V2/V3 has matched two or
+  // more timepoints it must not emit a competing "only N frames" message.
+  if (Number(object.v2_temporal_candidate_count || 0) >= 2) return "";
   const names = {
     static_pixel_identity_debris: "\u8de8\u65f6\u95f4\u50cf\u7d20\u7a33\u5b9a\uff0c\u503e\u5411\u6742\u8d28",
     changing_shape_or_growth_cell: "\u8de8\u65f6\u95f4\u53d1\u751f\u53d8\u5316\uff0c\u503e\u5411\u7ec6\u80de",
@@ -850,8 +911,157 @@ function temporalAppearanceText(object) {
   };
   const text = names[object.temporal_appearance_status] || "";
   return text
-    ? ` \u00b7 ${text} (${Number(object.temporal_appearance_match_count || 0)}\u5f20)`
+    ? `${text} (${Number(object.temporal_appearance_match_count || 0)}\u5f20)`
     : "";
+}
+
+function v3TrackFor(object) {
+  const trackId = String(object?.v3_track_id || "");
+  if (!trackId || !state.detail) return null;
+  return (state.detail.v3_tracks || []).find(
+    track => String(track.track_id) === trackId
+  ) || null;
+}
+
+function hasUnifiedV3Track(object) {
+  const track = v3TrackFor(object);
+  return Boolean(
+    track
+    && (String(object.v3_label_mode || "") === "unified_track"
+      || track.conclusion
+      || track.unified_label
+      || track.division_rescue)
+  );
+}
+
+function v3TrackLabelFor(object) {
+  const track = v3TrackFor(object);
+  if (!track) return "";
+  return state.v3TrackLabels.get(track.track_id)
+    || track.reviewed_label
+    || track.conclusion
+    || track.unified_label
+    || (track.division_rescue
+      ? object.v3_proposed_label || object.current_label || "uncertain"
+      : "dead_cell");
+}
+
+function v3StorageLabel(label, object) {
+  if (label === "dead_cell") return "debris";
+  if (label === "unmarked") {
+    return object.reviewed_label || object.integrated_label || "uncertain";
+  }
+  return label;
+}
+
+function applyV3TrackLabel(object, label) {
+  const track = v3TrackFor(object);
+  if (!track || !hasUnifiedV3Track(object)) return;
+  state.v3TrackLabels.set(track.track_id, label);
+  for (const target of state.detail.objects) {
+    if (String(target.v3_track_id || "") !== String(track.track_id)) continue;
+    target.current_label = v3StorageLabel(label, target);
+    if (label === "unmarked" && !target.reviewed_label && !target.is_new) {
+      state.dirty.delete(target.candidate_id);
+    } else {
+      state.dirty.add(target.candidate_id);
+    }
+  }
+  drawAll();
+  renderSelection();
+  renderTimepointHeaders();
+}
+
+const finalSourceNames = {
+  human_track_review: "人工统一轨迹审核",
+  human_frame_review: "人工审核",
+  v3_unified_track: "V3 统一轨迹决策",
+  v3_temporal: "V3 时序决策",
+  v2_temporal: "V2 时序决策",
+  integrated_model: "识别模型"
+};
+
+function effectiveFinalLabel(object) {
+  const track = v3TrackFor(object);
+  const pendingTrackLabel = track
+    ? state.v3TrackLabels.get(track.track_id)
+    : "";
+  if (pendingTrackLabel && pendingTrackLabel !== "unmarked") {
+    return pendingTrackLabel;
+  }
+  if (state.dirty.has(object.candidate_id)) return object.current_label;
+  return object.final_label || object.current_label || "uncertain";
+}
+
+function editableDecisionLabel(object) {
+  return v3StorageLabel(effectiveFinalLabel(object), object);
+}
+
+function persistedDecisionLabel(object) {
+  return object.final_review_label
+    || v3StorageLabel(
+      object.final_label
+      || object.reviewed_label
+      || object.integrated_label
+      || object.current_label
+      || "uncertain",
+      object
+    );
+}
+
+function temporalEvidenceHtml(object) {
+  const evidence = [];
+  const present = value => value !== undefined && value !== null && value !== "";
+  const frameCount = Math.max(
+    Number(object.v3_track_frame_count || 0),
+    Number(object.v2_temporal_candidate_count || 0)
+  );
+  if (frameCount > 0) {
+    evidence.push(`<span>轨迹匹配 ${frameCount}/3${frameCount >= 3 ? "（完整）" : ""}</span>`);
+  }
+  const identity = present(object.v3_identity_score)
+    ? object.v3_identity_score : object.v2_temporal_same_object_score;
+  const staticScore = present(object.v3_static_similarity)
+    ? object.v3_static_similarity : object.v2_temporal_static_similarity_score;
+  if (present(identity)) evidence.push(`<span>同一对象 ${pct(identity)}</span>`);
+  if (present(staticScore)) evidence.push(`<span>稳定度 ${pct(staticScore)}</span>`);
+  if (present(object.v3_shape_similarity)) {
+    evidence.push(`<span>形态相似 ${pct(object.v3_shape_similarity)}</span>`);
+  }
+  if (present(object.v2_wall_overlap)) {
+    evidence.push(`<span>孔壁重叠 ${pct(object.v2_wall_overlap)}</span>`);
+  }
+  const wallCellVeto = Boolean(
+    object.v3_wall_cell_veto || object.v2_static_wall_cell_veto
+  );
+  if (wallCellVeto) {
+    const strongFrames = Math.max(
+      Number(object.v3_wall_strong_cell_frame_count || 0),
+      Number(object.v2_strong_cell_evidence_frame_count || 0)
+    );
+    evidence.push(
+      `<span>强细胞证据 ${strongFrames}/3（否决孔壁误检）</span>`
+    );
+  }
+  if (present(object.v3_morphology_change_score)) {
+    evidence.push(`<span>形态变化 ${pct(object.v3_morphology_change_score)}</span>`);
+  }
+  if (String(object.v3_track_behavior || "") !== "disabled") {
+    evidence.push(object.v3_division_veto
+      ? `<span>分裂/增长：有${object.v3_division_interval ? `（${object.v3_division_interval}）` : ""}</span>`
+      : "<span>分裂/增长：无</span>");
+  }
+  const legacyAppearance = temporalAppearanceText(object);
+  if (legacyAppearance) evidence.push(`<span>${legacyAppearance}</span>`);
+  if (
+    object.temporal_completion_status
+    && object.temporal_completion_status !== "not_evaluated"
+  ) {
+    const completion = object.temporal_completion_status === "auto_promoted"
+      ? "时序自动补回" : "时序补搜待复核";
+    evidence.push(`<span>${completion} ${pct(object.temporal_completion_score)}</span>`);
+  }
+  return evidence.join("");
 }
 
 function renderSelection() {
@@ -862,40 +1072,55 @@ function renderSelection() {
     $("selectedTitle").textContent = "点击图中的标记进行判定";
     $("selectedDetail").textContent =
       "绿色为单细胞，青色为粘连双细胞，紫色为多细胞团，橙色为杂质，黄色虚线圆为待定目标。";
+    $("finalDecision").hidden = true;
+    $("decisionEvidence").hidden = true;
+    $("selectedTemporalEvidence").innerHTML = "";
     $("selectedProbabilities").innerHTML = "";
     $("selectedPatch").removeAttribute("src");
     $("diameterControl").hidden = true;
+    if ($("v3TrackNotice")) $("v3TrackNotice").hidden = true;
     document.querySelectorAll(".class-buttons button").forEach(
       button => button.classList.remove("active")
     );
     return;
   }
   editor.classList.remove("empty-selection");
+  const finalLabel = effectiveFinalLabel(object);
   $("selectedTitle").textContent =
-    `${object.timepoint} · ${labelNames[object.current_label]}`
-    + (object.v2_suspected_dead_cell ? " · 疑似死细胞" : "");
+    `${object.timepoint} · ${labelNames[finalLabel] || finalLabel}`;
   $("selectedDetail").textContent =
     `${object.candidate_id} · 位置 (${Math.round(object.x_px)}, ${Math.round(object.y_px)})`
     + ` · 直径 ${Number(object.diameter_px || 0).toFixed(1)} px`
-    + (
-      object.temporal_completion_status
-      && object.temporal_completion_status !== "not_evaluated"
-        ? ` · 时序${object.temporal_completion_status === "auto_promoted" ? "自动补回" : "复核"}`
-        : ""
-    )
-    + (
-      Number(object.temporal_completion_score || 0) > 0
-        ? ` ${pct(object.temporal_completion_score)}`
-        : ""
-    )
-    + (object.temporal_completion_direction
-      ? ` · ${object.temporal_completion_direction}` : "")
     + (state.dirty.has(object.candidate_id) ? " · 尚未保存" : "");
-  $("selectedDetail").textContent += temporalAppearanceText(object);
   $("selectedPatch").src = appUrl(
     `/api/patch?well=${object.well}&timepoint=${object.timepoint}`
     + `&x=${object.x_px}&y=${object.y_px}&size=256`
   );
+  const pendingHumanChange = state.dirty.has(object.candidate_id)
+    || Boolean(v3TrackFor(object)
+      && state.v3TrackLabels.has(v3TrackFor(object).track_id));
+  const finalSource = pendingHumanChange
+    ? "尚未保存的人工修正"
+    : (finalSourceNames[object.final_source] || "模型决策");
+  const finalConfidence = pendingHumanChange
+    ? ""
+    : (Number(object.final_confidence || 0) > 0
+      ? ` · 置信 ${pct(object.final_confidence)}` : "");
+  const finalNeedsReview = finalLabel === "uncertain"
+    || (!pendingHumanChange && object.final_status === "needs_review");
+  $("finalDecision").hidden = false;
+  $("finalDecision").classList.toggle(
+    "needs-review",
+    finalNeedsReview
+  );
+  $("finalDecisionLabel").textContent = `${finalNeedsReview ? "暂定：" : ""}${labelNames[finalLabel] || finalLabel}`;
+  $("finalDecisionMeta").textContent = `${finalSource}${finalConfidence}`;
+  $("finalDecisionReason").textContent = pendingHumanChange
+    ? "这是尚未保存的人工分类；保存后将成为本目标的最终结论。"
+    : (object.final_reason_text || "已按当前最高优先级证据生成最终分类。");
+  $("decisionEvidence").hidden = false;
+  $("selectedTemporalEvidence").innerHTML = temporalEvidenceHtml(object)
+    || "<span>没有可用的跨帧证据</span>";
   $("selectedProbabilities").innerHTML = `
     <span>细胞 ${pct(object.cell_probability)}</span>
     <span>杂质 ${pct(object.debris_probability)}</span>
@@ -903,22 +1128,47 @@ function renderSelection() {
     <span>单细胞 ${pct(object.single_probability)}</span>
     <span>双细胞 ${pct(object.touching_doublet_probability)}</span>
     <span>3+ ${pct(object.cluster_3plus_probability)}</span>
-    ${object.v2_temporal_same_object_score !== undefined ? `<span>同一对象 ${pct(object.v2_temporal_same_object_score)}</span>` : ""}
-    ${object.v2_temporal_static_similarity_score !== undefined ? `<span>静态相似 ${pct(object.v2_temporal_static_similarity_score)}</span>` : ""}
-    ${object.v2_temporal_candidate_count !== undefined ? `<span>已匹配时点 ${Number(object.v2_temporal_candidate_count || 0)}/3</span>` : ""}
-    ${object.v2_suspected_dead_cell ? `<span>疑似死细胞 ${pct(object.v2_suspected_dead_cell_score)}</span>` : ""}
-    ${object.v2_temporal_debris_boost > 0 ? `<span>时序向杂质修正 +${pct(object.v2_temporal_debris_boost)}</span>` : ""}
-    ${object.v2_adjusted_cell_probability !== undefined ? `<span>调整后细胞 ${pct(object.v2_adjusted_cell_probability)}</span>` : ""}
-    ${object.v2_adjusted_debris_probability !== undefined ? `<span>调整后杂质 ${pct(object.v2_adjusted_debris_probability)}</span>` : ""}
-    ${object.v2_temporal_recovered ? `<span>时序恢复候选</span>` : ""}
-    ${object.v2_temporal_reason ? `<span>时序依据：${({applied: "已应用相似性修正", temporal_recovery: "由其他时点恢复", noncell_debris_resolution: "低细胞概率，按概率判为杂质", noncell_invalid_resolution: "低细胞概率，按概率判为无效", unary_debris_probability_dominant: "单帧杂质概率高于细胞，按杂质判定", high_confidence_base: "单帧高置信，未介入", high_confidence_cell_anchor: "匹配到高置信细胞锚点，向细胞修正", high_confidence_debris_anchor: "匹配到高置信杂质锚点，向杂质修正", division_or_growth_cell_evidence: "检测到时序修正前的细胞分裂或生长证据", multi_frame_cell_consensus: "多帧形态共同支持细胞", multi_frame_debris_consensus: "多帧形态共同支持杂质", multi_frame_debris_probability_trend: "三帧杂质概率持续升高，向杂质修正", two_frame_static_object: "两帧物体稳定，提供弱杂质证据", three_frame_static_object: "三帧物体稳定，提供强杂质证据", three_frame_static_debris_consensus: "三帧同一物体高度稳定，跨越单帧阈值向杂质修正", suspected_dead_cell: "三帧细胞形态高度稳定，标记为疑似死细胞", suspected_dead_revoked_by_later_division: "T0唯一细胞后续出现可信分裂，已撤销疑似死细胞", conflicting_temporal_evidence: "时序证据冲突，维持原判定", outside_temporal_ambiguity_band: "三帧虽已匹配，但不足以覆盖明确的单帧结论", no_decisive_object_evidence: "三帧虽已匹配，但分类证据未形成一致结论", object_change_weak_cell_evidence: "物体发生变化，提供弱细胞证据", low_match: "跨时点匹配不足", low_similarity: "静态相似不足", invalid_candidate: "已由无效模型处理", insufficient_parallel_candidates: "近似位置的匹配时点不足，维持原判定", insufficient_frames: "可用时点不足", static_wall_artifact: "静态孔壁伪目标", not_evaluated: "未评估"})[object.v2_temporal_reason] || object.v2_temporal_reason}</span>` : ""}
   `;
+  const v3Notice = $("v3TrackNotice");
+  const v3TrackDetail = $("v3TrackDetail");
+  const v3TrackLabel = $("v3TrackLabel");
+  const track = v3TrackFor(object);
+  if (v3Notice && v3TrackDetail && v3TrackLabel && hasUnifiedV3Track(object)) {
+    const label = v3TrackLabelFor(object);
+    v3Notice.hidden = false;
+    v3TrackDetail.textContent = [
+      `轨迹 ${track.track_id} · ${track.frame_count} 帧`,
+      `V3：${labelNames[label] || labelNames.dead_cell}`,
+      track.reason || object.v3_reason || "多帧统一证据",
+      track.division_rescue ? "跨轨迹分裂补救已触发" : "",
+      "保存时将 T0/T1/T2 作为同一条轨迹处理"
+    ].filter(Boolean).join(" · ");
+    v3TrackLabel.value = [
+      "dead_cell",
+      "single",
+      "touching_doublet",
+      "cluster_3plus",
+      "uncertain",
+      "debris",
+      "invalid",
+      "unmarked"
+    ].includes(label)
+      ? label
+      : "dead_cell";
+    v3TrackLabel.onchange = event => applyV3TrackLabel(object, event.target.value);
+  } else if (v3Notice) {
+    v3Notice.hidden = true;
+    if (v3TrackLabel) v3TrackLabel.onchange = null;
+  }
   const canResize = Boolean(object.is_new || object.is_manual_missed);
   $("diameterControl").hidden = !canResize;
   $("diameterValue").textContent =
     `${Number(object.diameter_px || 12).toFixed(0)} px`;
   document.querySelectorAll(".class-buttons button").forEach(button => {
-    button.classList.toggle("active", button.dataset.label === object.current_label);
+    button.classList.toggle(
+      "active",
+      button.dataset.label === editableDecisionLabel(object)
+    );
   });
 }
 
@@ -938,10 +1188,17 @@ function changeSelectedDiameter(delta) {
 function setSelectedLabel(label) {
   const object = selectedObject();
   if (!object || state.busy) return;
+  if (
+    !state.dirty.has(object.candidate_id)
+    && label === editableDecisionLabel(object)
+  ) return;
+  if (hasUnifiedV3Track(object)) {
+    applyV3TrackLabel(object, label);
+    return;
+  }
   object.current_label = label;
   if (
-    label === object.integrated_label
-    && !object.reviewed_label
+    label === persistedDecisionLabel(object)
     && !object.is_new
   ) {
     state.dirty.delete(object.candidate_id);
@@ -1052,7 +1309,9 @@ function renderPlateDialog() {
       button.classList.toggle("current", state.detail?.well === well);
       button.textContent = well;
       button.title = [
-        result.report_category_label || wellTypeNames[result.screening_status] || "判定不明确",
+        wellTypeNames[result.screening_status]
+          || result.report_category_label
+          || "T0缺失但后期出现细胞",
         result.report_reason_label || ""
       ].filter(Boolean).join("：");
       button.onclick = () => jumpFromPlate(well);
@@ -1092,6 +1351,7 @@ function resetWell() {
   }
   if (removedIds.has(state.selectedId)) state.selectedId = null;
   state.dirty.clear();
+  state.v3TrackLabels.clear();
   drawAll();
   renderSelection();
   renderTimepointHeaders();
@@ -1104,6 +1364,7 @@ function resetWell() {
 async function saveWell(approvePredictions = false) {
   if (!state.detail || state.busy) return;
   state.busy = true;
+  renderUndoButton();
   const well = state.detail.well;
   const nextWell = nextWellAfter(well);
   const previousReportLabel = state.detail.report?.final_category_label || "";
@@ -1112,6 +1373,13 @@ async function saveWell(approvePredictions = false) {
       if (!object.is_new && !object.is_manual_missed) {
         object.current_label = object.integrated_label;
       }
+    }
+    for (const track of state.detail.v3_tracks || []) {
+      if (track.label_mode !== "unified_track" || !track.conclusion) continue;
+      const representative = state.detail.objects.find(
+        object => String(object.v3_track_id || "") === String(track.track_id)
+      );
+      if (representative) applyV3TrackLabel(representative, track.conclusion);
     }
   }
   setMessage(`正在保存 ${well} 的 ${state.detail.objects.length} 个目标…`);
@@ -1127,17 +1395,30 @@ async function saveWell(approvePredictions = false) {
         items: state.detail.objects.map(object => ({
           candidate_id: object.candidate_id,
           predicted_label: object.integrated_label,
-          reviewed_label: object.current_label,
+          reviewed_label: editableDecisionLabel(object),
           well: object.well,
           timepoint: object.timepoint,
           x_px: object.x_px,
           y_px: object.y_px,
           diameter_px: Number(object.diameter_px || 12),
           is_new: Boolean(object.is_new)
-        }))
+        })),
+        v3_track_reviews: [...state.v3TrackLabels.entries()].map(([track_id, label]) => {
+          const track = (state.detail.v3_tracks || []).find(
+            item => String(item.track_id) === String(track_id)
+          );
+          return {
+            track_id,
+            label,
+            well,
+            behavior: track?.behavior || ""
+          };
+        })
       })
     });
+    state.undoAction = result.undo_action || null;
     state.busy = false;
+    renderUndoButton();
     await Promise.all([
       refreshStats(),
       loadScreeningWells(),
@@ -1151,7 +1432,54 @@ async function saveWell(approvePredictions = false) {
     setMessage(`${well} 已保存${reportChange}，已进入下一个孔`);
   } catch (error) {
     state.busy = false;
+    renderUndoButton();
     setMessage(`保存失败：${error.message}`, true);
+  }
+}
+
+async function undoLastSave() {
+  if (state.busy) return;
+  if (!state.undoAction) {
+    await refreshUndoAction();
+    if (!state.undoAction) {
+      setMessage("暂无可撤销的已保存结果");
+      return;
+    }
+  }
+  if (state.dirty.size) {
+    setMessage("当前孔有未保存修改，请先撤销本孔修改或保存后再执行快捷撤销", true);
+    return;
+  }
+  const action = state.undoAction;
+  state.busy = true;
+  renderUndoButton();
+  setMessage(`正在撤销 ${action.well} 的上一块板结果…`);
+  try {
+    const result = await api("/api/quick-review-undo", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action_id: action.action_id, reviewer: "local_user" })
+    });
+    state.busy = false;
+    state.undoAction = null;
+    renderUndoButton();
+    state.mode = "all";
+    $("wellSearch").value = "";
+    $("wellTypeFilter").value = "all";
+    document.querySelectorAll("[data-mode]").forEach(node => {
+      node.classList.toggle("active", node.dataset.mode === "all");
+    });
+    await Promise.all([
+      refreshStats(),
+      loadScreeningWells(),
+      refreshUndoAction()
+    ]);
+    await loadWells(result.undone_action?.well || action.well);
+    setMessage(`${result.undone_action?.well || action.well} 的上一块板结果已撤销`);
+  } catch (error) {
+    state.busy = false;
+    renderUndoButton();
+    setMessage(`撤销失败：${error.message}`, true);
   }
 }
 
@@ -1201,6 +1529,7 @@ $("diameterUp").onclick = () => changeSelectedDiameter(2);
 $("resetButton").onclick = resetWell;
 $("approveButton").onclick = () => saveWell(true);
 $("saveButton").onclick = () => saveWell(false);
+$("undoButton").onclick = undoLastSave;
 $("newRoundButton").onclick = generateNextRound;
 $("plateReportButton").onclick = async () => {
   if (!state.screeningWells.length) await loadScreeningWells();
@@ -1212,6 +1541,11 @@ window.addEventListener("resize", () => {
 });
 document.addEventListener("keydown", event => {
   if (event.target.matches("input,select,textarea")) return;
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
+    event.preventDefault();
+    undoLastSave();
+    return;
+  }
   const labels = {
     "1": "single",
     "2": "touching_doublet",
@@ -1239,7 +1573,7 @@ if (initialWell) {
 async function bootReview() {
   // The first stats call materializes the shared server-side review frame;
   // the well list and detail then reuse it instead of racing duplicate work.
-  await Promise.all([refreshStats(), loadScreeningWells()]);
+  await Promise.all([refreshStats(), loadScreeningWells(), refreshUndoAction()]);
   await loadWells(initialWell?.toUpperCase() || null);
 }
 bootReview();

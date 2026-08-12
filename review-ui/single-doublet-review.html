@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="review-scope" content="plate">
+  <meta name="project-back-url" content="">
+  <meta name="project-name" content="">
+  <title>多类别批量审核</title>
+  <link rel="stylesheet" href="assets/single-doublet-review.css?v=20260811-categorized-review">
+</head>
+<body>
+  <header class="app-header">
+    <div class="brand-lockup">
+      <p class="eyebrow">CELL VISION <span>/</span> ACTIVE REVIEW</p>
+      <h1>多类别批量审核</h1>
+      <p class="subtitle">按模型预测分组浏览，只挑出判定不对的样本；浅色轮廓线用于核对识别边界。</p>
+    </div>
+    <div class="header-actions">
+      <span id="scopeBadge" class="scope-badge">QL2603</span>
+      <a id="backLink" class="header-link" href="./">返回主审核</a>
+      <a id="legacyLink" class="header-link quiet" href="doublet-teach">旧版教学页</a>
+    </div>
+  </header>
+
+  <main class="app-main">
+    <section class="control-panel panel">
+      <div class="control-copy">
+        <span class="panel-kicker">当前审核批次</span>
+        <h2>先看模型分组，再改错例</h2>
+        <p>每个分类只加载一批候选。不修改就表示你已确认模型类别正确；提交时会把整批记录为人工确认，只有选择其它类别的样本才会记录为纠正。</p>
+      </div>
+      <div class="control-actions">
+        <label class="batch-size">每类候选
+          <select id="pageSize" aria-label="每类候选数量">
+            <option value="12">12</option>
+            <option value="24" selected>24</option>
+            <option value="48">48</option>
+          </select>
+        </label>
+        <button id="reloadButton" class="toolbar-button" type="button">换一批</button>
+        <button id="submitButton" class="toolbar-button primary" type="button" disabled>提交本批（纠正 <span id="pendingCount">0</span>）</button>
+      </div>
+    </section>
+
+    <section class="category-tabs" id="categoryTabs" aria-label="模型预测类别" role="tablist">
+      <button class="category-tab active" data-category="single" type="button" role="tab">
+        <span class="tab-dot single-dot"></span><span class="tab-label">单细胞</span><strong data-count="single">0</strong>
+      </button>
+      <button class="category-tab" data-category="touching_doublet" type="button" role="tab">
+        <span class="tab-dot doublet-dot"></span><span class="tab-label">粘连双细胞</span><strong data-count="touching_doublet">0</strong>
+      </button>
+      <button class="category-tab" data-category="cluster_3plus" type="button" role="tab">
+        <span class="tab-dot cluster-dot"></span><span class="tab-label">3+细胞团</span><strong data-count="cluster_3plus">0</strong>
+      </button>
+      <button class="category-tab" data-category="debris" type="button" role="tab">
+        <span class="tab-dot debris-dot"></span><span class="tab-label">杂质</span><strong data-count="debris">0</strong>
+      </button>
+      <button class="category-tab" data-category="invalid" type="button" role="tab">
+        <span class="tab-dot invalid-dot"></span><span class="tab-label">无效（孔壁）</span><strong data-count="invalid">0</strong>
+      </button>
+    </section>
+
+    <section class="status-strip panel">
+      <div class="status-message"><span class="live-dot"></span><strong id="queueStatus">正在加载分类候选…</strong><span id="queueScope" class="queue-scope"></span></div>
+      <div class="status-hint">轮廓线：V2 实例轮廓（无轮廓时显示候选中心）</div>
+    </section>
+
+    <section class="batch-panel panel" aria-live="polite">
+      <div class="batch-heading">
+        <div>
+          <span class="panel-kicker">模型预测类别</span>
+          <h2 id="categoryTitle">单细胞</h2>
+          <p id="categoryDescription">检查模型认为只有一个细胞中心的候选，重点挑出实际是粘连或杂质的样本。</p>
+        </div>
+        <div class="batch-summary"><strong id="visibleCount">0</strong><span>本批候选</span></div>
+      </div>
+
+      <div id="emptyState" class="empty-state" hidden>
+        <div class="empty-mark">✓</div>
+        <h3>这个分类暂时没有未审核候选</h3>
+        <p>可以切换其它类别，或点击“换一批”重新读取。</p>
+      </div>
+      <div id="cardGrid" class="card-grid"></div>
+    </section>
+
+    <section class="footer-panels">
+      <div class="panel stats-panel">
+        <div class="panel-kicker">已保存纠正</div>
+        <div class="stats-grid">
+          <div><span class="stat-dot single-dot"></span><strong id="savedSingle">0</strong><small>单细胞</small></div>
+          <div><span class="stat-dot doublet-dot"></span><strong id="savedDoublet">0</strong><small>粘连双细胞</small></div>
+          <div><span class="stat-dot cluster-dot"></span><strong id="savedCluster">0</strong><small>3+细胞团</small></div>
+          <div><span class="stat-dot debris-dot"></span><strong id="savedDebris">0</strong><small>杂质</small></div>
+          <div><span class="stat-dot invalid-dot"></span><strong id="savedInvalid">0</strong><small>无效（孔壁）</small></div>
+        </div>
+      </div>
+      <div class="panel quota-panel">
+        <div class="panel-kicker">单双细胞定向配额</div>
+        <p id="quotaCopy">当前审核页会保留全部类别的纠错记录；单双细胞训练只使用其中的单细胞、粘连双细胞标签。</p>
+        <div class="quota-track"><i id="quotaBar"></i></div>
+        <span id="quotaDetail">目标：40 个清晰单细胞 + 20 个清晰粘连双细胞</span>
+      </div>
+    </section>
+  </main>
+
+  <template id="cardTemplate">
+    <article class="review-card">
+      <div class="thumb-wrap">
+        <img class="patch-image" alt="候选图像">
+        <svg class="contour-overlay" viewBox="0 0 320 320" aria-hidden="true" preserveAspectRatio="none">
+          <polyline class="contour-line" points=""></polyline>
+        </svg>
+        <span class="target-ring"></span>
+        <button class="contour-toggle" data-action="toggle-contour" type="button" aria-pressed="true">隐藏轮廓</button>
+        <span class="thumb-caption">V2 CONTOUR</span>
+      </div>
+      <div class="card-content">
+        <div class="card-head">
+          <div><strong class="plate-label">当前板子</strong><span class="well-label">A1 · T0</span></div>
+          <span class="model-badge">模型：单细胞</span>
+        </div>
+        <div class="card-meta">
+          <span class="candidate-label">候选</span><code class="candidate-id"></code>
+          <span class="confidence-label">置信度 <strong class="confidence-value">—</strong></span>
+        </div>
+        <div class="probability-row">
+          <span>单细胞 <b data-prob="single_probability">—</b></span>
+          <span>粘连双细胞 <b data-prob="touching_doublet_probability">—</b></span>
+          <span>3+细胞团 <b data-prob="cluster_3plus_probability">—</b></span>
+        </div>
+        <div class="correction-row">
+          <span class="correction-label">判定：</span>
+          <button class="correct-button" data-action="correct" type="button" hidden>恢复默认正确</button>
+          <div class="correction-menu" role="group" aria-label="纠正类别">
+            <button data-correct-label="single" type="button">单细胞</button>
+            <button data-correct-label="touching_doublet" type="button">粘连双细胞</button>
+            <button data-correct-label="cluster_3plus" type="button">3+细胞团</button>
+            <button data-correct-label="debris" type="button">杂质</button>
+            <button data-correct-label="invalid" type="button">无效（孔壁）</button>
+          </div>
+        </div>
+        <div class="card-footer"><span class="decision-state">未选择纠正</span><span class="geometry-label">面积 <b class="area-value">—</b> px²</span></div>
+      </div>
+    </article>
+  </template>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="assets/single-doublet-review.js?v=20260811-categorized-review"></script>
+</body>
+</html>

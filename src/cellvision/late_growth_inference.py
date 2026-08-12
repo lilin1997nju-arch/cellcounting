@@ -352,6 +352,8 @@ def _deduplicate(candidates: pd.DataFrame, radius: float = 12.0) -> pd.DataFrame
 def _infer_late_growth_legacy(
     config: dict[str, Any], selected_wells: set[str] | None = None
 ) -> Path:
+    from .late_full_inference import _selected_late_timepoints
+
     settings = config.get("late_growth", {})
     thresholds = GrowthThresholds(
         minimum_added_cells=int(settings.get("minimum_added_cells", 2)),
@@ -365,6 +367,7 @@ def _infer_late_growth_legacy(
     ]
     dense_tile_size = int(settings.get("dense_tile_size_px", 384))
     images = pd.read_csv(artifact_path(config, "manifests", "images.csv"))
+    selected_late_timepoints = _selected_late_timepoints(config, images)
     anchors = _anchor_rows(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"late growth runtime device={device}; loading morphology model", flush=True)
@@ -419,7 +422,7 @@ def _infer_late_growth_legacy(
                 baseline_wall_inner,
                 dense_tile_size,
             )
-        for timepoint in LATE_TIMEPOINTS:
+        for timepoint in selected_late_timepoints:
             late_row = images[
                 (images["well"].astype(str) == well)
                 & (images["timepoint"].astype(str) == timepoint)
@@ -681,15 +684,17 @@ def infer_late_growth(
     *,
     reuse_existing_integrated: bool = False,
 ) -> Path:
-    """Detect T3/T4 growth with the full T0-T2 instance stack.
+    """Detect endpoint growth with the full T0-T2 instance stack.
 
-    Discrete late cells use the same multiscale proposals, morphology model,
-    multiplicity model, and V2 instance masks as T0-T2.  Confluent sheets are
-    handled as a region-level event so one colony is not forced into hundreds
-    of unreliable single-cell instances.
+    Only the selected late endpoint receives individual cell positions.
+    Confluent endpoint sheets are handled as a region-level event so one
+    colony is not forced into hundreds of unreliable single-cell instances.
     """
 
-    from .late_full_inference import infer_late_full_instances
+    from .late_full_inference import (
+        _selected_late_timepoints,
+        infer_late_full_instances,
+    )
 
     full_path = infer_late_full_instances(
         config,
@@ -698,6 +703,7 @@ def infer_late_growth(
     )
     full = pd.read_csv(full_path, low_memory=False)
     images = pd.read_csv(artifact_path(config, "manifests", "images.csv"))
+    selected_late_timepoints = _selected_late_timepoints(config, images)
     anchors = _anchor_rows(config)
     settings = config.get("late_growth", {})
     thresholds = GrowthThresholds(
@@ -757,7 +763,7 @@ def infer_late_growth(
                 dense_tile_size,
             )
 
-        for timepoint in LATE_TIMEPOINTS:
+        for timepoint in selected_late_timepoints:
             image_frame = images[
                 (images["well"].astype(str) == well)
                 & (images["timepoint"].astype(str) == timepoint)
@@ -957,6 +963,7 @@ def infer_late_growth(
     objects.to_csv(objects_output, index=False, encoding="utf-8")
     summary = {
         "algorithm": "full_t0_t2_v2_instances_plus_dense_regions_v3",
+        "endpoint_timepoints": list(selected_late_timepoints),
         "well_timepoint_count": int(len(result)),
         "decision_counts": result["automatic_decision"].value_counts().to_dict(),
         "channel_counts": result["decision_channel"].value_counts().to_dict(),

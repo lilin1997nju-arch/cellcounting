@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .config import artifact_path
 from .models.losses import dice_loss
@@ -24,6 +24,29 @@ def _device(config: dict[str, Any]) -> torch.device:
     return torch.device(requested)
 
 
+def _instance_sampler_weights(labels: np.ndarray, sources: np.ndarray) -> np.ndarray:
+    """Balance replay batches by source plate and reviewed object class."""
+
+    labels = np.asarray(labels).astype(str)
+    sources = np.asarray(
+        [str(value).split("|", 1)[0] for value in sources], dtype=str
+    )
+
+    def inverse_frequency(values: np.ndarray) -> np.ndarray:
+        weights = np.ones(len(values), dtype=np.float32)
+        unique, counts = np.unique(values, return_counts=True)
+        target = float(np.median(counts))
+        for value, count in zip(unique, counts):
+            weights[values == value] = np.clip(
+                target / max(float(count), 1.0), 0.5, 2.5
+            )
+        return weights
+
+    return np.sqrt(
+        inverse_frequency(sources) * inverse_frequency(labels)
+    ).astype(np.float32)
+
+
 def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
     settings = config["v2_instance_segmentation"]
     seed = int(settings.get("seed", 20260802))
@@ -35,10 +58,21 @@ def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
 
     cache_path = build_v2_instance_cache(config)
     dataset = V2InstanceDataset(cache_path, augment=True)
+    cache = np.load(cache_path, allow_pickle=False)
+    sampler = None
+    if bool(settings.get("balance_by_plate_and_class", True)):
+        sampler = WeightedRandomSampler(
+            torch.from_numpy(
+                _instance_sampler_weights(cache["labels"], cache["sources"])
+            ),
+            num_samples=len(dataset),
+            replacement=True,
+        )
     loader = DataLoader(
         dataset,
         batch_size=int(settings.get("batch_size", 32)),
-        shuffle=True,
+        shuffle=sampler is None,
+        sampler=sampler,
         num_workers=int(config.get("runtime", {}).get("num_workers", 0)),
         pin_memory=torch.cuda.is_available(),
     )
@@ -115,7 +149,16 @@ def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
         checkpoint,
     )
     (run_dir / "metrics.json").write_text(
-        json.dumps({"device": str(device), "sample_count": len(dataset), "fit_history": history, "external_validation": "A12-22 only; not used for weights"}, indent=2),
+        json.dumps(
+            {
+                "device": str(device),
+                "sample_count": len(dataset),
+                "fit_history": history,
+                "external_validation": "A12-22 only; not used for weights",
+                "balanced_sampler": bool(sampler is not None),
+            },
+            indent=2,
+        ),
         encoding="utf-8",
     )
     latest = artifact_path(config, "v2", "models", "latest_instance_segmenter.pt")

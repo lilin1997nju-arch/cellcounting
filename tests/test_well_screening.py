@@ -1,3 +1,4 @@
+import os
 import sqlite3
 
 import pandas as pd
@@ -5,6 +6,7 @@ import pytest
 
 from cellvision.well_screening import (
     _classify_well_status,
+    _latest_prediction_source,
     _manual_missed_objects,
     _merge_selected_well_rows,
     late_growth_gate,
@@ -100,6 +102,20 @@ def test_corrected_single_is_not_multi_origin():
     assert status[2] is False
 
 
+def test_single_origin_followed_by_touching_or_cluster_is_active_even_if_confidence_is_low():
+    status = _classify_well_status(
+        {"T0": 1, "T1": 2, "T2": 3},
+        t0_cell_instances=1,
+        t0_has_uncertain=False,
+        confidence=0.45,
+        late_growth_status="unavailable",
+    )
+    assert status[0] == "single_active"
+    assert status[1] is True
+    assert status[3] is True
+    assert status[4] is False
+
+
 def test_incremental_screening_replaces_only_selected_well():
     previous = pd.DataFrame(
         {
@@ -119,6 +135,20 @@ def test_incremental_screening_replaces_only_selected_well():
         {"well": "A2", "screening_status": "single_active"},
         {"well": "B1", "screening_status": "no_cell"},
     ]
+
+
+def test_well_screening_uses_latest_published_v3_predictions(tmp_path):
+    predictions = tmp_path / "predictions"
+    predictions.mkdir()
+    v2 = predictions / "latest_v2_predictions.csv"
+    v3 = predictions / "latest_v3_predictions.csv"
+    v2.write_text("candidate_id\nold\n", encoding="utf-8")
+    v3.write_text("candidate_id\nnew\n", encoding="utf-8")
+    os.utime(v2, ns=(1, 1))
+
+    assert _latest_prediction_source(
+        {"paths": {"artifact_root": str(tmp_path)}}
+    ) == v3
 
 
 def test_save_late_growth_review_upserts_by_well_and_timepoint(tmp_path):

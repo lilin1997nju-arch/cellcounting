@@ -11,6 +11,7 @@ button{cursor:pointer}.eyebrow{font-size:11px;font-weight:800;letter-spacing:.14
 .progress-copy{text-align:right}.progress-copy b,.progress-copy small{display:block}.progress-copy small{color:#a9c5c2;font-size:11px}
 .progress-track{width:150px;height:7px;border-radius:9px;background:#315156;overflow:hidden}.progress-track i{display:block;height:100%;background:#e0ad45;width:0}
 .top-button{padding:9px 13px;color:#fff;background:#27575b;border:1px solid #638084;border-radius:5px;text-decoration:none}
+.top-button.accent{color:#16383d;background:#e3b341;border-color:#e3b341;font-weight:700}
 .workspace{display:grid;grid-template-columns:285px minmax(0,1fr);min-height:calc(100vh - 88px)}
 .sidebar{background:#e9e5dc;border-right:1px solid #cbc7bc;position:sticky;top:88px;height:calc(100vh - 88px);overflow:hidden}
 .sidebar-tools{padding:17px 15px 13px;border-bottom:1px solid #cbc7bc}.sidebar-tools label span{display:block;margin-bottom:6px;color:var(--muted);font-size:12px;font-weight:700}

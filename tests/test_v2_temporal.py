@@ -3,11 +3,12 @@ import numpy as np
 
 from cellvision.train_v2_temporal import _review_triplet_static_target
 from cellvision.v2_temporal_inference import (
+    _v3_proposal_is_decisive,
     _adjust_cell_debris_probabilities,
     _component_temporal_outputs,
+    _detect_cross_track_division_rescues,
     _is_static_wall_artifact,
     _local_patch_similarity,
-    _revoke_suspected_dead_for_well,
     _track_fused_probabilities,
     preserve_temporal_multiplicity_labels,
     resolve_low_cell_noncell_labels,
@@ -31,6 +32,24 @@ def _row(label: str, x: float, y: float, area: float) -> pd.Series:
     )
 
 
+def test_v3_active_fusion_only_overwrites_v2_for_decisive_behavior():
+    assert not _v3_proposal_is_decisive(
+        {"v3_track_behavior": "no_decisive_temporal_evidence"}
+    )
+    assert not _v3_proposal_is_decisive(
+        {"v3_track_behavior": "wall_uncertain"}
+    )
+    assert not _v3_proposal_is_decisive(
+        {"v3_track_behavior": "decline_without_morphology_evidence"}
+    )
+    assert _v3_proposal_is_decisive(
+        {"v3_track_behavior": "wall_structure_invalid"}
+    )
+    assert _v3_proposal_is_decisive(
+        {"v3_track_behavior": "division_or_growth"}
+    )
+
+
 def test_stable_reviewed_single_triplet_is_static_similarity_evidence():
     rows = [
         _row("single", 100, 100, 129),
@@ -46,6 +65,16 @@ def test_reviewed_division_triplet_is_dynamic_similarity_evidence():
         _row("single", 100, 100, 100),
         _row("touching_doublet", 103, 101, 160),
         _row("cluster_3plus", 106, 102, 220),
+    ]
+
+    assert _review_triplet_static_target(rows) == 0.0
+
+
+def test_reviewed_cell_to_debris_triplet_is_dynamic_similarity_evidence():
+    rows = [
+        _row("single", 100, 100, 140),
+        _row("uncertain", 101, 100, 136),
+        _row("debris", 102, 101, 130),
     ]
 
     assert _review_triplet_static_target(rows) == 0.0
@@ -108,7 +137,18 @@ def test_static_wall_artifact_requires_three_stable_wall_overlapping_frames():
         [1.0, 1.0, 1.0],
         [(100.0, 100.0), (102.0, 101.0), (103.0, 100.0)],
         [86.0, 49.0, 44.0],
-        [(0.8, 0.1, 0.1, 1.0)] * 3,
+        [(0.52, 0.43, 0.05, 1.0)] * 3,
+        0.95,
+        0.90,
+    )
+
+
+def test_static_wall_artifact_is_vetoed_by_repeated_strong_cell_evidence():
+    assert not _is_static_wall_artifact(
+        [1.0, 1.0, 1.0],
+        [(100.0, 100.0), (102.0, 101.0), (103.0, 100.0)],
+        [86.0, 49.0, 44.0],
+        [(0.93, 0.04, 0.03, 1.0)] * 3,
         0.95,
         0.90,
     )
@@ -304,6 +344,245 @@ def _edge(left, right, *, kind="continuation", static=0.94):
     )
 
 
+def _split_descriptor(index, timepoint, x, y, area=48.0):
+    raw = np.full((48, 48), 0.5, np.float32)
+    mask = np.zeros((48, 48), dtype=bool)
+    yy, xx = np.mgrid[:48, :48]
+    mask[(xx - 24) ** 2 + (yy - 24) ** 2 <= 4**2] = True
+    return TemporalObjectDescriptor(
+        index=index,
+        timepoint=timepoint,
+        aligned_x=float(x),
+        aligned_y=float(y),
+        area=float(area),
+        equivalent_diameter=8.0,
+        raw=raw,
+        gradient=np.zeros_like(raw),
+        soft_mask=mask.astype(np.float32),
+        binary_mask=mask,
+        quality=0.9,
+    )
+
+
+def _textured_split_descriptor(index, timepoint, x, y, area=48.0):
+    descriptor = _split_descriptor(index, timepoint, x, y, area)
+    yy, xx = np.mgrid[:48, :48]
+    descriptor.raw[descriptor.binary_mask] = np.exp(
+        -(
+            (xx[descriptor.binary_mask] - 24) ** 2
+            + (yy[descriptor.binary_mask] - 24) ** 2
+        )
+        / 8.0
+    )
+    return descriptor
+
+
+def test_cross_track_division_rescue_recovers_a_child_consumed_by_neighbor():
+    frame = pd.DataFrame(
+        [
+            {
+                "candidate_id": f"split-{index}",
+                "timepoint": timepoint,
+                "integrated_label": "single",
+                "v2_pre_temporal_integrated_label": "single",
+                "cell_probability": 0.95,
+                "debris_probability": 0.03,
+                "invalid_probability": 0.02,
+                "v2_is_unique_instance": True,
+                "v2_is_counting_instance": True,
+                "v2_wall_overlap": 0.0,
+            }
+            for index, timepoint in enumerate(("T0", "T1", "T1", "T2", "T2"))
+        ]
+    )
+    descriptors = {
+        0: _split_descriptor(0, "T0", 100, 100),
+        1: _split_descriptor(1, "T1", 100, 100),
+        2: _split_descriptor(2, "T1", 125, 85),
+        3: _split_descriptor(3, "T2", 102, 100),
+        4: _split_descriptor(4, "T2", 102, 85),
+    }
+    pair_evidence = {
+        (1, 4): _edge(1, 4),
+        (2, 4): _edge(2, 4),
+    }
+    rescues = _detect_cross_track_division_rescues(
+        frame,
+        list(frame.index),
+        {"T0": [descriptors[0]], "T1": [descriptors[1], descriptors[2]], "T2": [descriptors[3], descriptors[4]]},
+        descriptors,
+        [_edge(0, 1), _edge(1, 3), _edge(2, 4)],
+        pair_evidence,
+        {0: 1, 1: 1, 3: 1, 2: 2, 4: 2},
+        {1: [0, 1, 3], 2: [2, 4]},
+        {index: f"W:O{component:03d}" for component, nodes in {1: [0, 1, 3], 2: [2, 4]}.items() for index in nodes},
+        {},
+        {
+            "cross_track_division_rescue_enabled": True,
+            "cross_track_division_rescue_radius_px": 88,
+            "cross_track_division_rescue_minimum_identity": 0.62,
+            "cross_track_division_rescue_minimum_foreground_quality": 0.30,
+            "cross_track_division_rescue_minimum_child_separation_px": 5,
+        },
+    )
+
+    assert len(rescues) == 1
+    assert rescues[0]["parent_index"] == 1
+    assert rescues[0]["secondary_child_index"] == 4
+    assert rescues[0]["interval"] == "T1->T2"
+
+
+def test_cross_track_division_rescue_ignores_suppressed_duplicate_child():
+    frame = pd.DataFrame(
+        [
+            {
+                "candidate_id": f"duplicate-{index}",
+                "timepoint": timepoint,
+                "integrated_label": "single",
+                "v2_pre_temporal_integrated_label": "single",
+                "cell_probability": 0.95,
+                "debris_probability": 0.03,
+                "invalid_probability": 0.02,
+                "v2_is_unique_instance": index != 4,
+                "v2_is_counting_instance": index != 4,
+                "v2_wall_overlap": 0.0,
+            }
+            for index, timepoint in enumerate(("T0", "T1", "T1", "T2", "T2"))
+        ]
+    )
+    descriptors = {
+        0: _split_descriptor(0, "T0", 100, 100),
+        1: _split_descriptor(1, "T1", 100, 100),
+        2: _split_descriptor(2, "T1", 125, 85),
+        3: _split_descriptor(3, "T2", 102, 100),
+        4: _split_descriptor(4, "T2", 102, 85),
+    }
+    rescues = _detect_cross_track_division_rescues(
+        frame,
+        list(frame.index),
+        {"T0": [descriptors[0]], "T1": [descriptors[1], descriptors[2]], "T2": [descriptors[3], descriptors[4]]},
+        descriptors,
+        [_edge(0, 1), _edge(1, 3), _edge(2, 4)],
+        {(1, 4): _edge(1, 4), (2, 4): _edge(2, 4)},
+        {0: 1, 1: 1, 3: 1, 2: 2, 4: 2},
+        {1: [0, 1, 3], 2: [2, 4]},
+        {index: f"W:O{component:03d}" for component, nodes in {1: [0, 1, 3], 2: [2, 4]}.items() for index in nodes},
+        {},
+        {"cross_track_division_rescue_enabled": True},
+    )
+
+    assert rescues == []
+
+
+def test_cross_track_division_rescue_supports_strong_wall_attached_parent():
+    values = [
+        ("T0", 0.927, 0.045, 0.027, False, 1.0),
+        ("T1", 0.952, 0.030, 0.018, False, 1.0),
+        ("T1", 0.864, 0.080, 0.056, True, 0.0),
+        ("T2", 0.889, 0.070, 0.041, False, 1.0),
+        ("T2", 0.967, 0.020, 0.013, True, 0.0),
+    ]
+    frame = pd.DataFrame(
+        [
+            {
+                "candidate_id": f"wall-split-{index}",
+                "timepoint": timepoint,
+                "integrated_label": "single",
+                "v2_pre_temporal_integrated_label": "single",
+                "cell_probability": cell,
+                "debris_probability": debris,
+                "invalid_probability": invalid,
+                "v2_is_unique_instance": True,
+                "v2_is_counting_instance": counting,
+                "v2_mask_valid": True,
+                "v2_wall_rejected": False,
+                "v2_is_suppressed": False,
+                "v2_instance_confidence": 0.89,
+                "v2_objectness": 0.95,
+                "v2_wall_overlap": wall_overlap,
+            }
+            for index, (
+                timepoint,
+                cell,
+                debris,
+                invalid,
+                counting,
+                wall_overlap,
+            ) in enumerate(values)
+        ]
+    )
+    descriptors = {
+        0: _textured_split_descriptor(0, "T0", 2912, 2168, area=55),
+        1: _textured_split_descriptor(1, "T1", 2918, 2167, area=42),
+        2: _textured_split_descriptor(2, "T1", 2749, 2105, area=245),
+        3: _textured_split_descriptor(3, "T2", 2916, 2163, area=52),
+        4: _textured_split_descriptor(4, "T2", 2741, 2034, area=300),
+    }
+    component_nodes = {1: [0, 1, 3], 2: [2, 4]}
+    rescues = _detect_cross_track_division_rescues(
+        frame,
+        list(frame.index),
+        {
+            "T0": [descriptors[0]],
+            "T1": [descriptors[1], descriptors[2]],
+            "T2": [descriptors[3], descriptors[4]],
+        },
+        descriptors,
+        [_edge(0, 1), _edge(1, 3), _edge(2, 4)],
+        {(2, 4): _edge(2, 4)},
+        {0: 1, 1: 1, 3: 1, 2: 2, 4: 2},
+        component_nodes,
+        {
+            index: f"H9:O{component:03d}"
+            for component, nodes in component_nodes.items()
+            for index in nodes
+        },
+        {
+            index: {"v3_track_behavior": "wall_structure_invalid"}
+            for index in frame.index
+        },
+        {
+            "cross_track_division_rescue_enabled": True,
+            "cross_track_division_rescue_radius_px": 88,
+            "cross_track_division_rescue_wall_radius_px": 224,
+            "cross_track_division_rescue_minimum_identity": 0.62,
+            "cross_track_division_rescue_wall_minimum_identity": 0.25,
+            "cross_track_division_rescue_wall_minimum_shape_similarity": 0.70,
+            "cross_track_division_rescue_wall_minimum_secondary_strong_frames": 2,
+            "cross_track_division_rescue_wall_maximum_area_ratio": 10.0,
+            "cross_track_division_rescue_minimum_foreground_quality": 0.30,
+            "cross_track_division_rescue_minimum_child_separation_px": 5,
+        },
+    )
+
+    assert {rescue["interval"] for rescue in rescues} == {"T0->T1", "T1->T2"}
+    assert {rescue["secondary_child_index"] for rescue in rescues} == {2, 4}
+
+
+def test_component_static_wall_rule_preserves_repeated_strong_cell_track():
+    frame = _temporal_frame([(0.93, 0.04, "single")] * 3)
+    frame["v2_wall_overlap"] = 1.0
+    frame["v2_instance_confidence"] = 0.89
+    frame["v2_objectness"] = 0.95
+    frame["v2_mask_valid"] = True
+    frame["v2_is_unique_instance"] = True
+    frame["v2_is_suppressed"] = False
+    frame["v2_wall_rejected"] = False
+    outputs = _component_temporal_outputs(
+        frame,
+        [0, 1, 2],
+        [_edge(0, 1), _edge(1, 2)],
+        {},
+        "H9:wall-cell",
+    )
+
+    assert all(output["static_wall_cell_veto"] for output in outputs.values())
+    assert all(output["strong_cell_frame_count"] == 3 for output in outputs.values())
+    assert all(not output["static_wall"] for output in outputs.values())
+    assert all(not output["suspected_dead_cell"] for output in outputs.values())
+    assert {output["label"] for output in outputs.values()} == {"single"}
+
+
 def test_three_frame_foreground_stability_is_strong_debris_evidence():
     frame = _temporal_frame([(0.55, 0.40, "uncertain")] * 3)
     outputs = _component_temporal_outputs(
@@ -351,12 +630,45 @@ def test_triplet_mean_and_shape_tolerate_one_focus_shift_for_static_debris():
     )
 
 
-def test_three_static_cell_like_frames_are_annotated_as_suspected_dead():
+def test_morphology_stable_triplet_tolerates_photometric_variation():
+    frame = _temporal_frame(
+        [
+            (0.589, 0.390, "touching_doublet"),
+            (0.674, 0.306, "touching_doublet"),
+            (0.530, 0.432, "touching_doublet"),
+        ]
+    )
+    edges = [
+        TemporalPairEvidence(
+            **{**_edge(0, 1, static=0.74).__dict__, "tolerant_shape": 0.89}
+        ),
+        TemporalPairEvidence(
+            **{**_edge(1, 2, static=0.74).__dict__, "tolerant_shape": 0.89}
+        ),
+    ]
+
+    outputs = _component_temporal_outputs(
+        frame, [0, 1, 2], edges, {}, "A4:morphology-stable"
+    )
+
+    assert all(not output["three_frame_static"] for output in outputs.values())
+    assert all(
+        output["morphology_stable_three_frame"]
+        for output in outputs.values()
+    )
+    assert all(output["label"] == "debris" for output in outputs.values())
+    assert all(
+        output["reason"] == "three_frame_morphology_stable_debris_consensus"
+        for output in outputs.values()
+    )
+
+
+def test_static_cell_like_frames_do_not_emit_v2_suspected_dead_cell():
     frame = _temporal_frame(
         [
             (0.68, 0.28, "single"),
             (0.93, 0.06, "single"),
-            (0.80, 0.19, "single"),
+            (0.79, 0.20, "single"),
         ]
     )
     outputs = _component_temporal_outputs(
@@ -364,13 +676,13 @@ def test_three_static_cell_like_frames_are_annotated_as_suspected_dead():
         [0, 1, 2],
         [_edge(0, 1), _edge(1, 2)],
         {},
-        "B10:suspected-dead",
+        "B10:legacy-dead-cell-case",
     )
 
-    assert all(output["suspected_dead_cell"] for output in outputs.values())
-    assert all(output["suspected_dead_cell_score"] > 0 for output in outputs.values())
+    assert all(not output["suspected_dead_cell"] for output in outputs.values())
+    assert all(output["suspected_dead_cell_score"] == 0.0 for output in outputs.values())
     assert all(output["label"] == "single" for output in outputs.values())
-    assert all(output["reason"] == "suspected_dead_cell" for output in outputs.values())
+    assert all(output["reason"] != "suspected_dead_cell" for output in outputs.values())
 
 
 def test_static_two_debris_frames_override_one_confident_cell_frame():
@@ -453,32 +765,6 @@ def test_rising_debris_probability_across_three_matched_frames_shifts_track_to_d
     assert outputs[0]["debris"] > frame.loc[0, "debris_probability"]
     assert outputs[0]["reason"] == "multi_frame_debris_probability_trend"
     assert outputs[0]["proposal_count"] == 3
-
-
-def test_only_t0_suspected_dead_is_revoked_when_well_has_later_division():
-    frame = _temporal_frame(
-        [
-            (0.85, 0.10, "single"),
-            (0.90, 0.08, "touching_doublet"),
-            (0.92, 0.06, "cluster_3plus"),
-        ]
-    )
-    outputs = {
-        0: {
-            "suspected_dead_cell": True,
-            "suspected_dead_cell_score": 0.91,
-            "growth": 0.0,
-            "reason": "suspected_dead_cell",
-        },
-        1: {"suspected_dead_cell": False, "growth": 1.0},
-        2: {"suspected_dead_cell": False, "growth": 1.0},
-    }
-
-    changed = _revoke_suspected_dead_for_well(frame, [0, 1, 2], outputs)
-
-    assert changed is True
-    assert outputs[0]["suspected_dead_cell"] is False
-    assert outputs[0]["reason"] == "suspected_dead_revoked_by_later_division"
 
 
 def test_static_temporal_evidence_does_not_revive_invalid_candidate():

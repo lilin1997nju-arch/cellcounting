@@ -17,11 +17,14 @@ from .temporal_objects import (
     TemporalPairEvidence,
     build_object_descriptor,
     component_path_confidence,
+    compare_object_descriptors,
     conditional_cell_probability,
     detect_division_edges,
     match_timepoint_objects,
     multiplicity_rank,
 )
+from .temporal_behavior import evaluate_temporal_behavior
+from .temporal_pairwise import load_temporal_pairwise_scorer
 from .v2_instance_dataset import _crop
 from .v2_instance_inference import decode_rle
 
@@ -29,6 +32,20 @@ from .v2_instance_inference import decode_rle
 TIMEPOINTS = ("T0", "T1", "T2")
 CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
 LOW_CELL_NONCELL_RESOLUTION_THRESHOLD = 0.30
+V3_NON_FUSING_BEHAVIORS = frozenset(
+    {
+        "no_decisive_temporal_evidence",
+        "wall_uncertain",
+        "decline_without_morphology_evidence",
+    }
+)
+
+
+def _v3_proposal_is_decisive(output: dict[str, Any]) -> bool:
+    """Return whether a V3 proposal may overwrite the V2 final label."""
+
+    behavior = str(output.get("v3_track_behavior", ""))
+    return bool(behavior and behavior not in V3_NON_FUSING_BEHAVIORS)
 
 
 def _probability_logit(value: float) -> float:
@@ -57,6 +74,516 @@ def _row_flag(row: pd.Series, key: str, default: bool = True) -> bool:
     if isinstance(value, str):
         return value.strip().lower() not in {"", "0", "false", "no", "off"}
     return bool(value)
+
+
+def _strong_wall_cell_observation(
+    row: pd.Series,
+    settings: dict[str, Any],
+) -> bool:
+    """Return whether unary evidence is strong enough to protect a wall cell.
+
+    Wall overlap and ``v2_is_counting_instance`` are deliberately absent from
+    this gate: both can be consequences of the wall policy that this evidence
+    is meant to veto.  The stricter absolute semantic and instance-quality
+    requirements keep a weak wall response from receiving the same rescue.
+    """
+
+    if _finite_row_value(row, "cell_probability", 0.0) < float(
+        settings.get("wall_cell_protection_minimum_cell_probability", 0.80)
+    ):
+        return False
+    if _finite_row_value(row, "debris_probability", 1.0) > float(
+        settings.get("wall_cell_protection_maximum_debris_probability", 0.20)
+    ):
+        return False
+    if _finite_row_value(row, "invalid_probability", 1.0) > float(
+        settings.get("wall_cell_protection_maximum_invalid_probability", 0.20)
+    ):
+        return False
+    if _finite_row_value(row, "v2_instance_confidence", 1.0) < float(
+        settings.get("wall_cell_protection_minimum_instance_confidence", 0.55)
+    ):
+        return False
+    if _finite_row_value(row, "v2_objectness", 1.0) < float(
+        settings.get("wall_cell_protection_minimum_objectness", 0.70)
+    ):
+        return False
+    if not _row_flag(row, "v2_mask_valid", True):
+        return False
+    if not _row_flag(row, "v2_is_unique_instance", True):
+        return False
+    if _row_flag(row, "v2_is_suppressed", False):
+        return False
+    if _row_flag(row, "v2_wall_rejected", False):
+        return False
+    return True
+
+
+def _cross_track_division_cell_candidate(
+    row: pd.Series,
+    minimum_probability: float,
+    settings: dict[str, Any],
+    *,
+    allow_wall_attached: bool = False,
+) -> bool:
+    """Return whether a unique V2 instance is safe to use as a split child.
+
+    Cross-track rescue deliberately uses the pre-temporal semantic label and
+    the existing instance-quality gates.  It must not revive duplicates,
+    rejected wall residues, invalid rows, or a debris candidate merely because
+    another nearby object looks cell-like.
+    """
+
+    label = str(
+        row.get("v2_pre_temporal_integrated_label", row.get("integrated_label", ""))
+    )
+    if label not in CELL_LABELS:
+        return False
+    if conditional_cell_probability(row) < float(minimum_probability):
+        return False
+    if not _row_flag(row, "v2_is_unique_instance", True):
+        return False
+    strong_wall_cell = _strong_wall_cell_observation(row, settings)
+    if (
+        not _row_flag(row, "v2_is_counting_instance", True)
+        and not (allow_wall_attached and strong_wall_cell)
+    ):
+        return False
+    if _row_flag(row, "v2_wall_rejected", False):
+        return False
+    if _finite_row_value(row, "invalid_probability", 1.0) > float(
+        settings.get("cross_track_division_rescue_maximum_invalid_probability", 0.60)
+    ):
+        return False
+    if _finite_row_value(row, "v2_instance_confidence", 1.0) < float(
+        settings.get("cross_track_division_rescue_minimum_instance_confidence", 0.55)
+    ):
+        return False
+    if _finite_row_value(row, "v2_objectness", 1.0) < float(
+        settings.get("cross_track_division_rescue_minimum_objectness", 0.70)
+    ):
+        return False
+    if (
+        _finite_row_value(row, "v2_wall_overlap", 0.0)
+        > float(
+            settings.get("cross_track_division_rescue_maximum_wall_overlap", 0.85)
+        )
+        and not (allow_wall_attached and strong_wall_cell)
+    ):
+        return False
+    return True
+
+
+def _pair_evidence_for_cross_track_rescue(
+    parent: Any,
+    child: Any,
+    pair_evidence: dict[tuple[int, int], TemporalPairEvidence],
+    settings: dict[str, Any],
+    pairwise_scorer: Any = None,
+    *,
+    correspondence_distance_px: float | None = None,
+) -> TemporalPairEvidence:
+    """Reuse cached evidence and score only the extra cross-track pair."""
+
+    pair = pair_evidence.get((int(parent.index), int(child.index)))
+    if pair is None:
+        pair = compare_object_descriptors(
+            parent,
+            child,
+            maximum_shift=int(settings.get("object_descriptor_maximum_shift_px", 2)),
+            correspondence_distance_px=float(
+                correspondence_distance_px
+                if correspondence_distance_px is not None
+                else settings.get("maximum_correspondence_distance_px", 128.0)
+            ),
+        )
+        if pairwise_scorer is not None:
+            pair = pairwise_scorer(parent, child, pair)
+        pair_evidence[(int(parent.index), int(child.index))] = pair
+    return pair
+
+
+def _detect_cross_track_division_rescues(
+    frame: pd.DataFrame,
+    group_indices: list[int],
+    by_timepoint: dict[str, list[Any]],
+    descriptors: dict[int, Any],
+    edges: list[TemporalPairEvidence],
+    pair_evidence: dict[tuple[int, int], TemporalPairEvidence],
+    node_to_component: dict[int, int],
+    component_nodes: dict[int, list[int]],
+    component_track_ids: dict[int, str],
+    v3_outputs: dict[int, dict[str, Any]],
+    settings: dict[str, Any],
+    pairwise_scorer: Any = None,
+) -> list[dict[str, Any]]:
+    """Find a one-to-many split that one-to-one matching assigned elsewhere.
+
+    The normal graph is intentionally conservative and globally one-to-one.
+    That is useful for stable debris, but it can consume a genuine child with
+    a neighbouring track before division detection sees it.  This pass only
+    runs in wells with exactly one credible T0 cell and adds a veto relation;
+    it does not merge unrelated components or count suppressed duplicates.
+    """
+
+    if not bool(settings.get("cross_track_division_rescue_enabled", True)):
+        return []
+
+    t0_cells = [
+        index
+        for index in group_indices
+        if str(frame.at[index, "timepoint"]) == "T0"
+        and _cross_track_division_cell_candidate(
+            frame.loc[index],
+            0.50,
+            settings,
+            allow_wall_attached=True,
+        )
+    ]
+    if len(t0_cells) != 1:
+        return []
+    anchor_component = node_to_component.get(t0_cells[0])
+    if anchor_component is None:
+        return []
+
+    division_radius = float(
+        settings.get("cross_track_division_rescue_radius_px", 88.0)
+    )
+    wall_division_radius = float(
+        settings.get("cross_track_division_rescue_wall_radius_px", 224.0)
+    )
+    minimum_identity = float(
+        settings.get("cross_track_division_rescue_minimum_identity", 0.62)
+    )
+    wall_minimum_identity = float(
+        settings.get("cross_track_division_rescue_wall_minimum_identity", 0.25)
+    )
+    wall_minimum_shape = float(
+        settings.get(
+            "cross_track_division_rescue_wall_minimum_shape_similarity", 0.70
+        )
+    )
+    minimum_foreground_quality = float(
+        settings.get("cross_track_division_rescue_minimum_foreground_quality", 0.30)
+    )
+    minimum_child_separation = float(
+        settings.get("cross_track_division_rescue_minimum_child_separation_px", 5.0)
+    )
+    minimum_area_ratio = float(
+        settings.get("cross_track_division_rescue_minimum_area_ratio", 0.65)
+    )
+    maximum_area_ratio = float(
+        settings.get("cross_track_division_rescue_maximum_area_ratio", 5.0)
+    )
+    wall_maximum_area_ratio = float(
+        settings.get("cross_track_division_rescue_wall_maximum_area_ratio", 10.0)
+    )
+    wall_minimum_secondary_strong_frames = int(
+        settings.get(
+            "cross_track_division_rescue_wall_minimum_secondary_strong_frames", 2
+        )
+    )
+    maximum_component_nodes = int(
+        settings.get("cross_track_division_rescue_maximum_secondary_component_nodes", 3)
+    )
+    descriptor_lookup = {int(index): descriptor for index, descriptor in descriptors.items()}
+    continuation_by_parent: dict[tuple[int, str, str], list[TemporalPairEvidence]] = {}
+    division_parents: set[tuple[int, str, str]] = set()
+    for edge in edges:
+        left_timepoint = str(frame.at[edge.left, "timepoint"])
+        right_timepoint = str(frame.at[edge.right, "timepoint"])
+        interval = (int(edge.left), left_timepoint, right_timepoint)
+        if (left_timepoint, right_timepoint) not in {("T0", "T1"), ("T1", "T2")}:
+            continue
+        if edge.kind == "division":
+            division_parents.add(interval)
+        elif edge.kind == "continuation":
+            continuation_by_parent.setdefault(interval, []).append(edge)
+
+    best_by_parent: dict[tuple[int, str, str], dict[str, Any]] = {}
+    for left_timepoint, right_timepoint in (("T0", "T1"), ("T1", "T2")):
+        for parent in by_timepoint[left_timepoint]:
+            parent_index = int(parent.index)
+            if node_to_component.get(parent_index) != anchor_component:
+                continue
+            if not _cross_track_division_cell_candidate(
+                frame.loc[parent_index],
+                0.50,
+                settings,
+                allow_wall_attached=True,
+            ):
+                continue
+            parent_row = frame.loc[parent_index]
+            wall_overlap_limit = float(
+                settings.get(
+                    "cross_track_division_rescue_maximum_wall_overlap", 0.85
+                )
+            )
+            strong_wall_parent = bool(
+                _strong_wall_cell_observation(parent_row, settings)
+                and (
+                    _finite_row_value(parent_row, "v2_wall_overlap", 0.0)
+                    > wall_overlap_limit
+                    or _finite_row_value(parent_row, "radial_fraction", 0.0)
+                    >= float(
+                        settings.get(
+                            "wall_cell_protection_band_start_fraction", 0.42
+                        )
+                    )
+                    or not _row_flag(parent_row, "v2_is_counting_instance", True)
+                )
+            )
+            local_division_radius = (
+                wall_division_radius if strong_wall_parent else division_radius
+            )
+            local_minimum_identity = (
+                wall_minimum_identity if strong_wall_parent else minimum_identity
+            )
+            local_maximum_area_ratio = (
+                wall_maximum_area_ratio
+                if strong_wall_parent
+                else maximum_area_ratio
+            )
+            parent_key = (parent_index, left_timepoint, right_timepoint)
+            if parent_key in division_parents:
+                continue
+            primary_edges = continuation_by_parent.get(parent_key, [])
+            if not primary_edges:
+                continue
+
+            primary_edge = max(primary_edges, key=lambda edge: float(edge.identity))
+            primary_child = descriptor_lookup.get(int(primary_edge.right))
+            if primary_child is None or not _cross_track_division_cell_candidate(
+                frame.loc[primary_child.index],
+                0.45,
+                settings,
+                allow_wall_attached=True,
+            ):
+                continue
+            if float(primary_edge.identity) < minimum_identity:
+                continue
+            if float(primary_edge.foreground_quality) < minimum_foreground_quality:
+                continue
+
+            for alternative_child in by_timepoint[right_timepoint]:
+                alternative_index = int(alternative_child.index)
+                if alternative_index == int(primary_child.index):
+                    continue
+                alternative_component = node_to_component.get(alternative_index)
+                if alternative_component is None or alternative_component == anchor_component:
+                    continue
+                if len(component_nodes.get(alternative_component, [])) > maximum_component_nodes:
+                    continue
+                alternative_row = frame.loc[alternative_index]
+                alternative_strong_wall_cell = _strong_wall_cell_observation(
+                    alternative_row, settings
+                )
+                if strong_wall_parent:
+                    secondary_strong_timepoints = {
+                        str(frame.at[index, "timepoint"])
+                        for index in component_nodes.get(alternative_component, [])
+                        if _strong_wall_cell_observation(frame.loc[index], settings)
+                    }
+                    if (
+                        len(secondary_strong_timepoints)
+                        < wall_minimum_secondary_strong_frames
+                    ):
+                        continue
+                if any(
+                    str(v3_outputs.get(index, {}).get("v3_track_behavior", ""))
+                    == "wall_structure_invalid"
+                    for index in component_nodes.get(alternative_component, [])
+                ) and not alternative_strong_wall_cell:
+                    continue
+                if not _cross_track_division_cell_candidate(
+                    alternative_row,
+                    0.45,
+                    settings,
+                    allow_wall_attached=True,
+                ):
+                    continue
+                distance = float(
+                    np.hypot(
+                        alternative_child.aligned_x - parent.aligned_x,
+                        alternative_child.aligned_y - parent.aligned_y,
+                    )
+                )
+                if distance > local_division_radius:
+                    continue
+                child_separation = float(
+                    np.hypot(
+                        alternative_child.aligned_x - primary_child.aligned_x,
+                        alternative_child.aligned_y - primary_child.aligned_y,
+                    )
+                )
+                if child_separation < minimum_child_separation:
+                    continue
+                alternative_pair = _pair_evidence_for_cross_track_rescue(
+                    parent,
+                    alternative_child,
+                    pair_evidence,
+                    settings,
+                    pairwise_scorer,
+                    correspondence_distance_px=local_division_radius,
+                )
+                if float(alternative_pair.identity) < local_minimum_identity:
+                    continue
+                if float(alternative_pair.foreground_quality) < minimum_foreground_quality:
+                    continue
+                if (
+                    strong_wall_parent
+                    and float(alternative_pair.tolerant_shape) < wall_minimum_shape
+                ):
+                    continue
+                children = [primary_child, alternative_child]
+                combined_area_ratio = sum(float(child.area) for child in children) / max(
+                    float(parent.area), 1.0
+                )
+                if not (
+                    minimum_area_ratio
+                    <= combined_area_ratio
+                    <= local_maximum_area_ratio
+                ):
+                    continue
+                centroid_x = float(
+                    np.average(
+                        [child.aligned_x for child in children],
+                        weights=[child.area for child in children],
+                    )
+                )
+                centroid_y = float(
+                    np.average(
+                        [child.aligned_y for child in children],
+                        weights=[child.area for child in children],
+                    )
+                )
+                centroid_distance = float(
+                    np.hypot(centroid_x - parent.aligned_x, centroid_y - parent.aligned_y)
+                )
+                if centroid_distance > local_division_radius:
+                    continue
+                alternative_support = max(
+                    float(alternative_pair.identity),
+                    0.45 * float(alternative_pair.tolerant_shape)
+                    + 0.30 * float(alternative_pair.foreground_quality)
+                    + 0.25 * _finite_row_value(
+                        alternative_row, "cell_probability", 0.0
+                    ),
+                )
+                score = float(
+                    min(float(primary_edge.identity), alternative_support)
+                    * min(
+                        1.0,
+                        float(primary_edge.foreground_quality),
+                        float(alternative_pair.foreground_quality),
+                    )
+                )
+                rescue = {
+                    "parent_index": parent_index,
+                    "primary_child_index": int(primary_child.index),
+                    "secondary_child_index": alternative_index,
+                    "parent_component": anchor_component,
+                    "secondary_component": alternative_component,
+                    "left_timepoint": left_timepoint,
+                    "right_timepoint": right_timepoint,
+                    "interval": f"{left_timepoint}->{right_timepoint}",
+                    "score": score,
+                    "parent_track_id": component_track_ids.get(parent_index, ""),
+                    "child_candidate_ids": "|".join(
+                        [
+                            str(frame.at[primary_child.index, "candidate_id"]),
+                            str(frame.at[alternative_index, "candidate_id"]),
+                        ]
+                    ),
+                }
+                current = best_by_parent.get(parent_key)
+                if current is None or float(rescue["score"]) > float(current["score"]):
+                    best_by_parent[parent_key] = rescue
+
+    return list(best_by_parent.values())
+
+
+def _apply_cross_track_division_rescues(
+    frame: pd.DataFrame,
+    rescues: list[dict[str, Any]],
+    outputs: dict[int, dict[str, Any]],
+    v3_outputs: dict[int, dict[str, Any]],
+    component_nodes: dict[int, list[int]],
+    v3_settings: dict[str, Any],
+) -> None:
+    """Apply the rescue as a division veto without merging graph components."""
+
+    if not rescues:
+        return
+    cell_threshold = float(v3_settings.get("division_cell_decision_threshold", 0.62))
+    debris_threshold = float(v3_settings.get("division_debris_decision_threshold", 0.38))
+    for rescue in rescues:
+        related_nodes = set(component_nodes.get(int(rescue["parent_component"]), []))
+        related_nodes.update(component_nodes.get(int(rescue["secondary_component"]), []))
+        rescue_reason = "cross_track_division_rescue_vetoes_static_debris_and_dead_cell"
+        for index in related_nodes:
+            output = outputs.get(index)
+            if output is not None:
+                output["growth"] = max(float(output.get("growth", 0.0)), 1.0)
+                output["suspected_dead_cell"] = False
+                output["suspected_dead_cell_score"] = 0.0
+                output["reason"] = "cross_track_division_rescue"
+
+            v3_output = v3_outputs.get(index)
+            if v3_output is not None:
+                base_label = str(
+                    v3_output.get("v3_proposed_label", frame.at[index, "integrated_label"])
+                )
+                conditional = conditional_cell_probability(frame.loc[index])
+                if base_label in CELL_LABELS or conditional >= cell_threshold:
+                    proposed_label = candidate_multiplicity_label(frame.loc[index])
+                    frame_state = "cell"
+                elif base_label == "debris" or conditional <= debris_threshold:
+                    proposed_label = "debris"
+                    frame_state = "debris"
+                else:
+                    proposed_label = base_label
+                    frame_state = "uncertain"
+                intervals = [
+                    value
+                    for value in str(v3_output.get("v3_division_interval", "")).split("|")
+                    if value
+                ]
+                if rescue["interval"] not in intervals:
+                    intervals.append(rescue["interval"])
+                v3_output.update(
+                    {
+                        "v3_track_behavior": "division_or_growth",
+                        "v3_behavior_score": max(
+                            float(v3_output.get("v3_behavior_score", 0.0)),
+                            float(np.clip(0.65 + 0.35 * rescue["score"], 0.0, 1.0)),
+                        ),
+                        "v3_reason": rescue_reason,
+                        "v3_division_interval": "|".join(intervals),
+                        "v3_division_veto": True,
+                        "v3_frame_state": frame_state,
+                        "v3_proposed_label": proposed_label,
+                        "v3_would_change": proposed_label != base_label,
+                        "v3_division_rescue": True,
+                        "v3_division_rescue_parent_candidate_id": str(
+                            frame.at[rescue["parent_index"], "candidate_id"]
+                        ),
+                        "v3_division_rescue_child_candidate_ids": str(
+                            rescue["child_candidate_ids"]
+                        ),
+                        "v3_division_rescue_score": float(rescue["score"]),
+                    }
+                )
+
+            if "v3_division_rescue" in frame.columns:
+                frame.at[index, "v3_division_rescue"] = True
+                frame.at[index, "v3_division_rescue_parent_candidate_id"] = str(
+                    frame.at[rescue["parent_index"], "candidate_id"]
+                )
+                frame.at[index, "v3_division_rescue_child_candidate_ids"] = str(
+                    rescue["child_candidate_ids"]
+                )
+                frame.at[index, "v3_division_rescue_score"] = float(rescue["score"])
 
 
 def _component_temporal_outputs(
@@ -233,8 +760,36 @@ def _component_temporal_outputs(
         and area_ratio <= float(settings.get("static_maximum_area_ratio", 1.65))
         and not growth
     )
+    # A stable object may change brightness, halo or local foreground
+    # response between days.  Keep the strict pixel-static flag above for
+    # auditability, but also recognize a morphology-stable triplet when
+    # identity, shape, foreground quality and instance area agree.
+    morphology_stable_three_frame = bool(
+        simple_three
+        and all(edge is not None for edge in stable_adjacent)
+        and all(
+            edge.identity
+            >= float(settings.get("morphology_stable_identity_threshold", 0.70))
+            for edge in stable_adjacent
+            if edge is not None
+        )
+        and static_score
+        >= float(settings.get("morphology_stable_static_similarity_threshold", 0.68))
+        and shape_score
+        >= float(settings.get("morphology_stable_shape_similarity_threshold", 0.86))
+        and all(
+            edge.foreground_quality
+            >= float(settings.get("minimum_foreground_quality", 0.30))
+            for edge in stable_adjacent
+            if edge is not None
+        )
+        and area_ratio
+        <= float(settings.get("morphology_stable_maximum_area_ratio", 1.80))
+        and not growth
+    )
     two_frame_static = bool(
         not three_frame_static
+        and not morphology_stable_three_frame
         and len(available_timepoints) >= 2
         and any(
             edge.identity >= identity_threshold
@@ -296,28 +851,69 @@ def _component_temporal_outputs(
     )
 
     wall_overlap = pd.to_numeric(local.get("v2_wall_overlap", 0.0), errors="coerce").fillna(0.0)
+    radial_fraction = pd.to_numeric(
+        local.get("radial_fraction", pd.Series(0.0, index=local.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    wall_cell_context = bool(
+        wall_overlap.ge(float(settings.get("static_wall_overlap_threshold", 0.90))).any()
+        or radial_fraction.ge(
+            float(settings.get("wall_cell_protection_band_start_fraction", 0.42))
+        ).any()
+    )
+    strong_wall_cell_timepoints = {
+        str(frame.at[index, "timepoint"])
+        for index in nodes
+        if _strong_wall_cell_observation(frame.loc[index], settings)
+    }
+    strong_wall_cell_frame_count = len(strong_wall_cell_timepoints)
+    strong_wall_cell_track = bool(
+        wall_cell_context
+        and strong_wall_cell_frame_count
+        >= int(settings.get("wall_cell_protection_minimum_frames", 2))
+    )
     maximum_motion = max((edge.distance_px for edge in continuation_edges), default=np.inf)
     static_wall = bool(
-        three_frame_static
+        (three_frame_static or morphology_stable_three_frame)
         and float(wall_overlap.min()) >= float(settings.get("static_wall_overlap_threshold", 0.90))
         and maximum_motion <= float(settings.get("static_wall_maximum_motion_px", 5.0))
         and area_ratio <= float(settings.get("static_wall_maximum_area_ratio", 2.20))
+        and not strong_wall_cell_track
     )
 
-    suspected_dead_morphology_threshold = float(
-        settings.get("suspected_dead_cell_morphology_threshold", 0.80)
-    )
-    suspected_dead_cell = bool(
-        three_frame_static
+    # V2 no longer infers a dead-cell state.  Keep the legacy output fields
+    # false/zero so older CSV readers remain compatible without allowing a
+    # static object to veto a genuine T0 cell.
+    suspected_dead_cell = False
+    suspected_dead_cell_score = 0.0
+    # Static, strongly cell-like tracks remain cell candidates.  This is a
+    # label-preservation guard only; it deliberately does not create a
+    # dead-cell category or score.
+    static_cell_like_track = bool(
+        (three_frame_static or morphology_stable_three_frame)
         and all(pre_temporal_cell(index) for index in nodes)
-        and morphology_consensus_cell >= suspected_dead_morphology_threshold
+        and morphology_consensus_cell
+        >= float(settings.get("static_cell_preservation_minimum_probability", 0.80))
+        and not strong_wall_cell_track
     )
-    suspected_dead_cell_score = float(
-        identity_score * static_score * morphology_consensus_cell
-        if suspected_dead_cell
-        else 0.0
+    morphology_stable_debris = bool(
+        morphology_stable_three_frame
+        and not debris_probability_trend
+        and morphology_consensus_cell
+        <= float(
+            settings.get(
+                "morphology_stable_debris_maximum_cell_probability", 0.62
+            )
+        )
     )
-    strong_static_debris = bool(three_frame_static and not suspected_dead_cell)
+    strong_static_debris = bool(
+        not strong_wall_cell_track
+        and not static_cell_like_track
+        and (
+            three_frame_static
+            or morphology_stable_debris
+        )
+    )
 
     outputs: dict[int, dict[str, Any]] = {}
     for index in nodes:
@@ -354,6 +950,8 @@ def _component_temporal_outputs(
             "applied": False,
             "label": original_label,
             "static_wall": False,
+            "static_wall_cell_veto": strong_wall_cell_track,
+            "strong_cell_frame_count": strong_wall_cell_frame_count,
             "track_id": track_id,
             # This field is shown as matched frames in the review UI.  A
             # component may contain more than one child after division, so the
@@ -362,6 +960,8 @@ def _component_temporal_outputs(
             "frame_count": len(available_timepoints),
             "pair_count": len(edges),
             "three_frame_static": three_frame_static,
+            "morphology_stable_three_frame": morphology_stable_three_frame,
+            "morphology_stable_debris": morphology_stable_debris,
             "morphology_consensus_cell": morphology_consensus_cell,
             "suspected_dead_cell": suspected_dead_cell,
             "suspected_dead_cell_score": suspected_dead_cell_score,
@@ -391,9 +991,6 @@ def _component_temporal_outputs(
         # because the underlying background artifact is static across frames.
         if original_label == "invalid" or invalid >= 0.60:
             outputs[index] = {**common, "reason": "invalid_candidate"}
-            continue
-        if suspected_dead_cell:
-            outputs[index] = {**common, "reason": "suspected_dead_cell"}
             continue
         # Usually a confident unary decision is an anchor and is preserved.
         # A complete three-frame static object with non-cell-like consensus is
@@ -456,7 +1053,11 @@ def _component_temporal_outputs(
                 reason = "high_confidence_cell_anchor"
         if strong_static_debris:
             debris_evidence += float(settings.get("three_frame_static_debris_logit", 2.60)) * max(static_score, 0.80)
-            reason = "three_frame_static_debris_consensus"
+            reason = (
+                "three_frame_morphology_stable_debris_consensus"
+                if morphology_stable_debris and not three_frame_static
+                else "three_frame_static_debris_consensus"
+            )
         elif two_frame_static:
             debris_evidence += float(settings.get("two_frame_static_debris_logit", 0.35)) * max(static_score, 0.75)
             reason = "two_frame_static_object"
@@ -527,7 +1128,11 @@ def _component_temporal_outputs(
                 reason = "object_change_weak_cell_evidence"
         else:
             if strong_static_debris:
-                reason = "three_frame_static_debris_consensus"
+                reason = (
+                    "three_frame_morphology_stable_debris_consensus"
+                    if morphology_stable_debris and not three_frame_static
+                    else "three_frame_static_debris_consensus"
+                )
             elif debris_probability_trend:
                 reason = "multi_frame_debris_probability_trend"
             elif debris_anchor > 0:
@@ -581,37 +1186,6 @@ def _component_temporal_outputs(
             "label": adjusted_label,
         }
     return outputs
-
-
-def _revoke_suspected_dead_for_well(
-    frame: pd.DataFrame,
-    group_indices: list[int],
-    outputs: dict[int, dict[str, Any]],
-) -> bool:
-    """Revoke a dead-cell hint when the only T0 source later divides."""
-
-    group_set = set(group_indices)
-    t0_cell_nodes = [
-        index
-        for index in group_indices
-        if str(frame.at[index, "timepoint"]) == "T0"
-        and str(frame.at[index, "v2_pre_temporal_integrated_label"]) in CELL_LABELS
-        and conditional_cell_probability(frame.loc[index]) >= 0.50
-    ]
-    well_has_later_division = any(
-        float(output.get("growth", 0.0)) > 0.0
-        for index, output in outputs.items()
-        if index in group_set
-    )
-    if len(t0_cell_nodes) != 1 or not well_has_later_division:
-        return False
-    output = outputs.get(t0_cell_nodes[0])
-    if not output or not output.get("suspected_dead_cell"):
-        return False
-    output["suspected_dead_cell"] = False
-    output["suspected_dead_cell_score"] = 0.0
-    output["reason"] = "suspected_dead_revoked_by_later_division"
-    return True
 
 
 def _normalized_crop(image: np.ndarray, x: float, y: float, size: int) -> np.ndarray:
@@ -714,6 +1288,10 @@ def _is_static_wall_artifact(
     wall_overlap_threshold: float = 0.90,
     maximum_motion_px: float = 5.0,
     maximum_area_ratio: float = 2.20,
+    strong_cell_probability: float = 0.80,
+    strong_cell_maximum_debris_probability: float = 0.20,
+    strong_cell_maximum_invalid_probability: float = 0.20,
+    strong_cell_minimum_frames: int = 2,
 ) -> bool:
     available = [index for index, value in enumerate(present) if value]
     if len(available) != 3 or same_object_score < same_threshold or static_similarity_score < static_threshold:
@@ -726,10 +1304,17 @@ def _is_static_wall_artifact(
     available_areas = [max(float(areas[index]), 1.0) for index in available]
     area_ratio = max(available_areas) / min(available_areas)
     minimum_wall_overlap = min(float(morphology[index][3]) for index in available)
+    strong_cell_frames = sum(
+        float(morphology[index][0]) >= strong_cell_probability
+        and float(morphology[index][1]) <= strong_cell_maximum_debris_probability
+        and float(morphology[index][2]) <= strong_cell_maximum_invalid_probability
+        for index in available
+    )
     return (
         maximum_displacement <= maximum_motion_px
         and area_ratio <= maximum_area_ratio
         and minimum_wall_overlap >= wall_overlap_threshold
+        and strong_cell_frames < strong_cell_minimum_frames
     )
 
 
@@ -831,6 +1416,32 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
             frame["candidate_source"].fillna("").astype(str) != "temporal_recovery"
         ].copy().reset_index(drop=True)
     settings = config.get("v2_temporal_model", {})
+    v3_settings = config.get("v3_temporal_behavior", {})
+    v3_enabled = bool(v3_settings.get("enabled", False))
+    v3_state_fusion = str(v3_settings.get("state_fusion", "off")).lower()
+    v3_shadow = v3_enabled and v3_state_fusion in {"shadow", "active"}
+    v3_active = v3_shadow and v3_state_fusion == "active"
+    pairwise_scorer = None
+    pairwise_checkpoint_status = "not_requested"
+    v3_backend = str(v3_settings.get("backend", "heuristic_behavior_v1")).lower()
+    if v3_shadow and v3_backend in {"pairwise", "temporal_pairwise"}:
+        configured_pairwise_path = str(
+            v3_settings.get("pairwise_checkpoint_path", "")
+        ).strip()
+        pairwise_path = (
+            Path(configured_pairwise_path)
+            if configured_pairwise_path
+            else artifact_path(config, "v2", "models", "latest_temporal_pairwise.pt")
+        )
+        if not pairwise_path.exists():
+            raise FileNotFoundError(
+                "V3 pairwise backend is enabled but its checkpoint does not exist: "
+                f"{pairwise_path}"
+            )
+        pairwise_scorer = load_temporal_pairwise_scorer(pairwise_path)
+        pairwise_checkpoint_status = str(pairwise_path.resolve())
+    elif v3_shadow:
+        pairwise_checkpoint_status = "heuristic_descriptor_evidence"
     maximum_correspondence_distance = float(settings.get("maximum_correspondence_distance_px", 128.0))
     identity_threshold = float(settings.get("object_identity_threshold", 0.58))
     descriptor_shift = int(settings.get("object_descriptor_maximum_shift_px", 3))
@@ -857,6 +1468,8 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         "v2_temporal_reason": "not_evaluated",
         "v2_temporal_adjusted_label": frame["integrated_label"].astype(str),
         "v2_static_wall_artifact": False,
+        "v2_static_wall_cell_veto": False,
+        "v2_strong_cell_evidence_frame_count": 0,
         "v2_temporal_cell_boost": 0.0,
         "v2_temporal_foreground_similarity": 0.0,
         "v2_temporal_shape_similarity": 0.0,
@@ -866,11 +1479,50 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         "v2_temporal_evidence_frame_count": 0,
         "v2_temporal_pair_count": 0,
         "v2_temporal_three_frame_static": False,
+        "v2_temporal_morphology_stable_three_frame": False,
         "v2_temporal_morphology_consensus_cell_probability": 0.0,
         "v2_suspected_dead_cell": False,
         "v2_suspected_dead_cell_score": 0.0,
         "v2_temporal_debris_probability_trend": False,
         "v2_temporal_debris_trend_score": 0.0,
+        # V3 behavior proposals are initialized to the legacy values.  They
+        # become populated only when the explicitly enabled shadow/active
+        # backend evaluates an identity component.
+        "v3_track_behavior": "disabled",
+        "v3_track_conclusion": "",
+        "v3_unified_label": "",
+        "v3_label_mode": "per_frame_evidence",
+        "v3_wall_origin": "none",
+        "v3_wall_cell_veto": False,
+        "v3_wall_strong_cell_frame_count": 0,
+        "v3_behavior_score": 0.0,
+        "v3_division_interval": "",
+        "v3_division_veto": False,
+        "v3_division_rescue": False,
+        "v3_division_rescue_parent_candidate_id": "",
+        "v3_division_rescue_child_candidate_ids": "",
+        "v3_division_rescue_score": 0.0,
+        "v3_reason": "disabled",
+        "v3_frame_state": "preserved",
+        "v3_proposed_label": frame["integrated_label"].astype(str),
+        "v3_proposed_cell_probability": frame["cell_probability"].astype(float),
+        "v3_proposed_debris_probability": frame["debris_probability"].astype(float),
+        "v3_proposed_invalid_probability": frame["invalid_probability"].astype(float),
+        "v3_would_change": False,
+        "v3_identity_score": 0.0,
+        "v3_static_similarity": 0.0,
+        "v3_shape_similarity": 0.0,
+        "v3_morphology_change_score": 0.0,
+        "v3_semantic_degradation": False,
+        "v3_degradation_evidence_score": 0.0,
+        "v3_foreground_quality": 0.0,
+        "v3_track_frame_count": 0,
+        "v3_track_pair_count": 0,
+        "v3_valid_observations": False,
+        "v3_persistent_cell_evidence": False,
+        "v3_cell_to_debris_candidate": False,
+        "v3_track_id": "",
+        "v3_timepoint": frame["timepoint"].astype(str),
     }
     for name, values in output_columns.items():
         frame[name] = values
@@ -903,6 +1555,8 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
 
     valid = frame[frame["v2_is_temporal_candidate"].fillna(False).astype(bool)].copy()
     outputs: dict[int, dict[str, Any]] = {}
+    v3_outputs: dict[int, dict[str, Any]] = {}
+    cross_track_division_rescue_count = 0
 
     for well, group in valid.groupby("well", sort=False):
         all_well = frame[frame["well"] == well]
@@ -939,6 +1593,7 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         }
         components = TemporalComponents(list(descriptors))
         edges: list[TemporalPairEvidence] = []
+        all_pair_evidence: dict[tuple[int, int], TemporalPairEvidence] = {}
         degree = {index: 0 for index in descriptors}
         for left_timepoint, right_timepoint in (("T0", "T1"), ("T1", "T2")):
             matches, pair_evidence = match_timepoint_objects(
@@ -947,7 +1602,9 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
                 maximum_distance_px=maximum_correspondence_distance,
                 minimum_identity=identity_threshold,
                 maximum_shift=descriptor_shift,
+                pairwise_scorer=pairwise_scorer,
             )
+            all_pair_evidence.update(pair_evidence)
             division = detect_division_edges(
                 frame,
                 by_timepoint[left_timepoint],
@@ -963,13 +1620,15 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
                 degree[edge.right] += 1
 
         # A direct T0-T2 edge is useful only when T1 did not provide a path.
-        skip_matches, _ = match_timepoint_objects(
+        skip_matches, skip_pair_evidence = match_timepoint_objects(
             by_timepoint["T0"],
             by_timepoint["T2"],
             maximum_distance_px=maximum_correspondence_distance * 1.15,
             minimum_identity=min(identity_threshold + 0.05, 0.95),
             maximum_shift=descriptor_shift,
+            pairwise_scorer=pairwise_scorer,
         )
+        all_pair_evidence.update(skip_pair_evidence)
         for edge in skip_matches:
             if degree[edge.left] or degree[edge.right]:
                 continue
@@ -979,7 +1638,11 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
             degree[edge.left] += 1
             degree[edge.right] += 1
 
-        for component_number, nodes in enumerate(components.groups(), start=1):
+        component_groups = components.groups()
+        node_to_component: dict[int, int] = {}
+        component_nodes: dict[int, list[int]] = {}
+        component_track_ids: dict[int, str] = {}
+        for component_number, nodes in enumerate(component_groups, start=1):
             node_set = set(nodes)
             local_edges = [
                 edge for edge in edges if edge.left in node_set and edge.right in node_set
@@ -991,20 +1654,47 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
             track_id = f"{well}:O{component_number:03d}:" + "|".join(
                 str(frame.at[index, "candidate_id"]) for index in ordered
             )
+            component_nodes[component_number] = list(nodes)
+            for index in nodes:
+                node_to_component[int(index)] = component_number
+                component_track_ids[int(index)] = track_id
             outputs.update(
                 _component_temporal_outputs(frame, nodes, local_edges, settings, track_id)
             )
+            if v3_shadow:
+                v3_outputs.update(
+                    evaluate_temporal_behavior(
+                        frame,
+                        nodes,
+                        local_edges,
+                        v3_settings,
+                        track_id,
+                    )
+                )
 
-        # A T0 object cannot remain labelled as a suspected dead cell when it
-        # is the well's only credible T0 cell source and the same well later
-        # contains pre-temporal biological division evidence.  This is applied
-        # after every component has been evaluated because the division may be
-        # represented by a neighbouring child component.
-        _revoke_suspected_dead_for_well(
+        cross_track_rescues = _detect_cross_track_division_rescues(
             frame,
             list(group.index),
-            outputs,
+            by_timepoint,
+            descriptors,
+            edges,
+            all_pair_evidence,
+            node_to_component,
+            component_nodes,
+            component_track_ids,
+            v3_outputs,
+            settings,
+            pairwise_scorer,
         )
+        _apply_cross_track_division_rescues(
+            frame,
+            cross_track_rescues,
+            outputs,
+            v3_outputs,
+            component_nodes,
+            v3_settings,
+        )
+        cross_track_division_rescue_count += len(cross_track_rescues)
 
     for index, output in outputs.items():
         frame.at[index, "v2_temporal_same_object_score"] = output["same"]
@@ -1017,6 +1707,12 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         frame.at[index, "v2_temporal_reason"] = output["reason"]
         frame.at[index, "v2_temporal_adjusted_label"] = output["label"]
         frame.at[index, "v2_static_wall_artifact"] = output["static_wall"]
+        frame.at[index, "v2_static_wall_cell_veto"] = output[
+            "static_wall_cell_veto"
+        ]
+        frame.at[index, "v2_strong_cell_evidence_frame_count"] = output[
+            "strong_cell_frame_count"
+        ]
         frame.at[index, "integrated_label"] = output["label"]
         frame.at[index, "v2_temporal_track_id"] = output["track_id"]
         frame.at[index, "v2_temporal_cell_boost"] = output["cell_boost"]
@@ -1028,6 +1724,9 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         frame.at[index, "v2_temporal_evidence_frame_count"] = output["frame_count"]
         frame.at[index, "v2_temporal_pair_count"] = output["pair_count"]
         frame.at[index, "v2_temporal_three_frame_static"] = output["three_frame_static"]
+        frame.at[index, "v2_temporal_morphology_stable_three_frame"] = output[
+            "morphology_stable_three_frame"
+        ]
         frame.at[index, "v2_temporal_morphology_consensus_cell_probability"] = output["morphology_consensus_cell"]
         frame.at[index, "v2_suspected_dead_cell"] = output["suspected_dead_cell"]
         frame.at[index, "v2_suspected_dead_cell_score"] = output["suspected_dead_cell_score"]
@@ -1037,6 +1736,35 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         frame.at[index, "v2_temporal_debris_trend_score"] = output[
             "debris_trend_score"
         ]
+        v3_output = v3_outputs.get(index)
+        if v3_output is not None:
+            for key, value in v3_output.items():
+                if key in frame.columns:
+                    frame.at[index, key] = value
+            if v3_active and _v3_proposal_is_decisive(v3_output):
+                # Active fusion is deliberately opt-in.  The proposal module
+                # still cannot revive a row that the instance stage marked
+                # invalid; it can only choose among the existing vocabulary.
+                # Review-only states (for example an uncertain wall site)
+                # must preserve the already-computed V2 result instead of
+                # restoring a pre-temporal label.
+                proposed_label = str(v3_output["v3_proposed_label"])
+                if proposed_label in {
+                    "single",
+                    "touching_doublet",
+                    "cluster_3plus",
+                    "debris",
+                    "uncertain",
+                    "invalid",
+                    "unmarked",
+                }:
+                    frame.at[index, "integrated_label"] = proposed_label
+                    frame.at[index, "v2_adjusted_cell_probability"] = float(
+                        v3_output["v3_proposed_cell_probability"]
+                    )
+                    frame.at[index, "v2_adjusted_debris_probability"] = float(
+                        v3_output["v3_proposed_debris_probability"]
+                    )
 
     frame, low_cell_noncell_resolution_count = resolve_low_cell_noncell_labels(frame)
     frame, multiplicity_preserved_count = preserve_temporal_multiplicity_labels(frame)
@@ -1070,7 +1798,13 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
     frame.to_csv(round_directory / "predictions.csv", index=False)
     evaluated = frame.loc[list(outputs)] if outputs else frame.iloc[0:0]
     summary = {
-        "algorithm_version": "v2.1-object-graph",
+        "algorithm_version": (
+            "v2.1-object-graph+v3-active"
+            if v3_active
+            else "v2.1-object-graph+v3-shadow"
+            if v3_shadow
+            else "v2.1-object-graph"
+        ),
         "round_id": round_id,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "checkpoint_retained_for_retraining": str(Path(checkpoint_path).resolve()),
@@ -1087,10 +1821,44 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         ) if evaluated["v2_temporal_adjustment_applied"].fillna(False).astype(bool).any() else 0.0,
         "object_components": int(evaluated["v2_temporal_track_id"].replace("", np.nan).nunique()),
         "three_frame_static_instances": int(evaluated["v2_temporal_three_frame_static"].fillna(False).astype(bool).sum()),
+        "morphology_stable_three_frame_instances": int(
+            evaluated["v2_temporal_morphology_stable_three_frame"]
+            .fillna(False)
+            .astype(bool)
+            .sum()
+        ),
         "growth_evidence_instances": int(evaluated["v2_temporal_growth_score"].fillna(0.0).astype(float).gt(0).sum()),
+        "cross_track_division_rescues": cross_track_division_rescue_count,
         "suspected_dead_cell_instances": int(
             evaluated["v2_suspected_dead_cell"].fillna(False).astype(bool).sum()
         ),
+        "v3_enabled": v3_enabled,
+        "v3_backend": str(v3_settings.get("backend", "disabled")),
+        "v3_state_fusion": v3_state_fusion,
+        "v3_pairwise_checkpoint": pairwise_checkpoint_status,
+        "v3_evaluated_instances": len(v3_outputs),
+        "v3_would_change_instances": int(
+            frame.loc[list(v3_outputs), "v3_would_change"].fillna(False).astype(bool).sum()
+        ) if v3_outputs else 0,
+        "v3_behavior_counts": (
+            frame.loc[list(v3_outputs), "v3_track_behavior"].value_counts().to_dict()
+            if v3_outputs
+            else {}
+        ),
+        "v3_wall_origin_counts": (
+            frame.loc[list(v3_outputs), "v3_wall_origin"].value_counts().to_dict()
+            if v3_outputs
+            else {}
+        ),
+        "v3_reason_counts": (
+            frame.loc[list(v3_outputs), "v3_reason"].value_counts().to_dict()
+            if v3_outputs
+            else {}
+        ),
+        "v3_division_veto_instances": int(
+            frame.loc[list(v3_outputs), "v3_division_veto"].fillna(False).astype(bool).sum()
+        ) if v3_outputs else 0,
+        "v3_policy": "division/growth vetoes static-debris and dead-cell overrides; cell_to_debris requires a strong T0 cell, monotonic probability decline, valid observations, and morphology degradation; wall invalid requires positive stable wall-structure evidence",
         "policy": "foreground-only object matching; global one-to-one continuation with conservative one-to-many division; strong three-frame stability supports debris; missing or weak identity preserves the base label",
     }
     source.with_name("latest_v2_temporal_summary.json").write_text(
@@ -1197,33 +1965,6 @@ def refinalize_v2_temporal_noncell_labels(config: dict[str, Any]) -> Path:
                     frame.at[index, "v2_temporal_adjusted_label"] = "debris"
                 cached_trend_updates += 1
 
-    # Revoke stale suspected-dead annotations using already cached, trusted
-    # division evidence.  This is a metadata-only pass and does not reload any
-    # source TIFFs.
-    for _, local in frame.groupby("well", sort=False):
-        visible = local[
-            local.get(
-                "v2_is_unique_instance", pd.Series(True, index=local.index)
-            ).fillna(False).astype(bool)
-        ]
-        t0_cells = visible[
-            visible["timepoint"].astype(str).eq("T0")
-            & visible["v2_pre_temporal_integrated_label"].isin(CELL_LABELS)
-        ]
-        later_division = pd.to_numeric(
-            visible.get(
-                "v2_temporal_growth_score", pd.Series(0.0, index=visible.index)
-            ),
-            errors="coerce",
-        ).fillna(0.0).gt(0.0).any()
-        if len(t0_cells) == 1 and later_division:
-            index = t0_cells.index[0]
-            if bool(frame.at[index, "v2_suspected_dead_cell"]):
-                frame.at[index, "v2_suspected_dead_cell"] = False
-                frame.at[index, "v2_suspected_dead_cell_score"] = 0.0
-                frame.at[index, "v2_temporal_reason"] = (
-                    "suspected_dead_revoked_by_later_division"
-                )
     frame, resolved_count = resolve_low_cell_noncell_labels(frame)
     frame, multiplicity_preserved_count = preserve_temporal_multiplicity_labels(frame)
     frame["v2_is_reviewable_instance"] = (

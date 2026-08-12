@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260807-project-v4">
+  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260811-project-v5">
 </head>
 <body>
   <header class="project-header">
@@ -15,7 +15,10 @@
     </div>
     <div class="header-actions">
       <a class="secondary" href="/">返回项目列表</a>
+      <a class="secondary" href="/single-doublet-review">单/粘连训练审核</a>
       <button id="refreshButton" class="secondary" type="button">刷新</button>
+      <button id="renameProjectButton" class="secondary" type="button">修改项目名称</button>
+      <button id="deleteProjectButton" class="danger" type="button" hidden>删除空项目</button>
       <a class="primary header-link" href="/?new-task=1">新建任务</a>
     </div>
   </header>
@@ -41,7 +44,7 @@
       </div>
     </section>
     <section class="panel queue-panel">
-      <div class="panel-heading"><div><h2>任务队列</h2><p class="muted">新建任务只负责解析和排队；计算按板子顺序执行，避免同时占用显存。</p></div></div>
+      <div class="panel-heading"><div><h2>任务队列</h2><p class="muted">新建任务只负责解析和排队；计算按板子顺序执行，避免同时占用显存。</p><p class="task-queue-note">queued 表示排队中、尚未开始；执行后会显示阶段和进度。</p></div></div>
       <div id="taskRows" class="task-list"><div class="empty">暂无任务</div></div>
     </section>
   </main>
@@ -49,13 +52,21 @@
   <dialog id="taskDialog">
     <form method="dialog" id="taskForm">
       <div class="dialog-heading"><div><h2>新建计算任务</h2><p class="muted">选择包含 sessions.idx 的数据文件夹。</p></div><button id="closeTaskButton" class="icon-button" type="button" aria-label="关闭">×</button></div>
-      <label>任务名称<input id="taskName" required value="QL2603 新任务"></label>
+      <label>任务名称<input id="taskName" required placeholder="默认使用所选文件夹名称"></label>
+      <label>创建人<input id="createdBy" required placeholder="请输入创建人姓名"></label>
       <label>数据文件夹<div class="folder-row"><input id="folderPath" required placeholder="例如 E:\\CM\\20260623 QL2603"><button id="browseButton" class="secondary" type="button">选择文件夹</button></div></label>
       <div id="analysisResult" class="analysis-result muted">选择文件夹后点击解析。</div>
       <div class="dialog-actions"><button id="cancelTaskButton" class="secondary" type="button">取消</button><button id="analyzeButton" class="secondary" type="button">解析数据</button><button id="queueButton" class="primary" type="button" disabled>加入队列</button></div>
     </form>
   </dialog>
+  <dialog id="projectNameDialog">
+    <form method="dialog" id="projectNameForm">
+      <div class="dialog-heading"><div><h2>修改项目名称</h2><p class="muted">只修改项目显示名称，不会改变原始数据目录。</p></div><button id="closeProjectNameButton" class="icon-button" type="button" aria-label="关闭">×</button></div>
+      <label>项目名称<input id="projectNameInput" required maxlength="120"></label>
+      <div class="dialog-actions"><button id="cancelProjectNameButton" class="secondary" type="button">取消</button><button id="saveProjectNameButton" class="primary" type="button">保存</button></div>
+    </form>
+  </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-dashboard.js?v=20260807-project-v4"></script>
+  <script src="/project-assets/project-dashboard.js?v=20260811-project-v5"></script>
 </body>
 </html>

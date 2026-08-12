@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-list.css?v=20260807-project-list-v2">
+  <link rel="stylesheet" href="/project-assets/project-list.css?v=20260811-project-list-v4">
 </head>
 <body>
   <header class="hub-header">
@@ -43,7 +43,7 @@
       </div>
     </section>
     <section class="panel">
-      <div class="section-heading"><div><h2>任务队列</h2><p class="muted">新任务先解析文件夹并确认时间点，随后按末点数据快速排除无明显生长的孔。</p></div></div>
+      <div class="section-heading"><div><h2>任务队列</h2><p class="muted">新任务先解析文件夹并确认时间点，随后按末点数据快速排除无明显生长的孔。</p><p class="task-queue-note">queued 表示排队中、尚未开始；执行后会显示阶段和进度。</p></div></div>
       <div id="taskRows" class="task-list"><div class="empty">暂无任务</div></div>
     </section>
   </main>
@@ -51,7 +51,8 @@
   <dialog id="taskDialog">
     <form method="dialog" id="taskForm">
       <div class="dialog-heading"><div><h2>新建计算任务</h2><p class="muted">选择包含 sessions.idx 的数据文件夹，解析后勾选用于本轮计算的实际日龄。</p></div><button id="closeTaskButton" class="icon-button" type="button" aria-label="关闭">×</button></div>
-      <label>任务名称<input id="taskName" required value="新建数据任务"></label>
+      <label>任务名称<input id="taskName" required placeholder="默认使用所选文件夹名称"></label>
+      <label>创建人<input id="createdBy" required placeholder="请输入创建人姓名"></label>
       <label>数据文件夹<div class="folder-row"><input id="folderPath" required placeholder="例如 E:\\CM\\20260623 QL2603"><button id="browseButton" class="secondary" type="button">选择文件夹</button></div></label>
       <div id="analysisResult" class="analysis-result muted">选择文件夹后点击解析。</div>
       <div id="timepointPicker" class="timepoint-picker" hidden></div>
@@ -60,7 +61,7 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-list.js?v=20260807-project-list-v3"></script>
+  <script src="/project-assets/project-list.js?v=20260811-project-list-v4"></script>
   <script>if(new URLSearchParams(location.search).get("new-task")==="1")document.getElementById("taskDialog").showModal();</script>
 </body>
 </html>

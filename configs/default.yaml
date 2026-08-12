@@ -95,13 +95,16 @@ runtime:
   offline: true
 
 late_growth:
+  # Only the actual endpoint receives individual late-cell localization. If
+  # the configured endpoint is unavailable, inference falls back to the
+  # latest available late timepoint (for example, Day7/T3-only data).
+  endpoint_timepoint: T4
   # Dense late images only need a reliable growth conclusion; fine instance
   # contours remain enabled for sparse/ambiguous views.
   precise_v2_max_counting_instances: 96
   precise_v2_max_cell_units: 160
-  # T3/T4 are evaluated independently from the T0-T2 audit table. The search
-  # stops as soon as a clear count increase is confirmed near high-confidence
-  # T0-T2 cells; otherwise it expands and finally checks the whole well.
+  # Only the selected late endpoint is evaluated with individual cell
+  # positions. Earlier late images remain growth-screening inputs only.
   anchor_confidence: 0.82
   stage_radii_px: [450, 850]
   stage_candidate_quotas: [160, 280, 480]
@@ -232,6 +235,17 @@ multiplicity:
   first_division_radius_px: 140
   growth_confirmation_radius_px: 1600
 
+# The focused single/doublet queue should not spend review time on empty
+# annular wall residuals.  Confirmed wall-cell rescues and wall-buffer cells
+# remain eligible when they carry cell evidence; this only changes queue
+# presentation, not the training targets or general wall review.
+multiplicity_review_queue:
+  wall_filter_enabled: true
+  wall_buffer_minimum_cell_probability: 0.55
+  wall_rescue_minimum_cell_probability: 0.35
+  wall_rescue_minimum_blobness: 0.34
+  wall_rescue_minimum_response: 40.0
+
 debris_tracking:
   # Debris may drift. T2 uses the T0→T1 motion vector as a prediction, and the
   # final global search is accepted only when morphology and ambiguity agree.
@@ -316,6 +330,13 @@ v2_temporal_model:
   # its shape remain stable across all three frames.
   object_static_minimum_pair_similarity: 0.72
   object_static_minimum_shape_similarity: 0.90
+  # A morphology-stable fallback tolerates photometric/foreground changes
+  # while still requiring reliable identity, shape and instance area.
+  morphology_stable_identity_threshold: 0.70
+  morphology_stable_static_similarity_threshold: 0.68
+  morphology_stable_shape_similarity_threshold: 0.86
+  morphology_stable_maximum_area_ratio: 1.80
+  morphology_stable_debris_maximum_cell_probability: 0.62
   minimum_foreground_quality: 0.30
   static_maximum_area_ratio: 1.65
   # A clean >=80% cell observation may support an ambiguous matched frame.
@@ -330,7 +351,9 @@ v2_temporal_model:
   temporal_debris_anchor_threshold: 0.90
   temporal_debris_consensus_threshold: 0.35
   temporal_cell_consensus_threshold: 0.65
-  suspected_dead_cell_morphology_threshold: 0.80
+  # V2 does not emit a dead-cell class. Strong static cell-like tracks remain
+  # cell candidates so static evidence cannot remove a genuine T0 source.
+  static_cell_preservation_minimum_probability: 0.80
   debris_consensus_logit: 1.30
   cell_consensus_logit: 1.30
   base_high_confidence_threshold: 0.90
@@ -347,6 +370,121 @@ v2_temporal_model:
   change_cell_logit: 0.55
   temporal_cell_decision_threshold: 0.62
   temporal_debris_decision_threshold: 0.62
+  # Near-wall geometry is contextual evidence, not an absolute veto. Two or
+  # more high-quality unary cell observations protect the track from static
+  # wall/debris rules without requiring it to be a counting object.
+  wall_cell_protection_minimum_cell_probability: 0.80
+  wall_cell_protection_maximum_debris_probability: 0.20
+  wall_cell_protection_maximum_invalid_probability: 0.20
+  wall_cell_protection_minimum_instance_confidence: 0.55
+  wall_cell_protection_minimum_objectness: 0.70
+  wall_cell_protection_minimum_frames: 2
+  wall_cell_protection_band_start_fraction: 0.42
   static_wall_overlap_threshold: 0.90
   static_wall_maximum_motion_px: 5
   static_wall_maximum_area_ratio: 2.20
+  # A low-cost well-level rescue handles a true child that was consumed by a
+  # neighbouring one-to-one continuation before the local division detector
+  # could see the parent-to-many relation.
+  cross_track_division_rescue_enabled: true
+  cross_track_division_rescue_radius_px: 88
+  # Only a strong wall-attached parent receives the expanded Day-to-Day
+  # search radius; ordinary wells keep the conservative 88 px radius.
+  cross_track_division_rescue_wall_radius_px: 224
+  cross_track_division_rescue_minimum_identity: 0.62
+  # A daughter can be larger and look different from a wall-clipped parent.
+  # The relaxed wall-only pair gates require a persistent two-frame strong
+  # secondary cell track and do not affect ordinary division matching.
+  cross_track_division_rescue_wall_minimum_identity: 0.25
+  cross_track_division_rescue_wall_minimum_shape_similarity: 0.70
+  cross_track_division_rescue_wall_minimum_secondary_strong_frames: 2
+  cross_track_division_rescue_minimum_foreground_quality: 0.30
+  cross_track_division_rescue_minimum_child_separation_px: 5
+  cross_track_division_rescue_minimum_area_ratio: 0.65
+  cross_track_division_rescue_maximum_area_ratio: 5.0
+  cross_track_division_rescue_wall_maximum_area_ratio: 10.0
+  cross_track_division_rescue_maximum_secondary_component_nodes: 3
+  cross_track_division_rescue_maximum_invalid_probability: 0.60
+  cross_track_division_rescue_minimum_instance_confidence: 0.55
+  cross_track_division_rescue_minimum_objectness: 0.70
+  cross_track_division_rescue_maximum_wall_overlap: 0.85
+
+# V3 is the active behavior/state layer over the existing object graph.  Its
+# frame probabilities remain auditable evidence, while the track conclusion
+# is exposed separately so death trajectories can be reviewed as one result.
+v3_temporal_behavior:
+  enabled: true
+  backend: "heuristic_behavior_v1"
+  state_fusion: "active"
+  maximum_invalid_probability: 0.60
+  minimum_identity: 0.58
+  minimum_foreground_quality: 0.30
+  stable_static_similarity: 0.82
+  stable_shape_similarity: 0.90
+  # Robust morphology stability tolerates brightness/halo variation while
+  # preserving the strict static gate for the strongest evidence.
+  morphology_stable_static_similarity: 0.68
+  morphology_stable_shape_similarity: 0.86
+  morphology_stable_maximum_change: 0.25
+  morphology_stable_debris_maximum_cell_probability: 0.62
+  cell_strong_threshold: 0.80
+  minimum_cell_debris_mass: 0.45
+  cell_to_debris_minimum_probability_drop: 0.30
+  cell_to_debris_monotonic_tolerance: 0.05
+  cell_to_debris_final_cell_max: 0.50
+  # A monotonic semantic transition in the morphology head is valid
+  # degradation evidence even when the binary mask remains geometrically
+  # similar (for example, a cell losing internal texture before its outline).
+  cell_to_debris_minimum_semantic_drop: 0.30
+  cell_to_debris_semantic_midpoint_max: 0.70
+  cell_to_debris_minimum_morphology_degradation: 0.50
+  cell_to_debris_t1_cell_threshold: 0.62
+  cell_to_debris_output_cell_max: 0.45
+  # Frame probabilities remain evidence, but the track conclusion is unified
+  # so a death trajectory is not reviewed as cell -> uncertain -> debris.
+  cell_to_debris_unified_label: "dead_cell"
+  persistent_cell_threshold: 0.72
+  persistent_cell_minimum_frames: 2
+  persistent_cell_mean_threshold: 0.65
+  stable_debris_maximum_morphology_change: 0.25
+  stable_debris_maximum_cell_probability: 0.55
+  stable_debris_output_cell_max: 0.38
+  stable_cell_decision_threshold: 0.62
+  division_minimum_cell_probability: 0.45
+  division_cell_decision_threshold: 0.62
+  division_debris_decision_threshold: 0.38
+  wall_band_start_fraction: 0.42
+  wall_overlap_threshold: 0.90
+  wall_minimum_neighbor_count: 3
+  wall_anisotropy_threshold: 0.55
+  wall_chain_anisotropy_threshold: 0.40
+  wall_maximum_motion_px: 5.0
+  wall_minimum_identity: 0.70
+  wall_minimum_static_similarity: 0.78
+  wall_minimum_shape_similarity: 0.82
+  # The V3 scene-origin layer uses the same strict unary veto as V2. Wall
+  # overlap and counting status are intentionally not part of this gate.
+  wall_cell_protection_minimum_cell_probability: 0.80
+  wall_cell_protection_maximum_debris_probability: 0.20
+  wall_cell_protection_maximum_invalid_probability: 0.20
+  wall_cell_protection_minimum_instance_confidence: 0.55
+  wall_cell_protection_minimum_objectness: 0.70
+  wall_cell_protection_minimum_frames: 2
+  wall_compact_blobness_threshold: 0.34
+  # A raw residual response only creates a candidate.  At least two matched
+  # frames must show compact morphology before it can override stable wall
+  # structure evidence.
+  wall_compact_minimum_frames: 2
+  wall_compact_cell_probability: 0.80
+  wall_compact_change_threshold: 0.35
+  wall_biological_change_threshold: 0.50
+  pairwise_checkpoint_path: ""
+  pairwise_training:
+    reuse_training_cache: true
+    seed: 20260809
+    epochs: 40
+    batch_size: 32
+    learning_rate: 0.0008
+    weight_decay: 0.0001
+    embedding_dim: 64
+    validation_fraction: 0.20

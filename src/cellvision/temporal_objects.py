@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -263,6 +263,7 @@ def match_timepoint_objects(
     maximum_distance_px: float,
     minimum_identity: float,
     maximum_shift: int = 3,
+    pairwise_scorer: Callable[[TemporalObjectDescriptor, TemporalObjectDescriptor, TemporalPairEvidence], TemporalPairEvidence] | None = None,
 ) -> tuple[list[TemporalPairEvidence], dict[tuple[int, int], TemporalPairEvidence]]:
     """Globally match objects one-to-one while allowing every object to remain unmatched."""
 
@@ -281,6 +282,8 @@ def match_timepoint_objects(
                 maximum_shift=maximum_shift,
                 correspondence_distance_px=maximum_distance_px,
             )
+            if pairwise_scorer is not None:
+                pair = pairwise_scorer(first, second, pair)
             scores[left_index, right_index] = pair.identity
             evidence[(first.index, second.index)] = pair
     if np.all(scores < 0):

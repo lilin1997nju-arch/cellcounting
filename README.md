@@ -59,4 +59,14 @@ http://127.0.0.1:8777/api/ready
 - 任务队列目前已能保存任务计划，但正式的后台 worker、重试和取消机制仍需继续补齐；
 - 当前审核服务尚未提供用户认证，生产部署必须放在反向代理和实验室内网/VPN后面；
 - 多用户并发审核时建议从按板 SQLite 迁移到 PostgreSQL。
+## 自适应计算 worker
 
+项目审核服务默认会启动一个后台 worker，启动时自动检测 CUDA；有 GPU 使用 GPU，没有 GPU 自动使用 CPU。也可以单独运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m cellvision project-worker `
+  --manifest artifacts\projects\ql2603\project.json `
+  --device auto
+```
+
+部署说明见 [`docs/worker-deployment.md`](docs/worker-deployment.md)。
