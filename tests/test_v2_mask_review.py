@@ -12,6 +12,8 @@ from cellvision.v2_mask_review import (
     round_directory,
     save_mask_review,
 )
+from cellvision.v2_instance_dataset import _decode_review_mask
+from cellvision.train_v2_instance import _instance_sampler_weights
 
 
 def _review_config(tmp_path):
@@ -118,3 +120,23 @@ def test_manual_mask_review_recomputes_derived_fields_and_persists(tmp_path):
         ).fetchone()
     assert stored == ("edited", int(edited.sum()), "补齐边界")
     assert mask_review_summary(config, database, round_id)["edited_count"] == 1
+
+
+def test_review_mask_rle_decoder_preserves_empty_negative_and_pixels():
+    assert not _decode_review_mask("[]", MASK_SIZE).any()
+    mask = _decode_review_mask(
+        f"[[0, 2], [{MASK_SIZE * MASK_SIZE - 1}, 1]]", MASK_SIZE
+    )
+    assert int(mask.sum()) == 3
+    assert bool(mask[0, 0])
+    assert bool(mask[-1, -1])
+
+
+def test_review_sample_multipliers_increase_exact_review_sampling_weight():
+    weights = _instance_sampler_weights(
+        np.asarray(["invalid", "single"]),
+        np.asarray(["old", "old"]),
+        np.asarray(["v2_mask_review_rejected", "human_review"]),
+        {"v2_mask_review_rejected": 8.0},
+    )
+    assert weights[0] > weights[1]

@@ -35,6 +35,10 @@ v2_instance_segmentation:
   include_unreviewed_hard_negatives: false
   # Incremental fine-tuning preserves the already learned cell/debris boundary.
   initial_checkpoint: artifacts/v2/models/latest_instance_segmenter.pt
+  # Pixel-level reviewer masks are exact supervision.  They are loaded in
+  # addition to the replay sources below; rejected non-cell proposals become
+  # all-zero instance/presence hard negatives.
+  mask_review_rounds: []
   # The round cache was rebuilt from the old replay plus reviewed 2603 add-on.
   reuse_training_cache: true
   training_sources:

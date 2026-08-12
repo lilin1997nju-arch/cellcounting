@@ -1,0 +1,22 @@
+base_config: configs/v2_training.yaml
+
+# Isolated incremental fine-tuning configuration for the completed QL2603
+# pixel-level mask review round.  The current production checkpoint is used
+# only as a warm start; the resulting run remains in artifacts/v2/runs until
+# validation promotes it.
+v2_instance_segmentation:
+  cache_name: v2_instance_training_96_mask_review_ql2603_t1_1
+  reuse_training_cache: false
+  replay_mask_review_cache: true
+  replay_cache_path: artifacts/cache/v2_instance_training_96.npz
+  maximum_training_samples: 6000
+  promote_latest: false
+  epochs: 8
+  learning_rate: 0.00005
+  review_sample_multipliers:
+    v2_mask_review_edited: 3.0
+    v2_mask_review_accepted: 2.0
+    v2_mask_review_rejected: 8.0
+  mask_review_rounds:
+    - config: configs/generated/ql2603-t1-1.yaml
+      round_id: p0-mask-review-ql2603-t1-1-20260812

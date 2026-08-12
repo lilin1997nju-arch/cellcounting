@@ -18,6 +18,7 @@ from .config import artifact_path, is_validation_holdout, load_config
 
 
 OBJECT_LABELS = {"single", "touching_doublet", "cluster_3plus", "debris"}
+MASK_REVIEW_DECISIONS = {"accepted", "edited", "rejected"}
 
 
 def _balanced_training_indices(
@@ -121,6 +122,284 @@ def _latest_reviews(database: Path) -> pd.DataFrame:
     return frame.drop_duplicates("candidate_id", keep="last")
 
 
+def _resolve_review_file(value: str | Path, base: Path) -> Path:
+    candidate = Path(str(value)).expanduser()
+    return candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
+
+
+def _load_mask_review_sources(
+    settings: dict[str, Any],
+) -> list[tuple[dict[str, Any], str, pd.DataFrame]]:
+    """Load completed pixel-level review rounds as exact training sources.
+
+    The historical V2 cache is built from ``integrated_training_reviews`` and
+    reconstructs a compact pseudo-mask from the CF channel.  A mask review
+    round is different: its ``reviewed_v2_predictions.csv`` already contains
+    the reviewer-approved RLE, including an empty RLE for an explicitly
+    rejected non-cell proposal.  Keep this source separate so exact human
+    masks are not replaced by a weaker pseudo-mask during cache construction.
+    """
+
+    sources: list[tuple[dict[str, Any], str, pd.DataFrame]] = []
+    for entry in settings.get("mask_review_rounds", []) or []:
+        if isinstance(entry, (str, Path)):
+            raise ValueError(
+                "mask_review_rounds entries must include both config and round_id"
+            )
+        if not isinstance(entry, dict):
+            raise ValueError("mask_review_rounds entries must be mappings")
+        source_config_path = entry.get("config") or entry.get("source_config")
+        round_id = str(entry.get("round_id", "")).strip()
+        if not source_config_path or not round_id:
+            raise ValueError("each mask review round requires config and round_id")
+        source_config = load_config(source_config_path)
+        source_config_id = str(Path(str(source_config_path)).expanduser().resolve())
+        explicit_round_dir = entry.get("round_dir")
+        if explicit_round_dir:
+            round_dir = Path(str(explicit_round_dir)).expanduser()
+            if not round_dir.is_absolute():
+                round_dir = (Path.cwd() / round_dir).resolve()
+            else:
+                round_dir = round_dir.resolve()
+        else:
+            round_dir = (
+                Path(source_config["paths"]["artifact_root"])
+                / "v2"
+                / "mask_review"
+                / round_id
+            ).resolve()
+        manifest_path = round_dir / "manifest.json"
+        if not manifest_path.exists():
+            raise FileNotFoundError(f"mask review manifest is missing: {manifest_path}")
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        reviewed_value = manifest.get("reviewed_predictions")
+        if not reviewed_value:
+            raise ValueError(f"mask review manifest is missing reviewed_predictions: {manifest_path}")
+        reviewed_path = _resolve_review_file(reviewed_value, round_dir)
+        if not reviewed_path.exists():
+            raise FileNotFoundError(f"reviewed mask predictions are missing: {reviewed_path}")
+        frame = pd.read_csv(reviewed_path, low_memory=False)
+        required = {
+            "candidate_id",
+            "well",
+            "timepoint",
+            "x_px",
+            "y_px",
+            "raw_image_path",
+            "v2_mask_rle",
+            "v2_mask_review_status",
+        }
+        missing = sorted(required.difference(frame.columns))
+        if missing:
+            raise ValueError(
+                f"reviewed mask predictions are missing columns {missing}: {reviewed_path}"
+            )
+        frame["v2_mask_review_status"] = frame["v2_mask_review_status"].fillna("").astype(str).str.lower()
+        frame = frame[frame["v2_mask_review_status"].isin(MASK_REVIEW_DECISIONS)].copy()
+        frame = frame.drop_duplicates("candidate_id", keep="last").reset_index(drop=True)
+        frame["v2_mask_review_round"] = round_id
+        frame["v2_mask_size"] = int(manifest.get("mask_size", 96))
+        frame["v2_mask_review_source_config"] = source_config_id
+        frame["v2_label_origin"] = frame["v2_mask_review_status"].map(
+            lambda status: f"v2_mask_review_{status}"
+        )
+        source_id = f"mask_review:{Path(str(source_config_path)).as_posix()}:{round_id}"
+        sources.append((source_config, source_id, frame))
+    return sources
+
+
+def _decode_review_mask(value: Any, size: int) -> np.ndarray:
+    """Decode and validate a review-round RLE into a local binary patch."""
+
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        runs: Any = []
+    else:
+        try:
+            runs = json.loads(str(value))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("reviewed mask RLE must be valid JSON") from exc
+    if not isinstance(runs, list):
+        raise ValueError("reviewed mask RLE must be a list")
+    total = int(size) * int(size)
+    mask = np.zeros(total, dtype=np.uint8)
+    for run in runs:
+        if not isinstance(run, (list, tuple)) or len(run) != 2:
+            raise ValueError("each reviewed mask RLE run must contain start and length")
+        start, length = int(run[0]), int(run[1])
+        if start < 0 or length < 0 or start + length > total:
+            raise ValueError("reviewed mask RLE run is outside the patch")
+        mask[start : start + length] = 1
+    return mask.reshape((int(size), int(size)))
+
+
+def _review_training_arrays(
+    settings: dict[str, Any],
+    size: int,
+    mask_review_sources: list[tuple[dict[str, Any], str, pd.DataFrame]],
+) -> dict[str, np.ndarray]:
+    inputs: list[np.ndarray] = []
+    instances: list[np.ndarray] = []
+    walls: list[np.ndarray] = []
+    labels: list[str] = []
+    sources: list[str] = []
+    wells: list[str] = []
+    timepoints: list[str] = []
+    origins: list[str] = []
+    for source_config, source_id, reviewed in mask_review_sources:
+        source_started = time.perf_counter()
+        size_from_round = int(reviewed["v2_mask_size"].iloc[0]) if not reviewed.empty else size
+        if size_from_round != size:
+            raise ValueError(
+                f"mask review size {size_from_round} does not match training size {size}"
+            )
+        for raw_path, group in reviewed.groupby("raw_image_path", sort=False):
+            with Image.open(raw_path) as image:
+                raw_full = np.asarray(image.convert("L"), dtype=np.uint8)
+            for row in group.itertuples(index=False):
+                raw = _crop(raw_full, row.x_px, row.y_px, size, int(np.median(raw_full)))
+                inner = float(
+                    getattr(row, "detected_wall_inner_fraction", np.nan)
+                    if pd.notna(getattr(row, "detected_wall_inner_fraction", np.nan))
+                    else source_config.get("candidate_filter", {}).get(
+                        "hard_wall_exclusion_fraction", 0.44
+                    )
+                )
+                wall = _wall_prior(raw_full.shape, row.x_px, row.y_px, size, inner)
+                instance = _decode_review_mask(row.v2_mask_rle, size)
+                status = str(row.v2_mask_review_status).lower()
+                if status == "rejected":
+                    instance.fill(0)
+                    label_value = "invalid"
+                else:
+                    label_value = str(getattr(row, "integrated_label", "single"))
+                    if label_value not in OBJECT_LABELS:
+                        label_value = "single"
+                normalized = raw.astype(np.float32)
+                lo, hi = np.percentile(normalized, [2, 98])
+                normalized = np.clip(
+                    (normalized - lo) / max(hi - lo, 1.0), 0, 1
+                )
+                inputs.append(
+                    np.stack(
+                        [
+                            normalized,
+                            _seed_heatmap(
+                                size, float(settings.get("seed_sigma_px", 4.0))
+                            ),
+                            wall,
+                        ]
+                    ).astype(np.float32)
+                )
+                instances.append(instance.astype(np.uint8))
+                walls.append(wall.astype(np.uint8))
+                labels.append(label_value)
+                sources.append(f"{source_id}|{row.candidate_id}")
+                wells.append(str(row.well))
+                timepoints.append(str(row.timepoint))
+                origins.append(str(row.v2_label_origin))
+        print(
+            f"v2 mask review source {source_id}: {len(reviewed)} rows, "
+            f"completed in {time.perf_counter() - source_started:.1f}s",
+            flush=True,
+        )
+    if not inputs:
+        raise RuntimeError("No completed V2 mask review samples are available.")
+    return {
+        "inputs": np.stack(inputs),
+        "instance_masks": np.stack(instances),
+        "wall_masks": np.stack(walls),
+        "labels": np.asarray(labels),
+        "sources": np.asarray(sources),
+        "wells": np.asarray(wells),
+        "timepoints": np.asarray(timepoints),
+        "label_origins": np.asarray(origins),
+    }
+
+
+def build_v2_mask_review_replay_cache(config: dict[str, Any]) -> Path:
+    """Build a replay cache without rescanning the historical image sources."""
+
+    settings = config["v2_instance_segmentation"]
+    size = int(settings.get("patch_size_px", 96))
+    output = artifact_path(
+        config,
+        "cache",
+        f"{str(settings.get('cache_name', f'v2_instance_training_{size}')).strip()}.npz",
+    )
+    replay_value = settings.get("replay_cache_path")
+    if not replay_value:
+        raise ValueError("replay_cache_path is required for mask review replay cache")
+    replay_path = Path(str(replay_value)).expanduser()
+    if not replay_path.is_absolute():
+        replay_path = (Path.cwd() / replay_path).resolve()
+    if not replay_path.exists():
+        raise FileNotFoundError(f"replay cache is missing: {replay_path}")
+    replay = np.load(replay_path, allow_pickle=False)
+    keys = (
+        "inputs",
+        "instance_masks",
+        "wall_masks",
+        "labels",
+        "sources",
+        "wells",
+        "timepoints",
+        "label_origins",
+    )
+    missing = [key for key in keys if key not in replay.files]
+    if missing:
+        raise ValueError(f"replay cache is missing arrays: {missing}")
+    if replay["inputs"].shape[1:] != (3, size, size):
+        raise ValueError(f"replay cache has incompatible input shape: {replay['inputs'].shape}")
+    review = _review_training_arrays(
+        settings, size, _load_mask_review_sources(settings)
+    )
+    replay_count = len(replay["inputs"])
+    review_count = len(review["inputs"])
+    maximum_samples = int(settings.get("maximum_training_samples", replay_count + review_count))
+    if maximum_samples < review_count:
+        raise ValueError(
+            f"maximum_training_samples={maximum_samples} cannot retain {review_count} reviewed samples"
+        )
+    replay_take = min(replay_count, maximum_samples - review_count)
+    if replay_take < replay_count:
+        replay_indices = _balanced_training_indices(
+            replay["labels"], replay["sources"], replay_take, int(settings.get("seed", 20260802))
+        )
+    else:
+        replay_indices = np.arange(replay_count, dtype=np.int64)
+    arrays = {
+        key: np.concatenate([replay[key][replay_indices], review[key]], axis=0)
+        for key in keys
+    }
+    rng = np.random.default_rng(int(settings.get("seed", 20260802)))
+    order = rng.permutation(len(arrays["inputs"]))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output, **{key: value[order] for key, value in arrays.items()})
+    metadata = {
+        "sample_count": int(len(order)),
+        "replay_cache": str(replay_path),
+        "replay_sample_count": int(len(replay_indices)),
+        "mask_review_sample_count": int(review_count),
+        "source_configs": settings.get("training_sources", []),
+        "mask_review_rounds": settings.get("mask_review_rounds", []),
+        "patch_size_px": size,
+        "label_counts": {
+            str(key): int(value)
+            for key, value in zip(*np.unique(arrays["labels"][order], return_counts=True))
+        },
+        "label_origin_counts": {
+            str(key): int(value)
+            for key, value in zip(
+                *np.unique(arrays["label_origins"][order], return_counts=True)
+            )
+        },
+    }
+    output.with_suffix(".json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return output
+
+
 def _seed_heatmap(size: int, sigma: float) -> np.ndarray:
     yy, xx = np.ogrid[:size, :size]
     center = (size - 1) / 2
@@ -166,6 +445,8 @@ def _residual_pseudo_mask(raw: np.ndarray, maximum_area: int) -> np.ndarray:
 
 def build_v2_instance_cache(config: dict[str, Any]) -> Path:
     settings = config["v2_instance_segmentation"]
+    if bool(settings.get("replay_mask_review_cache", False)):
+        return build_v2_mask_review_replay_cache(config)
     size = int(settings.get("patch_size_px", 96))
     maximum_area = int(settings.get("maximum_instance_area_px", 1800))
     maximum_samples = int(settings.get("maximum_training_samples", 6000))
@@ -188,6 +469,15 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
     source_configs = settings.get(
         "training_sources", ["configs/default.yaml", "configs/ql2202_validation.yaml"]
     )
+    mask_review_sources = _load_mask_review_sources(settings)
+    mask_review_ids_by_config: dict[str, set[str]] = {}
+    for _, _, frame in mask_review_sources:
+        if frame.empty:
+            continue
+        source_config_id = str(frame["v2_mask_review_source_config"].iloc[0])
+        mask_review_ids_by_config[source_config_id] = set(
+            frame["candidate_id"].astype(str)
+        )
     for source_config_path in source_configs:
         if is_validation_holdout(config, source_config_path):
             continue
@@ -212,6 +502,13 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
             reviewed["timepoint"].isin(["T0", "T1", "T2"])
             & reviewed["reviewed_label"].isin(list(OBJECT_LABELS | {"invalid"}))
         ].copy()
+        source_key = str(Path(str(source_config_path)).expanduser().resolve())
+        if source_key in mask_review_ids_by_config:
+            reviewed = reviewed[
+                ~reviewed["candidate_id"].astype(str).isin(
+                    mask_review_ids_by_config[source_key]
+                )
+            ].copy()
         reviewed["v2_label_origin"] = "human_review"
         reviewed_ids = set(reviewed["candidate_id"].astype(str))
         inner_series = predictions["detected_wall_inner_fraction"].fillna(
@@ -301,6 +598,64 @@ def build_v2_instance_cache(config: dict[str, Any]) -> Path:
         print(
             f"v2 instance source {source_config_path}: completed in "
             f"{time.perf_counter() - source_started:.1f}s",
+            flush=True,
+        )
+
+    # Pixel-level review rounds are appended after the legacy source pass.
+    # Their exact RLE replaces any same-candidate pseudo-mask above, while
+    # rejected non-cell proposals remain as all-zero hard negatives.
+    for source_config, source_id, reviewed in mask_review_sources:
+        source_started = time.perf_counter()
+        size_from_round = int(reviewed["v2_mask_size"].iloc[0]) if not reviewed.empty else size
+        if size_from_round != size:
+            raise ValueError(
+                f"mask review size {size_from_round} does not match training size {size}"
+            )
+        for raw_path, group in reviewed.groupby("raw_image_path", sort=False):
+            with Image.open(raw_path) as image:
+                raw_full = np.asarray(image.convert("L"), dtype=np.uint8)
+            for row in group.itertuples(index=False):
+                raw = _crop(raw_full, row.x_px, row.y_px, size, int(np.median(raw_full)))
+                inner = float(
+                    getattr(row, "detected_wall_inner_fraction", np.nan)
+                    if pd.notna(getattr(row, "detected_wall_inner_fraction", np.nan))
+                    else source_config.get("candidate_filter", {}).get(
+                        "hard_wall_exclusion_fraction", 0.44
+                    )
+                )
+                wall = _wall_prior(raw_full.shape, row.x_px, row.y_px, size, inner)
+                instance = _decode_review_mask(row.v2_mask_rle, size)
+                status = str(row.v2_mask_review_status).lower()
+                if status == "rejected":
+                    instance.fill(0)
+                    label_value = "invalid"
+                else:
+                    label_value = str(getattr(row, "integrated_label", "single"))
+                    if label_value not in OBJECT_LABELS:
+                        label_value = "single"
+                normalized = raw.astype(np.float32)
+                lo, hi = np.percentile(normalized, [2, 98])
+                normalized = np.clip(
+                    (normalized - lo) / max(hi - lo, 1.0), 0, 1
+                )
+                value = np.stack(
+                    [
+                        normalized,
+                        _seed_heatmap(size, float(settings.get("seed_sigma_px", 4.0))),
+                        wall,
+                    ]
+                ).astype(np.float32)
+                inputs.append(value)
+                instances.append(instance.astype(np.uint8))
+                walls.append(wall.astype(np.uint8))
+                labels_out.append(label_value)
+                sources_out.append(f"{source_id}|{row.candidate_id}")
+                origins_out.append(str(row.v2_label_origin))
+                wells_out.append(str(row.well))
+                timepoints_out.append(str(row.timepoint))
+        print(
+            f"v2 mask review source {source_id}: {len(reviewed)} rows, "
+            f"completed in {time.perf_counter() - source_started:.1f}s",
             flush=True,
         )
 

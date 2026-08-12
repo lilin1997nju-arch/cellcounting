@@ -24,7 +24,12 @@ def _device(config: dict[str, Any]) -> torch.device:
     return torch.device(requested)
 
 
-def _instance_sampler_weights(labels: np.ndarray, sources: np.ndarray) -> np.ndarray:
+def _instance_sampler_weights(
+    labels: np.ndarray,
+    sources: np.ndarray,
+    origins: np.ndarray | None = None,
+    review_multipliers: dict[str, float] | None = None,
+) -> np.ndarray:
     """Balance replay batches by source plate and reviewed object class."""
 
     labels = np.asarray(labels).astype(str)
@@ -42,9 +47,20 @@ def _instance_sampler_weights(labels: np.ndarray, sources: np.ndarray) -> np.nda
             )
         return weights
 
-    return np.sqrt(
+    weights = np.sqrt(
         inverse_frequency(sources) * inverse_frequency(labels)
     ).astype(np.float32)
+    if origins is not None and review_multipliers:
+        origin_values = np.asarray(origins).astype(str)
+        for prefix, multiplier in review_multipliers.items():
+            try:
+                factor = float(multiplier)
+            except (TypeError, ValueError):
+                continue
+            if factor <= 0:
+                continue
+            weights[origin_values == str(prefix)] *= factor
+    return weights
 
 
 def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
@@ -63,7 +79,12 @@ def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
     if bool(settings.get("balance_by_plate_and_class", True)):
         sampler = WeightedRandomSampler(
             torch.from_numpy(
-                _instance_sampler_weights(cache["labels"], cache["sources"])
+                _instance_sampler_weights(
+                    cache["labels"],
+                    cache["sources"],
+                    cache["label_origins"] if "label_origins" in cache.files else None,
+                    settings.get("review_sample_multipliers", {}),
+                )
             ),
             num_samples=len(dataset),
             replacement=True,
@@ -156,11 +177,14 @@ def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
                 "fit_history": history,
                 "external_validation": "A12-22 only; not used for weights",
                 "balanced_sampler": bool(sampler is not None),
+                "promote_latest": bool(settings.get("promote_latest", True)),
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    latest = artifact_path(config, "v2", "models", "latest_instance_segmenter.pt")
-    latest.write_bytes(checkpoint.read_bytes())
+    promote_latest = bool(settings.get("promote_latest", True))
+    if promote_latest:
+        latest = artifact_path(config, "v2", "models", "latest_instance_segmenter.pt")
+        latest.write_bytes(checkpoint.read_bytes())
     return run_dir
