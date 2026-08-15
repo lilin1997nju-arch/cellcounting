@@ -53,8 +53,7 @@ function Test-ModelBundle {
     $required = @(
         (Join-Path $Root "models\teaching_classifier.pt"),
         (Join-Path $Root "models\multiplicity_classifier.pt"),
-        (Join-Path $Root "v2\models\latest_instance_segmenter.pt"),
-        (Join-Path $Root "v2\models\latest_temporal_evidence.pt")
+        (Join-Path $Root "v2\models\latest_instance_segmenter.pt")
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($missing.Count -gt 0) {
