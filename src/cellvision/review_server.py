@@ -57,7 +57,7 @@ from .teaching import (
     train_teaching_classifier,
 )
 from .well_screening import build_well_screening, save_late_growth_review
-from .review_image_cache import render_review_image, review_image_cache_path
+from .review_image_cache import patch_cache_path, render_patch, render_review_image, report_image_cache_path, review_image_cache_path
 from .decode import inspect_tiff
 from .gated_screening import build_gated_plate_report
 from .v2_mask_review import (
@@ -3748,6 +3748,7 @@ def create_app(
 
     @app.get("/api/patch")
     def patch(
+        request: Request,
         well: str,
         timepoint: str,
         x: float,
@@ -3780,13 +3781,14 @@ def create_app(
         if selected.empty:
             raise HTTPException(status_code=404, detail="image unavailable")
         size = max(64, min(int(size), 2048))
-        half = size // 2
-        with Image.open(selected.iloc[0]["raw_image_path"]) as image:
-            gray = ImageEnhance.Contrast(image.convert("L")).enhance(1.8)
-            crop = gray.crop((int(x) - half, int(y) - half, int(x) + half, int(y) + half))
-        buffer = io.BytesIO()
-        crop.save(buffer, format="JPEG", quality=90)
-        return Response(content=buffer.getvalue(), media_type="image/jpeg")
+        raw_path = Path(str(selected.iloc[0]["raw_image_path"]))
+        cache_path, etag = patch_cache_path(config, raw_path, x, y, size)
+        headers = {"ETag": f'"{etag}"', "Cache-Control": "public, max-age=31536000, immutable"}
+        if request.headers.get("if-none-match") == headers["ETag"]:
+            return Response(status_code=304, headers=headers)
+        if not cache_path.exists():
+            render_patch(config, raw_path, x, y, size)
+        return Response(content=cache_path.read_bytes(), media_type="image/jpeg", headers=headers)
 
     @app.get("/api/well-image")
     def well_image(
@@ -3811,6 +3813,7 @@ def create_app(
 
     @app.get("/api/report-image")
     def report_image(
+        request: Request,
         well: str,
         timepoint: str,
         view: str = "whole",
@@ -3838,7 +3841,26 @@ def create_app(
             raise HTTPException(status_code=404, detail="screening ROI unavailable")
         roi_map = json.loads(str(row.iloc[0]["roi_json"]))
         roi = roi_map.get(normalized_timepoint)
-        with Image.open(selected.iloc[0]["raw_image_path"]) as opened:
+        raw_path = Path(str(selected.iloc[0]["raw_image_path"]))
+        max_size = max(360, min(int(max_size), 2200))
+        cache_path: Path | None = None
+        headers: dict[str, str] = {}
+        if roi is not None:
+            cache_path, etag = report_image_cache_path(
+                config,
+                raw_path,
+                float(roi["x"]),
+                float(roi["y"]),
+                float(roi["size"]),
+                view,
+                max_size,
+            )
+            headers = {"ETag": f'"{etag}"', "Cache-Control": "public, max-age=31536000, immutable"}
+            if request.headers.get("if-none-match") == headers["ETag"]:
+                return Response(status_code=304, headers=headers)
+            if cache_path.exists():
+                return Response(content=cache_path.read_bytes(), media_type="image/jpeg", headers=headers)
+        with Image.open(raw_path) as opened:
             rendered = ImageEnhance.Contrast(opened.convert("L")).enhance(1.7)
             width, height = rendered.size
             if roi is None:
@@ -3861,8 +3883,12 @@ def create_app(
                     outline=255,
                     width=line_width,
                 )
-            max_size = max(360, min(int(max_size), 2200))
             rendered.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
+        if cache_path is not None:
+            temporary = cache_path.with_suffix(".tmp")
+            rendered.save(temporary, format="JPEG", quality=94, subsampling=0)
+            temporary.replace(cache_path)
+            return Response(content=cache_path.read_bytes(), media_type="image/jpeg", headers=headers)
         buffer = io.BytesIO()
         rendered.save(buffer, format="JPEG", quality=94, subsampling=0)
         return Response(content=buffer.getvalue(), media_type="image/jpeg")
