@@ -1,7 +1,7 @@
 import pandas as pd
 import numpy as np
 
-from cellvision.train_v2_temporal import _review_triplet_static_target
+from cellvision.temporal_training_cache import _review_triplet_static_target
 from cellvision.v2_temporal_inference import (
     _v3_proposal_is_decisive,
     _adjust_cell_debris_probabilities,

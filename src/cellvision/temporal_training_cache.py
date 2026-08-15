@@ -2,63 +2,20 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
-import torch.nn.functional as F
 from PIL import Image
 from scipy.ndimage import label as ndi_label
-from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 from .config import artifact_path, is_validation_holdout, load_config
-from .models.v2_temporal_evidence import TemporalEvidenceNet
 from .v2_instance_dataset import _crop
 from .v2_instance_inference import decode_rle
-from .runtime import ensure_training_allowed
 
 
 CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
-
-
-def _balanced_sampler_weights(
-    groups: np.ndarray,
-    same: np.ndarray,
-    static: np.ndarray,
-    static_valid: np.ndarray,
-) -> np.ndarray:
-    """Return bounded plate/class weights for replay-balanced sampling."""
-
-    groups = np.asarray(
-        [str(value).split(":missing", 1)[0].split(":rolled", 1)[0] for value in groups]
-    )
-    same = np.asarray(same).astype(np.int64)
-    static = np.asarray(static).astype(np.int64)
-    static_valid = np.asarray(static_valid).astype(bool)
-
-    def inverse_frequency(values: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
-        if valid is None:
-            valid = np.ones(len(values), dtype=bool)
-        weights = np.ones(len(values), dtype=np.float32)
-        if not valid.any():
-            return weights
-        unique, counts = np.unique(values[valid], return_counts=True)
-        target = float(np.median(counts))
-        for value, count in zip(unique, counts):
-            weights[valid & (values == value)] = np.clip(
-                target / max(float(count), 1.0), 0.5, 2.5
-            )
-        return weights
-
-    # Geometric blending prevents a tiny plate with a rare class from
-    # dominating the replay stream while still guaranteeing representation.
-    plate_weight = inverse_frequency(groups)
-    same_weight = inverse_frequency(same)
-    static_weight = inverse_frequency(static, static_valid)
-    return np.sqrt(plate_weight * same_weight * static_weight).astype(np.float32)
 
 
 def _lineage_static_target(row: pd.Series) -> float | None:
@@ -411,106 +368,3 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
         groups=np.asarray(groups_out, dtype=str),
     )
     return output
-
-
-def train_v2_temporal_model(config: dict[str, Any]) -> Path:
-    ensure_training_allowed()
-    settings = config["v2_temporal_model"]
-    cache = np.load(build_temporal_training_cache(config))
-    dataset = TensorDataset(*(torch.from_numpy(cache[key]) for key in ("images", "numeric", "present", "same", "static", "static_valid")))
-    sampler = None
-    if bool(settings.get("balance_by_plate_and_class", True)):
-        sample_weights = _balanced_sampler_weights(
-            cache["groups"], cache["same"], cache["static"], cache["static_valid"]
-        )
-        sampler = WeightedRandomSampler(
-            torch.from_numpy(sample_weights),
-            num_samples=len(dataset),
-            replacement=True,
-        )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(settings.get("batch_size", 16)),
-        shuffle=sampler is None,
-        sampler=sampler,
-    )
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    numeric_features = int(cache["numeric"].shape[1])
-    model = TemporalEvidenceNet(numeric_features=numeric_features).to(device)
-    initial_checkpoint = str(settings.get("initial_checkpoint", "")).strip()
-    initialized_from_checkpoint = ""
-    if initial_checkpoint:
-        initial_path = Path(initial_checkpoint).expanduser()
-        if not initial_path.is_absolute():
-            initial_path = (Path.cwd() / initial_path).resolve()
-        if not initial_path.exists():
-            raise FileNotFoundError(f"Initial temporal checkpoint does not exist: {initial_path}")
-        payload = torch.load(initial_path, map_location=device)
-        state = payload.get("model_state", payload) if isinstance(payload, dict) else payload
-        checkpoint_features = payload.get("numeric_features") if isinstance(payload, dict) else None
-        if checkpoint_features is not None and int(checkpoint_features) != numeric_features:
-            raise ValueError(
-                "Initial temporal checkpoint numeric feature count does not match the training cache: "
-                f"{checkpoint_features} != {numeric_features}"
-            )
-        model.load_state_dict(state, strict=True)
-        initialized_from_checkpoint = str(initial_path)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(settings.get("learning_rate", 8e-4)), weight_decay=1e-4)
-    history = []
-    static_values = cache["static"]
-    static_valid_values = cache["static_valid"] > 0
-    static_counts = np.bincount(static_values[static_valid_values].astype(np.int64), minlength=2)
-    static_class_weights = np.ones(2, np.float32)
-    present_classes = static_counts > 0
-    static_class_weights[present_classes] = static_valid_values.sum() / (2 * static_counts[present_classes])
-    static_class_weights_tensor = torch.from_numpy(static_class_weights).to(device)
-    for epoch in range(int(settings.get("epochs", 80))):
-        total = 0.0
-        model.train()
-        for images, numeric, present, same, static, static_valid in loader:
-            images, numeric, present = images.float().to(device), numeric.float().to(device), present.float().to(device)
-            same = same.float().to(device)
-            static, static_valid = static.float().to(device), static_valid.float().to(device)
-            result = model(images, numeric, present)
-            same_loss = F.binary_cross_entropy_with_logits(result["same_object"], same)
-            static_loss_raw = F.binary_cross_entropy_with_logits(
-                result["static_similarity"], static, reduction="none"
-            )
-            static_weights = static_class_weights_tensor[static.long()]
-            static_loss = (static_loss_raw * static_weights * static_valid).sum() / static_valid.sum().clamp_min(1.0)
-            loss = same_loss + static_loss
-            optimizer.zero_grad(set_to_none=True); loss.backward(); optimizer.step()
-            total += float(loss.detach()) * len(images)
-        history.append({"epoch": epoch + 1, "loss": total / len(dataset)})
-    run = artifact_path(config, "v2", "runs", datetime.now().strftime("v2-temporal-%Y%m%d-%H%M%S"))
-    run.mkdir(parents=True, exist_ok=True)
-    checkpoint = run / "model.pt"
-    checkpoint_payload = {
-        "algorithm_version": "v2-temporal-similarity",
-        "model_state": model.state_dict(),
-        "numeric_features": numeric_features,
-        "same_object_threshold": float(settings.get("same_object_threshold", 0.80)),
-        "static_similarity_threshold": float(settings.get("static_similarity_threshold", 0.75)),
-        "base_high_confidence_threshold": float(settings.get("base_high_confidence_threshold", 0.90)),
-        "temporal_logit_beta": float(settings.get("temporal_logit_beta", 2.0)),
-        "maximum_probability_shift": float(settings.get("maximum_probability_shift", 0.30)),
-        "initialized_from_checkpoint": initialized_from_checkpoint or None,
-    }
-    torch.save(checkpoint_payload, checkpoint)
-    metrics = {
-        "device": str(device),
-        "sample_count": len(dataset),
-        "same_object_positive": int((cache["same"] > 0).sum()),
-        "same_object_negative": int((cache["same"] <= 0).sum()),
-        "static_positive": int(static_counts[1]),
-        "dynamic_positive": int(static_counts[0]),
-        "static_valid": int(static_valid_values.sum()),
-        "initialized_from_checkpoint": initialized_from_checkpoint or None,
-        "balanced_sampler": bool(sampler is not None),
-        "policy": "temporal output adjusts ambiguous cell/debris probabilities only",
-        "fit_history": history,
-    }
-    (run / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-    latest = artifact_path(config, "v2", "models", "latest_temporal_evidence.pt")
-    latest.write_bytes(checkpoint.read_bytes())
-    return run

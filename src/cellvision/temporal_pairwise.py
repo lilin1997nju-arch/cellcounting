@@ -100,8 +100,8 @@ def build_temporal_pairwise_training_cache(config: dict[str, Any]) -> Path:
             if "groups" in cached.files:
                 return cache_path
 
-    # Local import avoids importing the legacy trainer during normal inference.
-    from .train_v2_temporal import build_temporal_training_cache
+    # Local import keeps inference free of the training-data module.
+    from .temporal_training_cache import build_temporal_training_cache
 
     triplet_path = build_temporal_training_cache(config)
     triplets = np.load(triplet_path)

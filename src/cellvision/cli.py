@@ -22,7 +22,6 @@ from .project_catalog import ProjectCatalog, catalog_path_for_manifest
 from .train import train_weak_segmenter
 from .train_morphology import train_morphology_classifier
 from .train_v2_instance import train_v2_instance_segmenter
-from .train_v2_temporal import train_v2_temporal_model
 from .temporal_pairwise import train_temporal_pairwise_model
 from .v2_instance_inference import infer_v2_instances, refinalize_v2_file
 from .evaluate_v2 import write_v2_evaluation
@@ -66,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     baseline.add_argument("--wells", default="A1,B3,F12,G2,H6")
     train = subparsers.add_parser("train")
     train.add_argument(
-        "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v2-temporal-model", "v3-temporal-pairwise-model"]
+        "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v3-temporal-pairwise-model"]
     )
     train.add_argument("--config", default="configs/default.yaml")
     infer = subparsers.add_parser("infer")
@@ -335,7 +334,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.model == "v3-temporal-pairwise-model":
             run_dir = train_temporal_pairwise_model(config)
         else:
-            run_dir = train_v2_temporal_model(config)
+            raise SystemExit(f"Unsupported training model: {args.model}")
         print(str(run_dir))
     elif args.command == "infer":
         result = infer_smoke(config, args.checkpoint, _wells(args.wells))
