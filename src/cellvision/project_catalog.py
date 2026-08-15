@@ -301,6 +301,33 @@ def _project_id(value: dict[str, Any], path: Path) -> str:
     return str(value.get("project_id") or path.parent.name)
 
 
+def _project_card_from_row(data: dict[str, Any]) -> dict[str, Any]:
+    """Build a project card from a joined projects+summaries row."""
+
+    try:
+        categories = json.loads(data.get("category_counts_json") or "{}")
+    except json.JSONDecodeError:
+        categories = {}
+    return {
+        "project_id": data["project_id"],
+        "project_name": data["project_name"],
+        "root": data.get("source_root") or "",
+        "manifest_path": data["manifest_path"],
+        "plate_count": int(data.get("plate_count") or 0),
+        "completed_plate_count": int(data.get("recognized_plate_count") or 0),
+        "recognized_plate_count": int(data.get("recognized_plate_count") or 0),
+        "reviewed_plate_count": int(data.get("reviewed_plate_count") or 0),
+        "category_counts": categories,
+        "single_cell_origin_well_count": int(categories.get("single_cell_origin", 0) or 0),
+        "detection_start_date": None,
+        "detection_end_date": None,
+        "created_by": data.get("created_by") or "",
+        "generated_at": data.get("created_at"),
+        "updated_at": data.get("calculated_at") or data.get("updated_at"),
+        "detail_url": f"/projects/{_slug(data['project_id'])}/",
+    }
+
+
 class ProjectCatalog:
     """SQLite-backed project index with idempotent file reconciliation."""
 
@@ -808,9 +835,11 @@ class ProjectCatalog:
         refresh cannot erase the reviewer decision.
         """
 
-        # First pull the newest report/summary as a model projection.  The
-        # selected wells below are the only rows promoted to a human source.
-        card = self.sync_manifest(manifest_path, force=True, source="review_report_sync")
+        # The review-save path already rewrites the quick-review summary (whose
+        # mtime participates in the manifest signature), so a normal signature
+        # check detects the change without forcing a full manifest re-read.
+        # Selected wells below are the only rows promoted to a human source.
+        card = self.sync_manifest(manifest_path, force=False, source="review_report_sync")
         if card is None:
             return None
         selected = {str(value).upper() for value in (wells or []) if str(value).strip()}
@@ -1064,29 +1093,8 @@ class ProjectCatalog:
         ).fetchone()
         if row is None:
             return None
-        data = dict(row)
-        try:
-            categories = json.loads(data.get("category_counts_json") or "{}")
-        except json.JSONDecodeError:
-            categories = {}
-        return {
-            "project_id": data["project_id"],
-            "project_name": data["project_name"],
-            "root": data.get("source_root") or "",
-            "manifest_path": data["manifest_path"],
-            "plate_count": int(data.get("plate_count") or 0),
-            "completed_plate_count": int(data.get("recognized_plate_count") or 0),
-            "recognized_plate_count": int(data.get("recognized_plate_count") or 0),
-            "reviewed_plate_count": int(data.get("reviewed_plate_count") or 0),
-            "category_counts": categories,
-            "single_cell_origin_well_count": int(categories.get("single_cell_origin", 0) or 0),
-            "detection_start_date": None,
-            "detection_end_date": None,
-            "created_by": data.get("created_by") or "",
-            "generated_at": data.get("created_at"),
-            "updated_at": data.get("calculated_at") or data.get("updated_at"),
-            "detail_url": f"/projects/{_slug(data['project_id'])}/",
-        }
+        return _project_card_from_row(dict(row))
+
 
     def list_projects(
         self,
@@ -1121,9 +1129,7 @@ class ProjectCatalog:
             ).fetchall()
             items: list[dict[str, Any]] = []
             for row in rows:
-                item = self._project_card_row(connection, str(row["project_id"]))
-                if item is not None:
-                    items.append(item)
+                items.append(_project_card_from_row(dict(row)))
             aggregate_rows = connection.execute(
                 f"SELECT s.category_counts_json FROM projects p LEFT JOIN project_summaries s ON s.project_id=p.project_id WHERE {where}",
                 params,
