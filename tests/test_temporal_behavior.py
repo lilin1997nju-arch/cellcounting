@@ -3,7 +3,7 @@ from __future__ import annotations
 import pandas as pd
 
 from cellvision.temporal_behavior import evaluate_temporal_behavior
-from cellvision.temporal_objects import TemporalPairEvidence
+from cellvision.temporal_objects import TemporalPairEvidence, conditional_cell_probability
 
 
 def _row(
@@ -322,3 +322,27 @@ def test_b8_like_stable_low_blobness_wall_residual_is_invalid():
         "stable_wall_site_structure"
     }
     assert {value["v3_proposed_label"] for value in outputs.values()} == {"invalid"}
+
+
+def test_invalid_probability_is_not_removed_from_persistent_cell_evidence():
+    frame = pd.DataFrame(
+        [
+            _row(0, "T0", 0.56, 0.01, label="single"),
+            _row(1, "T1", 0.56, 0.01, label="single"),
+            _row(2, "T2", 0.56, 0.01, label="single"),
+        ]
+    ).set_index("index")
+    frame["invalid_probability"] = 0.43
+
+    assert conditional_cell_probability(frame.loc[2]) == 0.56
+    outputs = evaluate_temporal_behavior(
+        frame,
+        [0, 1, 2],
+        [_edge(0, 1), _edge(1, 2)],
+        _settings(),
+        "D2:invalid-aware",
+    )
+
+    assert all(value["v3_persistent_cell_evidence"] is False for value in outputs.values())
+    assert {value["v3_track_behavior"] for value in outputs.values()} == {"stable_debris"}
+    assert {value["v3_proposed_label"] for value in outputs.values()} == {"debris"}

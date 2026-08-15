@@ -535,7 +535,7 @@ def _apply_cross_track_division_rescues(
                     v3_output.get("v3_proposed_label", frame.at[index, "integrated_label"])
                 )
                 conditional = conditional_cell_probability(frame.loc[index])
-                if base_label in CELL_LABELS or conditional >= cell_threshold:
+                if conditional >= cell_threshold:
                     proposed_label = candidate_multiplicity_label(frame.loc[index])
                     frame_state = "cell"
                 elif base_label == "debris" or conditional <= debris_threshold:
@@ -689,7 +689,8 @@ def _component_temporal_outputs(
             frame.at[index, "debris_probability"]
             / max(
                 float(frame.at[index, "cell_probability"])
-                + float(frame.at[index, "debris_probability"]),
+                + float(frame.at[index, "debris_probability"])
+                + float(frame.at[index, "invalid_probability"]),
                 1e-6,
             )
         )
@@ -935,7 +936,7 @@ def _component_temporal_outputs(
             original_label = "debris"
         mass = cell + debris
         base_cell = conditional[index]
-        base_confidence = max(base_cell, 1.0 - base_cell)
+        base_confidence = max(cell, debris, invalid)
         common = {
             "same": identity_score,
             "static": static_score,
@@ -1058,7 +1059,7 @@ def _component_temporal_outputs(
                 if morphology_stable_debris and not three_frame_static
                 else "three_frame_static_debris_consensus"
             )
-        elif two_frame_static:
+        elif two_frame_static and cell_anchor <= 0.0:
             debris_evidence += float(settings.get("two_frame_static_debris_logit", 0.35)) * max(static_score, 0.75)
             reason = "two_frame_static_object"
         if debris_probability_trend:
@@ -1144,7 +1145,11 @@ def _component_temporal_outputs(
         target_cell = _probability_sigmoid(_probability_logit(base_cell) + net_evidence)
         if net_evidence > 0:
             maximum_probability_shift = (
-                0.45 if growth else 0.34 if cell_anchor > 0 else 0.12
+                # A high-quality cell anchor is allowed to overcome the
+                # lower raw cell mass of its matched partner.  The cap is
+                # still on the full three-class cell probability, so invalid
+                # mass cannot be converted into cell evidence.
+                0.45 if growth else 0.40 if cell_anchor > 0 else 0.12
             )
             conditional_shift = min(max(target_cell - base_cell, 0.0), maximum_probability_shift)
             target_cell = base_cell + conditional_shift
@@ -1165,7 +1170,8 @@ def _component_temporal_outputs(
                 target_cell,
                 1.0 - float(settings.get("temporal_debris_decision_threshold", 0.62)),
             )
-        new_cell = mass * target_cell
+        total_probability_mass = mass + invalid
+        new_cell = float(min(total_probability_mass * target_cell, mass))
         new_debris = mass - new_cell
         if strong_static_debris:
             adjusted_label = "debris"
@@ -1231,9 +1237,10 @@ def _adjust_cell_debris_probabilities(
 ) -> tuple[float, float, float, bool, str]:
     """Move ambiguous cell/debris mass toward debris using static temporal evidence.
 
-    Invalid probability is intentionally excluded from the redistribution.  Temporal
-    evidence can refine an uncertain cell/debris decision, but cannot rescue or
-    create an invalid/background decision.
+    Invalid probability is never used as cell/debris evidence and is preserved
+    during redistribution. Temporal evidence can refine an uncertain
+    cell/debris decision, but cannot rescue or create an invalid/background
+    decision.
     """
 
     cell_probability = float(np.clip(cell_probability, 0.0, 1.0))
@@ -1255,10 +1262,17 @@ def _adjust_cell_debris_probabilities(
         return cell_probability, debris_probability, 0.0, False, "low_similarity"
 
     mass = cell_probability + debris_probability
-    if mass <= 1e-6:
+    total_probability_mass = mass + invalid_probability
+    if mass <= 1e-6 or total_probability_mass <= 1e-6:
         return cell_probability, debris_probability, 0.0, False, "no_cell_debris_mass"
-    conditional_cell = float(np.clip(cell_probability / mass, 1e-5, 1.0 - 1e-5))
-    base_confidence = max(conditional_cell, 1.0 - conditional_cell)
+    conditional_cell = float(
+        np.clip(
+            cell_probability / total_probability_mass,
+            1e-5,
+            1.0 - 1e-5,
+        )
+    )
+    base_confidence = max(cell_probability, debris_probability, invalid_probability)
     if base_confidence >= high_confidence_threshold:
         return cell_probability, debris_probability, 0.0, False, "high_confidence_base"
 
@@ -1268,7 +1282,7 @@ def _adjust_cell_debris_probabilities(
     strength = float(np.clip(same_object_score * static_excess * ambiguity * frame_factor, 0.0, 1.0))
     logit = np.log(conditional_cell / (1.0 - conditional_cell))
     target_cell = 1.0 / (1.0 + np.exp(-(logit - beta * strength)))
-    requested_shift = mass * max(0.0, conditional_cell - target_cell)
+    requested_shift = total_probability_mass * max(0.0, conditional_cell - target_cell)
     shift = float(min(requested_shift, maximum_shift, cell_probability))
     if shift <= 1e-6:
         return cell_probability, debris_probability, 0.0, False, "no_effect"
@@ -1884,13 +1898,18 @@ def refinalize_v2_temporal_noncell_labels(config: dict[str, Any]) -> Path:
             if any(len(rows) != 1 for rows in by_timepoint.values()):
                 continue
             ordered = pd.concat([by_timepoint[timepoint] for timepoint in TIMEPOINTS])
+            total_probability = (
+                pd.to_numeric(ordered["cell_probability"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(ordered["debris_probability"], errors="coerce").fillna(0.0)
+                + pd.to_numeric(ordered["invalid_probability"], errors="coerce").fillna(0.0)
+            ).clip(lower=1e-6)
             mass = (
                 pd.to_numeric(ordered["cell_probability"], errors="coerce").fillna(0.0)
                 + pd.to_numeric(ordered["debris_probability"], errors="coerce").fillna(0.0)
             ).clip(lower=1e-6)
             debris_sequence = (
                 pd.to_numeric(ordered["debris_probability"], errors="coerce").fillna(0.0)
-                / mass
+                / total_probability
             ).to_numpy(float)
             identity = float(
                 pd.to_numeric(
@@ -1945,11 +1964,13 @@ def refinalize_v2_temporal_noncell_labels(config: dict[str, Any]) -> Path:
             for index in ordered.index:
                 cell = float(frame.at[index, "cell_probability"])
                 debris = float(frame.at[index, "debris_probability"])
+                invalid = float(frame.at[index, "invalid_probability"])
                 cell_debris_mass = max(cell + debris, 1e-6)
-                base_cell = cell / cell_debris_mass
+                total_probability_mass = max(cell_debris_mass + invalid, 1e-6)
+                base_cell = cell / total_probability_mass
                 target_cell = _probability_sigmoid(_probability_logit(base_cell) - evidence)
                 target_cell = base_cell - min(max(base_cell - target_cell, 0.0), 0.34)
-                new_cell = cell_debris_mass * target_cell
+                new_cell = min(total_probability_mass * target_cell, cell_debris_mass)
                 new_debris = cell_debris_mass - new_cell
                 frame.at[index, "v2_adjusted_cell_probability"] = new_cell
                 frame.at[index, "v2_adjusted_debris_probability"] = new_debris

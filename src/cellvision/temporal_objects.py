@@ -332,9 +332,17 @@ def multiplicity_rank(label: str) -> int:
 
 
 def conditional_cell_probability(row: pd.Series) -> float:
-    cell = float(row.get("cell_probability", 0.0) or 0.0)
-    debris = float(row.get("debris_probability", 0.0) or 0.0)
-    return float(cell / max(cell + debris, 1e-8))
+    """Return cell evidence normalized over all three model classes.
+
+    Invalid probability is evidence that the candidate is not a usable cell
+    observation, so it must remain in the denominator for temporal decisions.
+    This is deliberately not ``cell / (cell + debris)``.
+    """
+
+    cell = max(float(row.get("cell_probability", 0.0) or 0.0), 0.0)
+    debris = max(float(row.get("debris_probability", 0.0) or 0.0), 0.0)
+    invalid = max(float(row.get("invalid_probability", 0.0) or 0.0), 0.0)
+    return float(cell / max(cell + debris + invalid, 1e-8))
 
 
 def detect_division_edges(

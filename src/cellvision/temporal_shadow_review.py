@@ -88,7 +88,8 @@ def _boolean(row: pd.Series, key: str, default: bool = False) -> bool:
 def _conditional_cell(row: pd.Series) -> float:
     cell = max(_number(row, "cell_probability"), 0.0)
     debris = max(_number(row, "debris_probability"), 0.0)
-    return float(cell / max(cell + debris, 1e-8))
+    invalid = max(_number(row, "invalid_probability"), 0.0)
+    return float(cell / max(cell + debris + invalid, 1e-8))
 
 
 def _safe_run_id(root: Path, run_id: str) -> Path:
@@ -167,7 +168,10 @@ def _frame_record(row: pd.Series) -> dict[str, Any]:
         "cell_probability": _number(row, "cell_probability"),
         "debris_probability": _number(row, "debris_probability"),
         "invalid_probability": _number(row, "invalid_probability"),
+        # Kept for API compatibility; this is now invalid-aware full-class
+        # cell evidence rather than cell-vs-debris-only probability.
         "conditional_cell_probability": conditional,
+        "cell_evidence_probability": conditional,
         "v3_would_change": _boolean(row, "v3_would_change"),
         "semantic_degradation": _boolean(row, "v3_semantic_degradation"),
         "morphology_change_score": _number(row, "v3_morphology_change_score"),

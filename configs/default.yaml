@@ -345,6 +345,8 @@ v2_temporal_model:
   morphology_stable_static_similarity_threshold: 0.68
   morphology_stable_shape_similarity_threshold: 0.86
   morphology_stable_maximum_area_ratio: 1.80
+  # These cell-probability thresholds use the full three-class probability;
+  # invalid probability is not removed before temporal evidence is computed.
   morphology_stable_debris_maximum_cell_probability: 0.62
   minimum_foreground_quality: 0.30
   static_maximum_area_ratio: 1.65

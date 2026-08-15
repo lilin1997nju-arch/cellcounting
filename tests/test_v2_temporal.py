@@ -132,6 +132,18 @@ def test_two_real_candidates_can_apply_reduced_temporal_adjustment():
     assert debris > 0.40
 
 
+def test_invalid_probability_is_included_in_temporal_cell_evidence():
+    cell, debris, boost, applied, reason = _adjust_cell_debris_probabilities(
+        0.56, 0.01, 0.43, 0.95, 0.95, 3
+    )
+
+    assert applied is True
+    assert reason == "applied"
+    assert cell < 0.56
+    assert debris > 0.01
+    assert abs(cell + debris + 0.43 - 1.0) < 1e-6
+
+
 def test_static_wall_artifact_requires_three_stable_wall_overlapping_frames():
     assert _is_static_wall_artifact(
         [1.0, 1.0, 1.0],

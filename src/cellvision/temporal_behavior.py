@@ -73,9 +73,12 @@ def _flag(row: pd.Series, key: str, default: bool = True) -> bool:
 
 
 def _conditional(row: pd.Series) -> float:
+    """Return full three-class cell evidence, including invalid probability."""
+
     cell = max(_value(row, "cell_probability"), 0.0)
     debris = max(_value(row, "debris_probability"), 0.0)
-    return float(np.clip(cell / max(cell + debris, 1e-8), 0.0, 1.0))
+    invalid = max(_value(row, "invalid_probability"), 0.0)
+    return float(np.clip(cell / max(cell + debris + invalid, 1e-8), 0.0, 1.0))
 
 
 def _base_label(row: pd.Series) -> str:
@@ -157,14 +160,24 @@ def _cell_label(row: pd.Series) -> str:
 def _set_conditional_probability(
     row: pd.Series, target: float
 ) -> tuple[float, float]:
-    mass = max(
-        _value(row, "cell_probability") + _value(row, "debris_probability"),
-        0.0,
-    )
-    if mass <= 1e-8:
+    """Set full cell probability while preserving invalid probability.
+
+    Temporal evidence may redistribute only the cell/debris mass.  Invalid
+    mass is never silently converted into a cell or debris observation.
+    ``target`` is a full three-class cell probability.
+    """
+
+    cell = max(_value(row, "cell_probability"), 0.0)
+    debris = max(_value(row, "debris_probability"), 0.0)
+    invalid = max(_value(row, "invalid_probability"), 0.0)
+    non_invalid_mass = cell + debris
+    total_mass = non_invalid_mass + invalid
+    if total_mass <= 1e-8 or non_invalid_mass <= 1e-8:
         return _value(row, "cell_probability"), _value(row, "debris_probability")
-    cell = mass * float(np.clip(target, 0.0, 1.0))
-    return cell, mass - cell
+    target_cell = float(
+        np.clip(total_mass * float(np.clip(target, 0.0, 1.0)), 0.0, non_invalid_mass)
+    )
+    return target_cell, non_invalid_mass - target_cell
 
 
 def _nodes_by_timepoint(frame: pd.DataFrame, nodes: list[int]) -> dict[str, list[int]]:
@@ -781,7 +794,7 @@ def evaluate_temporal_behavior(
             # A division veto protects cell-like parents/children from the
             # static-debris and suspected-dead rules.  It does not invent a
             # cell from a clearly invalid or clearly debris-only row.
-            if base_label in CELL_LABELS or conditional[index] >= float(settings.get("division_cell_decision_threshold", 0.62)):
+            if conditional[index] >= float(settings.get("division_cell_decision_threshold", 0.62)):
                 proposed_label = _cell_label(row)
                 frame_state = "cell"
             elif _semantic_label(base_label) == "debris" or conditional[index] <= float(settings.get("division_debris_decision_threshold", 0.38)):
@@ -825,7 +838,7 @@ def evaluate_temporal_behavior(
             proposed_label = "debris"
             frame_state = "debris"
         elif track_behavior == "stable_cell_or_conflict":
-            if base_label in CELL_LABELS or conditional[index] >= float(settings.get("stable_cell_decision_threshold", 0.62)):
+            if conditional[index] >= float(settings.get("stable_cell_decision_threshold", 0.62)):
                 proposed_label = _cell_label(row)
                 frame_state = "cell"
             else:
@@ -838,7 +851,7 @@ def evaluate_temporal_behavior(
             proposed_label = base_label
             frame_state = "uncertain"
         elif track_behavior == "wall_independent_object":
-            if base_label in CELL_LABELS or conditional[index] >= float(settings.get("stable_cell_decision_threshold", 0.62)):
+            if conditional[index] >= float(settings.get("stable_cell_decision_threshold", 0.62)):
                 proposed_label = _cell_label(row)
                 frame_state = "cell"
             elif _semantic_label(base_label) == "debris":
