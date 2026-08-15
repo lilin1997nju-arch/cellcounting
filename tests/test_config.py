@@ -33,9 +33,25 @@ def test_environment_paths_override_yaml(tmp_path: Path, monkeypatch: pytest.Mon
     assert config["paths"]["artifact_root"] == str((tmp_path / "mounted-artifacts").resolve())
 
 
+def test_explicit_worker_paths_can_ignore_global_root_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"paths:\n  data_root: {tmp_path / 'board-data'}\n"
+        f"  artifact_root: {tmp_path / 'board-artifacts'}\n"
+        "runtime:\n  ignore_path_env_overrides: true\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CELLVISION_DATA_ROOT", str(tmp_path / "global-data"))
+    monkeypatch.setenv("CELLVISION_ARTIFACT_ROOT", str(tmp_path / "global-artifacts"))
+    config = load_config(path)
+    assert config["paths"]["data_root"] == str((tmp_path / "board-data").resolve())
+    assert config["paths"]["artifact_root"] == str((tmp_path / "board-artifacts").resolve())
+
+
 def test_missing_required_path_is_rejected(tmp_path: Path):
     path = tmp_path / "invalid.yaml"
     path.write_text("paths:\n  artifact_root: /artifacts\n", encoding="utf-8")
     with pytest.raises(ValueError, match="data_root"):
         load_config(path)
-

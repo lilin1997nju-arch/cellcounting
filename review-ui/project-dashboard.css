@@ -12,6 +12,7 @@ h2{font-size:22px}
 button{border:1px solid #c7d3d0;border-radius:8px;padding:10px 16px;font:inherit;cursor:pointer;background:#fff;color:#16464b}
 button:hover{filter:brightness(.98)}
 button.primary{background:#e3b341;color:#17383b;border-color:#e3b341;font-weight:700}
+button.primary:disabled{color:#17383b}
 button.secondary{background:#fff}
 .project-header a.secondary{display:inline-flex;align-items:center;justify-content:center;border:1px solid #c7d3d0;border-radius:8px;padding:10px 16px;font:inherit;cursor:pointer;background:#fff;color:#16464b;text-decoration:none}
 .project-header a.secondary:hover{text-decoration:none;filter:brightness(.98)}

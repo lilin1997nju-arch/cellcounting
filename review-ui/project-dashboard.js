@@ -3,6 +3,7 @@ let analysis = null;
 const projectId = document.querySelector('meta[name="project-id"]')?.content || "";
 let projectData = null;
 let taskNameAutoValue = "";
+let projectDataPollTimer = null;
 
 if (projectId) {
   const multiplicityLink = $("multiplicityReviewLink");
@@ -182,6 +183,40 @@ async function api(url, options) {
   return response.json();
 }
 
+async function exportProjectResults() {
+  const button = $("exportResultsButton");
+  if (!button || button.disabled) return;
+  button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = "正在导出…";
+  try {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    const response = await fetch(`/api/project/export-results${query}`);
+    if (!response.ok) throw new Error(await response.text());
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+    const filename = encodedName
+      ? decodeURIComponent(encodedName)
+      : plainName || `${projectData?.project_name || "项目任务"}_检测结果.xlsx`;
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    toast("检测结果 Excel 已导出");
+  } catch (error) {
+    toast(`导出失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
 function summaryCard(label, value) {
   return `<div class="summary-card"><span>${label}</span><strong>${count(value).toLocaleString()}</strong></div>`;
 }
@@ -266,13 +301,18 @@ function renderProject(data) {
   }));
 }
 
-async function loadProject() {
+async function loadProject({ silent = false } = {}) {
   try {
     renderProject(await api(`/api/project${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`));
     await loadTasks();
-    startTaskPolling();
+    if (projectDataPollTimer) clearInterval(projectDataPollTimer);
+    projectDataPollTimer = setInterval(() => {
+      if (document.visibilityState === "visible" && !$("taskDialog")?.open) {
+        loadProject({ silent: true }).catch(() => {});
+      }
+    }, 5000);
   } catch (error) {
-    toast(`加载失败：${error.message}`);
+    if (!silent) toast(`加载失败：${error.message}`);
   }
 }
 
@@ -297,6 +337,7 @@ async function loadTasks({ silent = false } = {}) {
     document.querySelectorAll("[data-task-action]").forEach(button => {
       button.addEventListener("click", handleTaskAction);
     });
+    updateTaskPolling(tasks);
   } catch (error) {
     if (!silent) throw error;
   } finally {
@@ -304,13 +345,25 @@ async function loadTasks({ silent = false } = {}) {
   }
 }
 
-function startTaskPolling() {
+function updateTaskPolling(tasks) {
   if (taskPollTimer) clearInterval(taskPollTimer);
+  taskPollTimer = null;
+  const shouldPoll = Array.isArray(tasks) && tasks.some(task =>
+    ["queued", "running"].includes(String(task.status || "queued"))
+  );
+  if (!shouldPoll) return;
   taskPollTimer = setInterval(() => {
-    if (document.visibilityState === "hidden") return;
+    if (document.visibilityState === "hidden" || $("taskDialog")?.open) return;
     loadTasks({ silent: true });
   }, 2500);
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    loadProject({ silent: true });
+    loadTasks({ silent: true });
+  }
+});
 
 function showAnalysis(value) {
   analysis = value;
@@ -382,6 +435,7 @@ async function deleteEmptyProject() {
 }
 
 $("refreshButton").addEventListener("click", loadProject);
+$("exportResultsButton").addEventListener("click", exportProjectResults);
 $("renameProjectButton").addEventListener("click", () => {
   $("projectNameInput").value = projectData?.project_name || $("projectName").textContent || "";
   $("projectNameDialog").showModal();

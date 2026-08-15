@@ -12,6 +12,7 @@ import json
 import os
 import queue
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -24,6 +25,7 @@ import pandas as pd
 import yaml
 
 from .runtime import ComputeRuntime, detect_compute_runtime
+from .project_catalog import ProjectCatalog, catalog_path_for_manifest
 from .session_index import parse_sessions_index
 from .task_queue import TaskQueueStore
 
@@ -124,6 +126,7 @@ class ProjectTaskWorker:
         requested_device: str | None = None,
         worker_id: str | None = None,
         runtime_path: str | Path | None = None,
+        catalog_path: str | Path | None = None,
         executor: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ):
         self.store = store
@@ -133,6 +136,11 @@ class ProjectTaskWorker:
             Path(runtime_path).expanduser().resolve()
             if runtime_path
             else self.store.path.parent / "worker_runtime.json"
+        )
+        self.catalog = ProjectCatalog(
+            catalog_path
+            if catalog_path is not None
+            else self.store.path.parent / "project_catalog.sqlite"
         )
         self.executor = executor or self.execute_project_task
         self._stop_event = threading.Event()
@@ -154,6 +162,7 @@ class ProjectTaskWorker:
             requested_device=requested_device,
             worker_id=worker_id,
             runtime_path=queue_path.parent / "worker_runtime.json",
+            catalog_path=catalog_path_for_manifest(manifest),
         )
 
     def _write_runtime(
@@ -236,29 +245,69 @@ class ProjectTaskWorker:
             return None
 
         task_id = str(task["task_id"])
+        self._sync_catalog_task(task)
         self._write_runtime("running", task=task)
         try:
             result = self.executor(task) or {}
         except TaskCancelledError:
             current = self.store.get(task_id)
             self._mark_project_manifest(task, "cancelled")
+            self._sync_catalog_task(current or task, source="task_cancelled")
             self._write_runtime("idle", last_task_id=task_id)
             return current
         except Exception as exc:  # keep the worker alive for the next task
             error = f"{type(exc).__name__}: {exc}"
             self._mark_project_manifest(task, "error", error=error)
             failed = self.store.fail(task_id, error)
+            self._sync_catalog_task(failed or task, source="task_failed")
             self._write_runtime("idle", last_task_id=task_id)
             return failed
 
         current = self.store.get(task_id)
         if current is not None and str(current.get("status")) == "cancelled":
             self._mark_project_manifest(task, "cancelled")
+            self._sync_catalog_task(current, source="task_cancelled")
             self._write_runtime("idle", last_task_id=task_id)
             return current
         completed = self.store.complete(task_id, result)
+        self._sync_catalog_task(completed or task, source="task_completed")
         self._write_runtime("idle", last_task_id=task_id)
         return completed
+
+    def _sync_catalog_task(
+        self,
+        task: dict[str, Any] | None,
+        *,
+        source: str = "task_progress",
+        force_manifest: bool = False,
+    ) -> None:
+        if not task:
+            return
+        try:
+            manifest_value = task.get("project_manifest")
+            if manifest_value:
+                manifest_path = _resolve(manifest_value)
+                if manifest_path.exists():
+                    self.catalog.sync_manifest(manifest_path, force=force_manifest, source=source)
+            self.catalog.sync_task(task)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, sqlite3.Error):
+            # Inference remains independent from the derived catalog.
+            return
+
+    def _update_progress(
+        self,
+        task_id: str,
+        current: int | float,
+        total: int | float | None = None,
+        *,
+        stage: str | None = None,
+        message: str | None = None,
+    ) -> dict[str, Any] | None:
+        updated = self.store.update_progress(
+            task_id, current, total, stage=stage, message=message
+        )
+        self._sync_catalog_task(updated)
+        return updated
 
     def _ensure_not_cancelled(self, task_id: str) -> dict[str, Any]:
         current = self.store.get(task_id)
@@ -343,13 +392,14 @@ class ProjectTaskWorker:
                 "elapsed_seconds": round(max(0.0, elapsed), 3),
                 "error": str(plate.get("error") or ""),
             })
-        self.store.update(
+        updated = self.store.update(
             task_id,
             progress_boards=rows,
             elapsed_seconds=_duration_seconds(task.get("started_at"))
             if str(task.get("status")) == "running"
             else float(task.get("elapsed_seconds", 0) or 0),
         )
+        self._sync_catalog_task(updated)
 
     def _child_env(self, task: dict[str, Any]) -> dict[str, str]:
         env = os.environ.copy()
@@ -470,7 +520,7 @@ class ProjectTaskWorker:
             raise FileNotFoundError(f"Project manifest not found: {manifest_path}")
         manifest = _read_json(manifest_path)
         if not isinstance(manifest.get("plates"), list) or not manifest.get("plates"):
-            self.store.update_progress(
+            self._update_progress(
                 task_id,
                 0,
                 int(task.get("group_count", 0) or 0),
@@ -484,8 +534,9 @@ class ProjectTaskWorker:
             raise RuntimeError("项目没有可执行的板子")
         total = len(plates)
         self._mark_project_manifest(task, "running")
+        self._sync_catalog_task(task, source="task_running", force_manifest=True)
         self._set_board_progress(task_id, plates)
-        self.store.update_progress(
+        self._update_progress(
             task_id,
             0,
             total,
@@ -499,7 +550,7 @@ class ProjectTaskWorker:
             board_id = _text(plate.get("board_id") or plate.get("slug"))
             if str(plate.get("status", "")).casefold() == "completed":
                 completed_count += 1
-                self.store.update_progress(
+                self._update_progress(
                     task_id,
                     completed_count,
                     total,
@@ -507,7 +558,7 @@ class ProjectTaskWorker:
                     message=f"{self.runtime.label} 已跳过已完成板 {board_id} ({index}/{total})",
                 )
                 continue
-            self.store.update_progress(
+            self._update_progress(
                 task_id,
                 completed_count,
                 total,
@@ -539,7 +590,7 @@ class ProjectTaskWorker:
             plates = [item for item in refreshed.get("plates", []) if isinstance(item, dict)]
             self._set_board_progress(task_id, plates)
             completed_count += 1
-            self.store.update_progress(
+            self._update_progress(
                 task_id,
                 completed_count,
                 total,
@@ -551,6 +602,11 @@ class ProjectTaskWorker:
         final_manifest["status"] = "completed"
         final_manifest["finished_at"] = _now()
         _atomic_json_write(manifest_path, final_manifest)
+        self._sync_catalog_task(
+            {**task, "project_manifest": str(manifest_path)},
+            source="project_completed",
+            force_manifest=True,
+        )
         return {
             "project_manifest": str(manifest_path),
             "device": self.runtime.as_dict(),
@@ -601,7 +657,7 @@ class ProjectTaskWorker:
                     active_stage=stage,
                     active_message=f"{board_id}：{stage}",
                 )
-                self.store.update_progress(
+                self._update_progress(
                     task_id,
                     float(self.store.get(task_id).get("progress_current", 0) or 0)
                     if self.store.get(task_id)
@@ -656,7 +712,7 @@ class ProjectTaskWorker:
         sessions.to_csv(sessions_csv, index=False, encoding="utf-8-sig")
         endpoint_dir = project_dir / "endpoint_screening"
         endpoint_dir.mkdir(parents=True, exist_ok=True)
-        self.store.update_progress(
+        self._update_progress(
             task_id,
             0,
             int(task.get("group_count", 0) or 0),
@@ -731,7 +787,12 @@ class ProjectTaskWorker:
                     "data_root": str(root),
                     "artifact_root": str(artifact_root),
                 },
-                "runtime": {"device": self.runtime.selected_device},
+                "runtime": {
+                    "device": self.runtime.selected_device,
+                    # Preserve the per-board paths written above when the
+                    # production parent exports global root defaults.
+                    "ignore_path_env_overrides": True,
+                },
                 "experiment": {
                     "experiment_id": f"{group_id} full project",
                     "plate_id": f"{project_id}_{board_id}",
@@ -811,7 +872,12 @@ class ProjectTaskWorker:
             "last_updated_at": _now(),
         })
         _atomic_json_write(manifest_path, project)
-        self.store.update_progress(
+        self._sync_catalog_task(
+            {**task, "project_manifest": str(manifest_path)},
+            source="project_prepared",
+            force_manifest=True,
+        )
+        self._update_progress(
             task_id,
             0,
             len(plates),

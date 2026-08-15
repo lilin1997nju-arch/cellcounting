@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from tempfile import NamedTemporaryFile
 from threading import RLock
 from collections import OrderedDict
 from datetime import datetime, timezone
@@ -27,12 +28,14 @@ from typing import Any
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, Response
+from starlette.background import BackgroundTask
+from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageEnhance
 from pydantic import BaseModel, Field
 
 from .config import PROJECT_ROOT, artifact_path, load_config
+from .project_catalog import ProjectCatalog, catalog_path_for_manifest
 from .multiplicity import (
     ensure_multiplicity_table,
     multiplicity_queue,
@@ -385,6 +388,282 @@ def _plate_summary(plate: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_EXPORT_TIMEPOINTS = ("T0", "T1", "T2")
+_EXPORT_COUNT_LABELS = (
+    ("single", "单细胞个数"),
+    ("touching_doublet", "双细胞个数"),
+    ("cluster_3plus", "多细胞个数"),
+)
+_EXPORT_CATEGORY_LABELS = {
+    "positive_control": "阳性对照",
+    "no_obvious_growth": "无明显生长",
+    "single_cell_origin": "单细胞来源",
+    "multi_cell_origin": "多细胞来源",
+    "undetermined": "待确定",
+}
+
+
+def _export_number(value: Any, default: int = 0) -> int:
+    """Return a finite, non-negative integer for a cell-count field."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not pd.notna(number):
+        return default
+    return max(0, int(round(number)))
+
+
+def _export_text(value: Any) -> str:
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip()
+    return "" if text.casefold() in {"nan", "none"} else text
+
+
+def _export_well_sort_key(well: Any) -> tuple[int, int, str]:
+    value = _export_text(well).upper()
+    match = re.match(r"^([A-Z]+)(\d+)$", value)
+    if match:
+        return (ord(match.group(1)[0]) - ord("A"), int(match.group(2)), value)
+    return (99, 99, value)
+
+
+def _export_read_csv(path: Path | None) -> pd.DataFrame:
+    if path is None or not path.exists():
+        return pd.DataFrame()
+    try:
+        return pd.read_csv(path, low_memory=False)
+    except (OSError, ValueError, pd.errors.ParserError):
+        return pd.DataFrame()
+
+
+def _export_reference_path(value: Any, base: Path) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
+def _export_plate_csv_paths(plate: dict[str, Any], manifest_path: Path) -> tuple[Path | None, Path | None]:
+    base = manifest_path.parent
+    artifact_root = _export_reference_path(plate.get("artifact_root"), base)
+    gated_root = _export_reference_path(plate.get("gated_output_dir"), base)
+    report = _export_reference_path(plate.get("report_json"), base)
+    if report is None and gated_root is not None:
+        report = gated_root / "plate_overview.json"
+    if report is None and artifact_root is not None:
+        report = artifact_root / "gated" / "plate_overview.json"
+    report_csv = report.with_suffix(".csv") if report is not None else None
+    if report_csv is None or not report_csv.exists():
+        report_csv = gated_root / "plate_overview.csv" if gated_root is not None else None
+    screening_csv = (
+        artifact_root / "predictions" / "latest_well_screening.csv"
+        if artifact_root is not None
+        else None
+    )
+    return report_csv, screening_csv
+
+
+def _export_count_columns(objects: pd.DataFrame) -> dict[tuple[str, str], int]:
+    """Count final per-object multiplicity labels by timepoint.
+
+    The screening table stores only weighted cell units.  The object table has
+    the final ``screen_label``/``predicted_multiplicity`` values needed to
+    distinguish one single, one doublet and one 3+ cluster.
+    """
+
+    counts: dict[tuple[str, str], int] = {}
+    if objects.empty or "well" not in objects.columns or "timepoint" not in objects.columns:
+        return counts
+    frame = objects.copy()
+    label_column = "screen_label" if "screen_label" in frame.columns else "integrated_label"
+    if label_column not in frame.columns:
+        return counts
+    frame["_export_label"] = frame[label_column].map(_export_text).str.lower()
+    frame["_export_timepoint"] = frame["timepoint"].map(_export_text).str.upper()
+    frame["_export_well"] = frame["well"].map(_export_text).str.upper()
+    frame = frame[frame["_export_timepoint"].isin(_EXPORT_TIMEPOINTS)]
+    frame = frame[frame["_export_label"].isin({key for key, _ in _EXPORT_COUNT_LABELS})]
+    if frame.empty:
+        return counts
+    grouped = frame.groupby(["_export_well", "_export_timepoint", "_export_label"], sort=False).size()
+    for (well, timepoint, label), value in grouped.items():
+        counts[(str(well), f"{timepoint}:{label}")] = int(value)
+    return counts
+
+
+def _export_project_rows(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    *,
+    task_name: str | None = None,
+    category_overrides: dict[tuple[str, str], str] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Build one flat row per well across every board in a project."""
+
+    project_name = (
+        _export_text(task_name)
+        or _export_text(manifest.get("project_name"))
+        or _export_text(manifest.get("project_id"))
+        or manifest_path.parent.name
+    )
+    category_overrides = category_overrides or {}
+    rows: list[dict[str, Any]] = []
+    warnings: dict[str, int] = {}
+    for plate in manifest.get("plates", []):
+        if not isinstance(plate, dict):
+            continue
+        board_name = _export_text(plate.get("board_id")) or _export_text(
+            plate.get("group_id")
+        ) or _export_text(plate.get("slug"))
+        report_path, screening_path = _export_plate_csv_paths(plate, manifest_path)
+        report = _export_read_csv(report_path)
+        screening = _export_read_csv(screening_path)
+        if report.empty and screening.empty:
+            warnings["missing_result_files"] = warnings.get("missing_result_files", 0) + 1
+            continue
+
+        object_path = (
+            screening_path.parent / "latest_screening_objects.csv"
+            if screening_path is not None
+            else None
+        )
+        object_counts = _export_count_columns(_export_read_csv(object_path))
+        report_rows = {
+            _export_text(row.get("well")).upper(): row
+            for row in report.to_dict(orient="records")
+            if _export_text(row.get("well"))
+        }
+        screening_rows = {
+            _export_text(row.get("well")).upper(): row
+            for row in screening.to_dict(orient="records")
+            if _export_text(row.get("well"))
+        }
+        wells = sorted(set(report_rows) | set(screening_rows), key=_export_well_sort_key)
+        if not wells:
+            warnings["empty_result_files"] = warnings.get("empty_result_files", 0) + 1
+            continue
+        for well in wells:
+            report_row = report_rows.get(well, {})
+            screening_row = screening_rows.get(well, {})
+            override_category = _export_text(
+                category_overrides.get(
+                    (str(plate.get("slug") or plate.get("board_id") or ""), well)
+                )
+            )
+            category = (
+                override_category
+                or _export_text(report_row.get("final_category"))
+                or _export_text(report_row.get("category_code"))
+            )
+            conclusion = (
+                _EXPORT_CATEGORY_LABELS.get(category, "")
+                if override_category
+                else _export_text(report_row.get("final_category_label"))
+            ) or _EXPORT_CATEGORY_LABELS.get(category, "") or _export_text(
+                screening_row.get("screening_status")
+            )
+            output: dict[str, Any] = {
+                "任务名称": project_name,
+                "板子名称": board_name,
+                "孔号": well,
+                "孔结论": conclusion,
+            }
+            for timepoint in _EXPORT_TIMEPOINTS:
+                for label_key, label in _EXPORT_COUNT_LABELS:
+                    output[f"{timepoint}{label}"] = object_counts.get(
+                        (well, f"{timepoint}:{label_key}"), 0
+                    )
+                weighted = _export_number(
+                    screening_row.get(f"{timepoint.lower()}_cell_units")
+                )
+                # If an older result set has no object table, retain the
+                # persisted weighted units as a useful fallback total.
+                count_total = (
+                    output[f"{timepoint}单细胞个数"]
+                    + output[f"{timepoint}双细胞个数"] * 2
+                    + output[f"{timepoint}多细胞个数"] * 3
+                )
+                has_object_counts = any(
+                    key[0] == well and key[1].startswith(f"{timepoint}:")
+                    for key in object_counts
+                )
+                output[f"{timepoint}推测细胞总数"] = count_total if has_object_counts else weighted
+            rows.append(output)
+    return rows, warnings
+
+
+def _write_project_result_excel(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    destination: Path,
+    *,
+    task_name: str | None = None,
+    category_overrides: dict[tuple[str, str], str] | None = None,
+) -> dict[str, Any]:
+    import openpyxl
+
+    rows, warnings = _export_project_rows(
+        manifest,
+        manifest_path,
+        task_name=task_name,
+        category_overrides=category_overrides,
+    )
+    columns = ["任务名称", "板子名称", "孔号", "孔结论"] + [
+        field
+        for timepoint in _EXPORT_TIMEPOINTS
+        for field in (
+            *(f"{timepoint}{label}" for _, label in _EXPORT_COUNT_LABELS),
+            f"{timepoint}推测细胞总数",
+        )
+    ]
+    frame = pd.DataFrame(rows, columns=columns)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(destination, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name="检测结果")
+        worksheet = writer.sheets["检测结果"]
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        worksheet.sheet_view.showGridLines = False
+        header_fill = "0E3439"
+        header_font = "FFFFFF"
+        for cell in worksheet[1]:
+            cell.fill = openpyxl.styles.PatternFill("solid", fgColor=header_fill)
+            cell.font = openpyxl.styles.Font(color=header_font, bold=True)
+            cell.alignment = openpyxl.styles.Alignment(horizontal="center", vertical="center")
+        for column_cells in worksheet.columns:
+            column_letter = column_cells[0].column_letter
+            max_length = max(len(str(cell.value or "")) for cell in column_cells)
+            worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 24)
+        worksheet.row_dimensions[1].height = 28
+        for row in worksheet.iter_rows(min_row=2, min_col=5):
+            for cell in row:
+                cell.number_format = "0"
+    return {"row_count": len(frame), "board_count": len(manifest.get("plates", [])), "warnings": warnings}
+
+
+def _export_filename(value: Any) -> str:
+    name = _export_text(value) or "项目任务"
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip(" .")
+    return f"{name or '项目任务'}_检测结果.xlsx"
+
+
+def _remove_export_file(path: str) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 class FolderPayload(BaseModel):
     path: str = Field(min_length=1)
 
@@ -721,10 +1000,12 @@ class _LazyPlateApp:
         config_path: Path,
         project_back_url: str = "",
         review_base_url: str = "",
+        catalog_context: dict[str, Any] | None = None,
     ):
         self.config_path = config_path
         self.project_back_url = project_back_url
         self.review_base_url = review_base_url.rstrip("/")
+        self.catalog_context = dict(catalog_context or {})
         self._app = None
         self._error: str | None = None
         self._lock = asyncio.Lock()
@@ -764,9 +1045,12 @@ class _LazyPlateApp:
                 try:
                     # Review-app creation performs synchronous image/database
                     # discovery.  Keep that work off the event loop.
+                    config = load_config(self.config_path)
+                    if self.catalog_context:
+                        config["_catalog_context"] = dict(self.catalog_context)
                     self._app = await asyncio.to_thread(
                         create_app,
-                        load_config(self.config_path),
+                        config,
                         project_back_url=self.project_back_url,
                         review_base_url=self.review_base_url,
                     )
@@ -923,6 +1207,13 @@ class _PlateReviewManager:
             return None, "project or plate not found"
         canonical_project, config_path, _ = resolved
         canonical_plate = _slug(plate_slug)
+        catalog_manifest = _find_project_manifest(self.root_manifest, canonical_project)
+        catalog_context = {
+            "catalog_path": str(catalog_path_for_manifest(self.root_manifest)),
+            "manifest_path": str(catalog_manifest) if catalog_manifest else "",
+            "project_id": canonical_project,
+            "plate_slug": canonical_plate,
+        }
         key = (canonical_project, canonical_plate)
         async with self._lock:
             app = self._apps.get(key)
@@ -931,6 +1222,7 @@ class _PlateReviewManager:
                     config_path,
                     project_back_url=f"/projects/{_slug(canonical_project)}/",
                     review_base_url=f"/projects/{_slug(canonical_project)}/plates/{canonical_plate}",
+                    catalog_context=catalog_context,
                 )
                 self._apps[key] = app
             else:
@@ -943,6 +1235,7 @@ class _PlateReviewManager:
                         config_path,
                         project_back_url=f"/projects/{_slug(canonical_project)}/",
                         review_base_url=f"/projects/{_slug(canonical_project)}/plates/{canonical_plate}",
+                        catalog_context=catalog_context,
                     )
                     self._apps[key] = app
             self._apps.move_to_end(key)
@@ -1026,6 +1319,64 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     app.mount("/project-assets", StaticFiles(directory=ui_root), name="project-assets")
     queue_file = _queue_path(manifest_file)
     queue_store = TaskQueueStore(queue_file)
+    catalog = ProjectCatalog(catalog_path_for_manifest(manifest_file))
+    catalog_refresh_lock = RLock()
+    catalog_refreshed_at = 0.0
+
+    def refresh_catalog(*, force: bool = False) -> None:
+        """Refresh changed manifests/reports before serving project metadata."""
+
+        nonlocal catalog_refreshed_at
+        now = time.monotonic()
+        if not force and now - catalog_refreshed_at < 1.0:
+            return
+        with catalog_refresh_lock:
+            now = time.monotonic()
+            if not force and now - catalog_refreshed_at < 1.0:
+                return
+            try:
+                catalog.reconcile_all(manifest_file)
+                catalog_refreshed_at = now
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                # Keep the legacy manifest response available if a catalog
+                # file is temporarily locked or an optional report is bad.
+                return
+
+    def sync_task_catalog(task: dict[str, Any] | None) -> None:
+        if not task:
+            return
+        try:
+            catalog.sync_task(task)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            return
+
+    def sync_catalog_review(
+        selected_manifest: Path,
+        plate_slug: str | None = None,
+        *,
+        wells: set[str] | list[str] | tuple[str, ...] | None = None,
+        source: str = "human_review",
+        reviewer: str = "",
+        operation: str = "review_save",
+    ) -> None:
+        """Project-level review endpoints share the same catalog contract."""
+
+        selected_value = _read_manifest(selected_manifest) or {}
+        selected_project_id = str(selected_value.get("project_id") or selected_manifest.parent.name)
+        try:
+            if plate_slug:
+                catalog.sync_review_update(
+                    selected_manifest,
+                    f"{selected_project_id}:{_slug(plate_slug)}",
+                    wells=wells,
+                    source=source,
+                    reviewer=reviewer,
+                    operation=operation,
+                )
+            else:
+                catalog.sync_manifest(selected_manifest, force=True, source=source)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            return
 
     def manifest_for_project(project_id: str | None = None) -> Path:
         """Resolve the manifest that owns a project-scoped API request."""
@@ -1042,9 +1393,195 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
 
         return TaskQueueStore(_queue_path(selected_manifest))
 
+    def task_plan_paths() -> list[Path]:
+        """Find task plans written before queues became project-scoped.
+
+        The first project-hub implementation kept plans beside the startup
+        project's queue.  Later versions moved each queue beside its project
+        manifest.  Plans are small metadata files, so scanning only the
+        project directories (rather than image/artifact trees) is cheap and
+        keeps those older tasks recoverable.
+        """
+
+        paths: list[Path] = []
+        seen: set[Path] = set()
+        for selected_manifest in _project_manifest_paths(manifest_file):
+            plan_dir = selected_manifest.parent / "task_plans"
+            if not plan_dir.is_dir():
+                continue
+            for plan_path in plan_dir.glob("*.json"):
+                if not plan_path.is_file():
+                    continue
+                if task_plan_deleted_marker(plan_path).exists():
+                    continue
+                resolved = plan_path.resolve()
+                if resolved in seen:
+                    continue
+                seen.add(resolved)
+                paths.append(resolved)
+        return sorted(paths, key=lambda path: path.as_posix().casefold())
+
+    def task_plan_deleted_marker(plan_path: Path) -> Path:
+        """Return the durable tombstone used when a legacy task is deleted."""
+
+        return plan_path.with_name(f"{plan_path.name}.deleted")
+
+    def mark_task_plan_deleted(task: dict[str, Any] | None) -> None:
+        """Prevent a deleted legacy plan from being imported again."""
+
+        if not task:
+            return
+        plan_value = str(task.get("plan_path") or "")
+        if not plan_value:
+            return
+        plan_path = _resolve(plan_value)
+        if plan_path.suffix.casefold() != ".json" or plan_path.parent.name != "task_plans":
+            return
+        try:
+            _write_json_atomic(
+                task_plan_deleted_marker(plan_path),
+                {
+                    "task_id": str(task.get("task_id") or plan_path.stem),
+                    "deleted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+        except OSError:
+            # Removing the queue row is still useful even if a read-only plan
+            # directory prevents the compatibility tombstone from being made.
+            return
+
+    def task_plan_manifest(plan: dict[str, Any], plan_path: Path) -> Path:
+        """Resolve the best project manifest for a legacy task plan."""
+
+        explicit = plan.get("project_manifest")
+        if explicit:
+            candidate = _resolve(str(explicit))
+            if candidate.is_file():
+                return candidate
+        task_key = str(plan.get("task_id") or "")
+        if task_key:
+            for candidate in _project_manifest_paths(manifest_file):
+                value = _read_manifest(candidate) or {}
+                if str(value.get("task_id") or "") == task_key:
+                    return candidate
+        owner = plan_path.parent.parent / "project.json"
+        if owner.is_file():
+            return owner.resolve()
+        return manifest_file
+
+    def legacy_task_from_plan(plan_path: Path, plan: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert an old plan-only record into the current task shape."""
+
+        if task_plan_deleted_marker(plan_path).exists():
+            return None
+        task_key = str(plan.get("task_id") or "")
+        if not task_key:
+            return None
+        selected_manifest = task_plan_manifest(plan, plan_path)
+        selected_value = _read_manifest(selected_manifest) or {}
+        manifest_task_matches = str(selected_value.get("task_id") or "") == task_key
+        sessions = [item for item in plan.get("sessions", []) if isinstance(item, dict)]
+        group_ids = {
+            str(item.get("group_id"))
+            for item in sessions
+            if item.get("group_id")
+        }
+        timepoint_labels = sorted({
+            str(item.get("timepoint_label"))
+            for item in sessions
+            if item.get("timepoint_label")
+        })
+        day_labels = sorted({
+            str(item.get("day_label"))
+            for item in sessions
+            if item.get("day_label")
+        })
+        status = str(plan.get("status") or "")
+        if not status and manifest_task_matches:
+            status = str(selected_value.get("status") or "")
+        status = status or "queued"
+        project_id = str(
+            plan.get("project_id")
+            or (selected_value.get("project_id") if selected_value else "")
+            or selected_manifest.parent.name
+        )
+        project_name = str(
+            plan.get("project_name")
+            or (selected_value.get("project_name") if selected_value else "")
+            or project_id
+        )
+        group_count = int(plan.get("group_count", 0) or len(group_ids))
+        record: dict[str, Any] = {
+            "task_id": task_key,
+            "name": str(plan.get("name") or project_name or task_key),
+            "project_name": project_name,
+            "created_by": str(
+                plan.get("created_by")
+                or selected_value.get("created_by")
+                or selected_value.get("creator")
+                or selected_value.get("owner")
+                or ""
+            ),
+            "path": str(plan.get("root") or selected_value.get("root") or ""),
+            "index": str(plan.get("index") or ""),
+            "status": status,
+            "created_at": str(
+                plan.get("created_at")
+                or selected_value.get("created_at")
+                or selected_value.get("generated_at")
+                or ""
+            ),
+            "updated_at": str(plan.get("updated_at") or plan.get("created_at") or ""),
+            "group_count": group_count,
+            "session_count": int(plan.get("session_count", 0) or len(sessions)),
+            "timepoint_labels": timepoint_labels,
+            "day_labels": day_labels,
+            "timepoint_options": plan.get("timepoint_options", []),
+            "selected_timepoint_labels": list(plan.get("selected_timepoint_labels", [])),
+            "endpoint_day_label": plan.get("endpoint_day_label"),
+            "endpoint_day_number": plan.get("endpoint_day_number"),
+            "endpoint_timepoint_labels": list(plan.get("endpoint_timepoint_labels", [])),
+            "early_timepoint_labels": list(plan.get("early_timepoint_labels", [])),
+            "plan_path": str(plan_path),
+            "project_id": project_id,
+            "project_manifest": str(selected_manifest),
+        }
+        if status == "completed":
+            record.update({
+                "progress_current": group_count,
+                "progress_total": group_count,
+                "progress_percent": 100,
+                "progress_stage": "completed",
+            })
+        return record
+
+    def migrate_legacy_task_plans() -> None:
+        """Restore queue entries that only exist as legacy task plans."""
+
+        for plan_path in task_plan_paths():
+            plan = _read_manifest(plan_path)
+            if plan is None:
+                continue
+            task = legacy_task_from_plan(plan_path, plan)
+            if task is None:
+                continue
+            # A legacy plan lived beside the old startup queue.  Once its
+            # owning manifest is known, place the recovered record beside
+            # that manifest so a project-scoped worker uses the same queue as
+            # the browser lifecycle endpoints.  This only adds a projection;
+            # the original plan and source artifacts are left untouched.
+            queue_owner_value = str(task.get("project_manifest") or "")
+            queue_owner = _resolve(queue_owner_value) if queue_owner_value else Path()
+            if not queue_owner.is_file():
+                queue_owner = plan_path.parent.parent / "project.json"
+            legacy_queue = TaskQueueStore(queue_owner.parent / "task_queue.json")
+            restored = legacy_queue.ensure(task)
+            sync_task_catalog(restored)
+
     def task_store_entries() -> list[tuple[Path, TaskQueueStore]]:
         """Return all project stores, including legacy records in the main store."""
 
+        migrate_legacy_task_plans()
         entries: list[tuple[Path, TaskQueueStore]] = []
         seen: set[Path] = set()
         for selected_manifest in _project_manifest_paths(manifest_file):
@@ -1057,11 +1594,52 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             entries.append((manifest_file, queue_store))
         return entries
 
+    def remove_task_from_all_queues(task_id_value: str) -> bool:
+        """Remove every physical copy of a task from all known queues."""
+
+        removed = False
+        for _, other_store in task_store_entries():
+            if other_store.delete(task_id_value) is not None:
+                removed = True
+        return removed
+
     def tasks_for_project(project_id: str | None = None) -> list[dict[str, Any]]:
         """Read one project's queue, or a de-duplicated hub-wide view."""
 
         if project_id:
-            return task_store_for_manifest(manifest_for_project(project_id)).list()
+            selected_manifest = manifest_for_project(project_id).resolve()
+            selected_value = _read_manifest(selected_manifest) or {}
+            selected_project_id = _slug(
+                str(selected_value.get("project_id") or selected_manifest.parent.name)
+            )
+            values: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for owner_manifest, store in task_store_entries():
+                for task in store.list():
+                    task_manifest = str(task.get("project_manifest") or "")
+                    task_project_id = _slug(str(task.get("project_id") or ""))
+                    has_task_identity = bool(task_project_id or task_manifest)
+                    belongs = (
+                        (
+                            task_project_id == selected_project_id
+                            or (
+                                task_manifest
+                                and _resolve(task_manifest).resolve() == selected_manifest
+                            )
+                        )
+                        if has_task_identity
+                        else owner_manifest.resolve() == selected_manifest
+                    )
+                    if not belongs:
+                        continue
+                    key = str(task.get("task_id") or "")
+                    if key and key in seen_ids:
+                        continue
+                    if key:
+                        seen_ids.add(key)
+                    values.append(task)
+                    sync_task_catalog(task)
+            return values
         values: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
         for _, store in task_store_entries():
@@ -1072,6 +1650,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 if key:
                     seen_ids.add(key)
                 values.append(task)
+                sync_task_catalog(task)
         return values
 
     def locate_task(task_id_value: str) -> tuple[TaskQueueStore, dict[str, Any]] | None:
@@ -1308,7 +1887,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         if selected_config is None or selected_database is None:
             raise HTTPException(status_code=503, detail="mask review is unavailable")
         try:
-            return save_mask_review(
+            result = save_mask_review(
                 selected_config,
                 selected_database,
                 round_id=payload.round_id,
@@ -1318,6 +1897,13 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 reviewer=payload.reviewer,
                 notes=payload.notes,
             )
+            sync_catalog_review(
+                manifest_for_project(project_id) if project_id else manifest_file,
+                source="mask_review",
+                reviewer=payload.reviewer,
+                operation="mask_review_save",
+            )
+            return result
         except (FileNotFoundError, ValueError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1595,6 +2181,14 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             )
             saved += int(count)
             by_plate[slug] = int(count)
+            sync_catalog_review(
+                manifest_for_project(project_id) if project_id else manifest_file,
+                slug,
+                wells={str(item.get("well") or "").upper() for item in items if item.get("well")},
+                source="multiplicity_review",
+                reviewer=payload.reviewer,
+                operation="multiplicity_review_save",
+            )
         return {"status": "saved", "saved": saved, "by_plate": by_plate}
 
     @app.delete("/api/multiplicity-training-labels/{plate_slug}/{candidate_id}")
@@ -1653,6 +2247,24 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "project_count": len(_project_manifest_paths(manifest_file)),
         }
 
+    @app.get("/api/catalog/status")
+    def catalog_status() -> dict[str, Any]:
+        refresh_catalog(force=True)
+        return catalog.status()
+
+    @app.get("/api/project/catalog-wells")
+    def project_catalog_wells(
+        project_id: str,
+        plate_slug: str,
+        category: str | None = None,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        selected_manifest = manifest_for_project(project_id)
+        selected_value = _read_manifest(selected_manifest) or {}
+        selected_project_id = str(selected_value.get("project_id") or selected_manifest.parent.name)
+        plate_id = f"{selected_project_id}:{_slug(plate_slug)}"
+        return catalog.list_wells(plate_id, category=category, limit=limit)
+
     @app.get("/api/ready")
     def ready() -> dict[str, Any]:
         """Readiness probe for a reverse proxy or service manager."""
@@ -1672,11 +2284,41 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         }
 
     @app.get("/api/projects")
-    def projects() -> list[dict[str, Any]]:
-        return [_project_card(path) for path in _project_manifest_paths(manifest_file)]
+    def projects(
+        q: str = "",
+        page: int = 1,
+        page_size: int = 10,
+    ) -> dict[str, Any]:
+        refresh_catalog()
+        try:
+            return catalog.list_projects(query=q, page=page, page_size=page_size)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            values = [_project_card(path) for path in _project_manifest_paths(manifest_file)]
+            needle = q.strip().casefold()
+            if needle:
+                values = [
+                    item for item in values
+                    if needle in json.dumps(item, ensure_ascii=False).casefold()
+                ]
+            safe_page_size = max(1, min(100, int(page_size or 10)))
+            safe_page = max(1, int(page or 1))
+            pages = max(1, (len(values) + safe_page_size - 1) // safe_page_size)
+            safe_page = min(safe_page, pages)
+            start = (safe_page - 1) * safe_page_size
+            return {
+                "items": values[start : start + safe_page_size],
+                "page": safe_page,
+                "page_size": safe_page_size,
+                "total": len(values),
+                "pages": pages,
+                "query": q,
+                "aggregate": {"project_count": len(values)},
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
     @app.get("/api/project")
     def project(project_id: str | None = None) -> dict[str, Any]:
+        refresh_catalog()
         selected_manifest = manifest
         selected_path = manifest_file
         if project_id:
@@ -1690,8 +2332,26 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                     break
             else:
                 raise HTTPException(status_code=404, detail="project not found")
-        plates = [_plate_summary(item) for item in selected_manifest.get("plates", [])]
         selected_project_id = str(selected_manifest.get("project_id") or selected_path.parent.name)
+        try:
+            catalog_detail = catalog.project_detail(selected_project_id)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            catalog_detail = None
+        if catalog_detail is not None and catalog_detail.get("plates"):
+            catalog_plates = catalog_detail["plates"]
+            mounted = [
+                str(item.get("plate_slug"))
+                for item in catalog_plates
+                if review_manager.resolve_plate(selected_project_id, str(item.get("plate_slug"))) is not None
+            ]
+            return {
+                **catalog_detail,
+                "root": selected_manifest.get("root"),
+                "mounted_plates": mounted,
+                "detection_start_date": _project_detection_dates(selected_manifest)[0],
+                "detection_end_date": _project_detection_dates(selected_manifest)[1],
+            }
+        plates = [_plate_summary(item) for item in selected_manifest.get("plates", [])]
         selected_mounted = [
             str(item.get("slug") or _slug(item.get("board_id", "")))
             for item in selected_manifest.get("plates", [])
@@ -1727,6 +2387,80 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             ),
             "generated_at": selected_manifest.get("generated_at"),
         }
+
+    @app.get("/api/project/export-results")
+    def export_project_results(project_id: str | None = None) -> FileResponse:
+        """Download one workbook containing every board's well-level results."""
+
+        selected_path = manifest_for_project(project_id)
+        selected_manifest = _read_manifest(selected_path)
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        selected_project_id = str(
+            selected_manifest.get("project_id") or selected_path.parent.name
+        )
+
+        # A project can be renamed independently from the task that created it.
+        # Prefer the latest task label for the workbook's task-name column, then
+        # fall back to the project display name for legacy projects.
+        task_name = _export_text(selected_manifest.get("task_name"))
+        try:
+            task_values = task_store_for_manifest(selected_path).list()
+        except (OSError, TypeError, ValueError):
+            task_values = []
+        if task_values:
+            latest_task = max(
+                task_values,
+                key=lambda item: str(item.get("created_at") or item.get("updated_at") or ""),
+            )
+            task_name = _export_text(latest_task.get("name")) or task_name
+
+        category_overrides: dict[tuple[str, str], str] = {}
+        refresh_catalog(force=True)
+        for plate in selected_manifest.get("plates", []):
+            if not isinstance(plate, dict):
+                continue
+            slug = _export_text(plate.get("slug")) or _export_text(plate.get("board_id"))
+            if not slug:
+                continue
+            try:
+                catalog_rows = catalog.list_wells(
+                    f"{selected_project_id}:{slug}", limit=10000
+                )
+            except (OSError, sqlite3.Error, ValueError, TypeError):
+                catalog_rows = []
+            for row in catalog_rows:
+                well = _export_text(row.get("well")).upper()
+                category = _export_text(row.get("category_code"))
+                if well and category:
+                    category_overrides[(slug, well)] = category
+
+        temporary = NamedTemporaryFile(
+            prefix="cellvision-export-", suffix=".xlsx", delete=False
+        )
+        temporary_path = Path(temporary.name)
+        temporary.close()
+        try:
+            summary = _write_project_result_excel(
+                selected_manifest,
+                selected_path,
+                temporary_path,
+                task_name=task_name,
+                category_overrides=category_overrides,
+            )
+        except (OSError, ValueError, KeyError, ImportError) as exc:
+            _remove_export_file(str(temporary_path))
+            raise HTTPException(status_code=500, detail=f"导出检测结果失败：{exc}") from exc
+        if int(summary.get("row_count", 0)) == 0:
+            _remove_export_file(str(temporary_path))
+            raise HTTPException(status_code=404, detail="当前项目没有可导出的检测结果")
+        download_name = _export_filename(task_name or selected_manifest.get("project_name"))
+        return FileResponse(
+            temporary_path,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=download_name,
+            background=BackgroundTask(_remove_export_file, str(temporary_path)),
+        )
 
     @app.get("/api/project/tasks")
     def tasks(project_id: str | None = None) -> list[dict[str, Any]]:
@@ -1771,6 +2505,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         value["project_name"] = project_name
         value["renamed_at"] = datetime.now(timezone.utc).isoformat()
         _write_json_atomic(selected_path, value)
+        try:
+            catalog.sync_manifest(selected_path, force=True, source="project_renamed")
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            pass
         return {
             "status": "renamed",
             "project_id": str(value.get("project_id") or selected_path.parent.name),
@@ -1808,6 +2546,11 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             raise HTTPException(status_code=409, detail="关联任务正在运行或已完成，不能删除项目")
 
         selected_path.unlink(missing_ok=False)
+        selected_project_id = str(value.get("project_id") or project_id)
+        try:
+            catalog.mark_project_deleted(selected_project_id)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            pass
         deleted_tasks: list[str] = []
         plan_root = (selected_path.parent / "task_plans").resolve()
         for task_store, task in related_entries:
@@ -1968,21 +2711,23 @@ public static class CellVisionWindowFocus
             "finally{[CellVisionWindowFocus]::Stop();$d.Dispose();$owner.Close();$owner.Dispose()}"
         )
         try:
-            # The review service is often started without an attached console
-            # (for example from a detached local launcher).  Explicitly ask
-            # PowerShell for a normal interactive window without creating a
-            # second console that could send a close event to the server.
+            # The picker is a GUI dialog; its PowerShell host must not create
+            # a console window of its own.  CREATE_NO_WINDOW covers launches
+            # from a console-less service, while SW_HIDE/Hidden also covers
+            # Windows PowerShell's normal startup-window behavior.
             startupinfo = subprocess.STARTUPINFO()
             startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            startupinfo.wShowWindow = getattr(subprocess, "SW_SHOWNORMAL", 1)
+            startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+            creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
             completed = subprocess.run(
                 [
                     "powershell.exe",
                     "-NoLogo",
                     "-NoProfile",
+                    "-NonInteractive",
                     "-STA",
                     "-WindowStyle",
-                    "Normal",
+                    "Hidden",
                     "-Command",
                     script,
                 ],
@@ -1991,6 +2736,7 @@ public static class CellVisionWindowFocus
                 timeout=120,
                 check=False,
                 startupinfo=startupinfo,
+                creationflags=creationflags,
             )
         except (OSError, subprocess.SubprocessError) as exc:
             print(
@@ -2107,7 +2853,13 @@ public static class CellVisionWindowFocus
             "project_id": project_id,
             "project_manifest": str(project_manifest_path),
         }
-        return task_store_for_manifest(project_manifest_path).add(task)
+        created = task_store_for_manifest(project_manifest_path).add(task)
+        try:
+            catalog.sync_manifest(project_manifest_path, force=True, source="task_created")
+            catalog.sync_task(created)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            pass
+        return created
 
     @app.get("/api/project/task-queue")
     def task_queue(project_id: str | None = None) -> dict[str, Any]:
@@ -2137,6 +2889,7 @@ public static class CellVisionWindowFocus
         started = store.start(task_id, worker_id="manual")
         if started is None:
             raise HTTPException(status_code=404, detail="task not found")
+        sync_task_catalog(started)
         return started
 
     @app.post("/api/project/tasks/{task_id}/cancel")
@@ -2152,6 +2905,7 @@ public static class CellVisionWindowFocus
                 detail=f"task cannot cancel from status {status}",
             )
         task = store.cancel(task_id)
+        sync_task_catalog(task or current)
         return task or current
 
     @app.delete("/api/project/tasks/{task_id}")
@@ -2165,9 +2919,18 @@ public static class CellVisionWindowFocus
             raise HTTPException(status_code=409, detail="completed tasks cannot be deleted")
         if status == "running":
             raise HTTPException(status_code=409, detail="cancel the running task before deleting it")
-        deleted = store.delete(task_id)
+        mark_task_plan_deleted(current)
+        deleted = store.get(task_id)
         if deleted is None:
             raise HTTPException(status_code=404, detail="task not found")
+        # A legacy task may have been projected into more than one queue while
+        # the service was upgraded.  Remove every copy so the next refresh
+        # cannot expose it again from a sibling queue.
+        remove_task_from_all_queues(task_id)
+        try:
+            catalog.delete_task(task_id)
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            pass
         return {"status": "deleted", "task": deleted}
 
     return app

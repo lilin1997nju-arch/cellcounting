@@ -1,6 +1,15 @@
 const $ = id => document.getElementById(id);
 let analysis = null;
 let taskNameAutoValue = "";
+const PROJECTS_PER_PAGE = 10;
+let allProjects = [];
+let projectPage = 1;
+let projectSearchTerm = "";
+let projectTotal = 0;
+let projectTotalPages = 1;
+let projectAggregate = null;
+let projectSearchTimer = null;
+let projectPollTimer = null;
 
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, character => ({
   "&": "&amp;",
@@ -203,19 +212,59 @@ function projectStatus(item) {
   return { label: "待识别", className: "pending" };
 }
 
-function renderProjects(items) {
-  const rows = $("projectRows");
-  $("projectCount").textContent = `${items.length} 个项目`;
+function filteredProjects() {
+  const term = projectSearchTerm.trim().toLocaleLowerCase();
+  if (!term) return allProjects;
+  return allProjects.filter(item => [
+    item.project_name,
+    item.project_id,
+    item.root,
+    item.created_by,
+    item.manifest_path,
+  ].some(value => String(value || "").toLocaleLowerCase().includes(term)));
+}
 
-  let boards = 0;
-  let recognized = 0;
-  items.forEach(item => {
-    boards += count(item.plate_count);
-    recognized += count(item.recognized_plate_count ?? item.completed_plate_count);
-  });
+function updateProjectPagination(totalItems = projectTotal, totalPages = projectTotalPages) {
+  const pagination = $("projectPagination");
+  if (!pagination) return;
+  pagination.hidden = totalItems <= PROJECTS_PER_PAGE;
+  $("projectPageInfo").textContent = `第 ${projectPage} / ${totalPages} 页 · 共 ${totalItems} 个`;
+  $("projectPrev").disabled = projectPage <= 1;
+  $("projectNext").disabled = projectPage >= totalPages;
+}
+
+function renderProjects(items, meta = {}) {
+  allProjects = Array.isArray(items) ? items : [];
+  const filtered = filteredProjects();
+  const serverPaged = Boolean(meta.serverPaged);
+  const totalItems = serverPaged ? Number(meta.total || 0) : filtered.length;
+  const totalPages = serverPaged
+    ? Math.max(1, Number(meta.pages || 1))
+    : Math.max(1, Math.ceil(filtered.length / PROJECTS_PER_PAGE));
+  projectTotal = totalItems;
+  projectTotalPages = totalPages;
+  projectAggregate = serverPaged ? (meta.aggregate || null) : null;
+  projectPage = Math.min(Math.max(1, projectPage), totalPages);
+  const start = (projectPage - 1) * PROJECTS_PER_PAGE;
+  items = serverPaged ? allProjects : filtered.slice(start, start + PROJECTS_PER_PAGE);
+  const rows = $("projectRows");
+  let boards = Number(projectAggregate?.plate_count || 0);
+  let recognized = Number(projectAggregate?.recognized_plate_count || 0);
+  if (!serverPaged) {
+    boards = 0;
+    recognized = 0;
+    filtered.forEach(item => {
+      boards += count(item.plate_count);
+      recognized += count(item.recognized_plate_count ?? item.completed_plate_count);
+    });
+  }
+  $("projectCount").textContent = `${totalItems} 个项目`;
+  $("projectFilterMeta").textContent = projectSearchTerm.trim()
+    ? `搜索到 ${totalItems} 个项目`
+    : `每页最多 ${PROJECTS_PER_PAGE} 个`;
 
   $("summaryCards").innerHTML = [
-    summaryCard("项目", items.length),
+    summaryCard("项目", totalItems),
     summaryCard("板子", boards),
     summaryCard("已完成识别板子", recognized),
     summaryCard("待处理板子", Math.max(0, boards - recognized)),
@@ -223,6 +272,7 @@ function renderProjects(items) {
 
   if (!items.length) {
     rows.innerHTML = `<tr><td colspan="6" class="empty">暂无项目，请新建任务。</td></tr>`;
+    updateProjectPagination(totalItems, totalPages);
     return;
   }
 
@@ -253,6 +303,7 @@ function renderProjects(items) {
     if (event.target.closest("a, button")) return;
     window.location.href = row.dataset.url;
   }));
+  updateProjectPagination(totalItems, totalPages);
 }
 
 async function deleteEmptyProjectFromList(event) {
@@ -272,15 +323,57 @@ async function deleteEmptyProjectFromList(event) {
   }
 }
 
+async function loadProjects(page = projectPage, { silent = false } = {}) {
+  const params = new URLSearchParams({
+    q: projectSearchTerm.trim(),
+    page: String(Math.max(1, page)),
+    page_size: String(PROJECTS_PER_PAGE),
+  });
+  const result = await api(`/api/projects?${params.toString()}`);
+  projectPage = Number(result.page || page || 1);
+  renderProjects(result.items || [], { ...result, serverPaged: true });
+}
+
 async function load() {
   try {
-    renderProjects(await api("/api/projects"));
+    await loadProjects(1);
     await loadTasks();
-    startTaskPolling();
+    if (projectPollTimer) clearInterval(projectPollTimer);
+    projectPollTimer = setInterval(() => {
+      if (document.visibilityState === "visible" && !$('taskDialog')?.open) {
+        loadProjects(projectPage, { silent: true }).catch(() => {});
+      }
+    }, 5000);
   } catch (error) {
     toast(`加载失败：${error.message}`);
   }
 }
+
+$("projectSearch").addEventListener("input", event => {
+  projectSearchTerm = String(event.target.value || "");
+  projectPage = 1;
+  clearTimeout(projectSearchTimer);
+  projectSearchTimer = setTimeout(() => loadProjects(1).catch(error => toast(`搜索失败：${error.message}`)), 220);
+});
+
+$("projectPrev").addEventListener("click", () => {
+  if (projectPage <= 1) return;
+  projectPage -= 1;
+  loadProjects(projectPage).catch(error => toast(`加载失败：${error.message}`));
+});
+
+$("projectNext").addEventListener("click", () => {
+  if (projectPage >= projectTotalPages) return;
+  projectPage += 1;
+  loadProjects(projectPage).catch(error => toast(`加载失败：${error.message}`));
+});
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible") {
+    loadProjects(projectPage, { silent: true }).catch(() => {});
+    loadTasks({ silent: true });
+  }
+});
 
 async function loadTasks({ silent = false } = {}) {
   if (taskPollInFlight) return;
@@ -302,6 +395,7 @@ async function loadTasks({ silent = false } = {}) {
     document.querySelectorAll("[data-task-action]").forEach(button => {
       button.addEventListener("click", handleTaskAction);
     });
+    updateTaskPolling(tasks);
   } catch (error) {
     if (!silent) throw error;
   } finally {
@@ -309,10 +403,15 @@ async function loadTasks({ silent = false } = {}) {
   }
 }
 
-function startTaskPolling() {
+function updateTaskPolling(tasks) {
   if (taskPollTimer) clearInterval(taskPollTimer);
+  taskPollTimer = null;
+  const shouldPoll = Array.isArray(tasks) && tasks.some(task =>
+    ["queued", "running"].includes(String(task.status || "queued"))
+  );
+  if (!shouldPoll) return;
   taskPollTimer = setInterval(() => {
-    if (document.visibilityState === "hidden") return;
+    if (document.visibilityState === "hidden" || $("taskDialog")?.open) return;
     loadTasks({ silent: true });
   }, 2500);
 }

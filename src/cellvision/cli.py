@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import uvicorn
@@ -16,6 +18,7 @@ from .manifest import build_manifest, split_sequences
 from .session_index import write_session_group_manifest
 from .review_server import create_app
 from .project_server import create_project_app
+from .project_catalog import ProjectCatalog, catalog_path_for_manifest
 from .train import train_weak_segmenter
 from .train_morphology import train_morphology_classifier
 from .train_v2_instance import train_v2_instance_segmenter
@@ -28,7 +31,7 @@ from .review_image_cache import precache_review_images
 from .late_growth_inference import infer_late_growth
 from .gated_screening import build_gated_plate_report
 from .project_worker import ProjectTaskWorker
-from .runtime import SUPPORTED_DEVICE_REQUESTS
+from .runtime import SUPPORTED_DEVICE_REQUESTS, detect_compute_runtime, ensure_training_allowed
 
 
 # Keep one stable project-review endpoint.  Starting a new task should reuse
@@ -123,6 +126,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not start the adaptive project worker alongside the review service",
     )
     project_review.add_argument(
+        "--access-log",
+        action="store_true",
+        help="Enable per-request Uvicorn access logs (disabled by default for the local UI)",
+    )
+    project_review.add_argument(
+        "--background",
+        action="store_true",
+        help="On Windows, relaunch the project service in a hidden process and return",
+    )
+    project_review.add_argument(
         "--worker-device",
         choices=SUPPORTED_DEVICE_REQUESTS,
         default=os.getenv("CELLVISION_WORKER_DEVICE", "auto"),
@@ -143,11 +156,74 @@ def build_parser() -> argparse.ArgumentParser:
     project_worker.add_argument("--worker-id", default="")
     project_worker.add_argument("--poll-seconds", type=float, default=2.0)
     project_worker.add_argument("--once", action="store_true", help="Claim at most one started task and exit")
+    runtime_info = subparsers.add_parser(
+        "runtime-info",
+        help="Detect the effective CPU/CUDA inference runtime",
+    )
+    runtime_info.add_argument(
+        "--device",
+        choices=SUPPORTED_DEVICE_REQUESTS,
+        default=os.getenv("CELLVISION_DEVICE", "auto"),
+    )
+    catalog_sync = subparsers.add_parser(
+        "catalog-sync",
+        help="Reconcile project_catalog.sqlite from all sibling project manifests",
+    )
+    catalog_sync.add_argument("--manifest", required=True, help="Any project JSON manifest in the collection")
+    catalog_sync.add_argument("--force", action="store_true", help="Re-read unchanged manifests and reports")
     return parser
+
+
+def _start_project_review_in_background(port: int) -> int:
+    """Detach ``review-project`` from a visible Windows console.
+
+    The browser polls the task endpoint regularly.  If the service is started
+    directly from a PowerShell window, those access logs make that window look
+    like a continuously running task.  This launcher keeps the service alive
+    while redirecting diagnostics to the normal artifact log directory.
+    """
+
+    log_root = Path(os.getenv("CELLVISION_LOG_ROOT", "artifacts/logs"))
+    if not log_root.is_absolute():
+        log_root = Path.cwd() / log_root
+    log_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = log_root / f"review-project-{port}.stdout.log"
+    stderr_path = log_root / f"review-project-{port}.stderr.log"
+    child_args = [value for value in sys.argv[1:] if value != "--background"]
+    command = [sys.executable, "-m", "cellvision", *child_args]
+    creationflags = 0
+    popen_options: dict[str, object] = {
+        "cwd": str(Path.cwd()),
+        "stdin": subprocess.DEVNULL,
+        "close_fds": True,
+    }
+    if os.name == "nt":
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        creationflags |= int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200))
+        popen_options["creationflags"] = creationflags
+    else:
+        popen_options["start_new_session"] = True
+    with stdout_path.open("a", encoding="utf-8") as stdout, stderr_path.open(
+        "a", encoding="utf-8"
+    ) as stderr:
+        popen_options["stdout"] = stdout
+        popen_options["stderr"] = stderr
+        process = subprocess.Popen(command, **popen_options)
+    print(
+        f"Cell Vision project server started in background (PID {process.pid}); "
+        f"logs: {stdout_path} / {stderr_path}",
+        flush=True,
+    )
+    return process.pid
 
 
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
+    if args.command == "train":
+        try:
+            ensure_training_allowed()
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
     if args.command == "parse-sessions":
         index = args.index or str(Path(args.root) / "sessions.idx")
         sessions, groups, summary_path = write_session_group_manifest(
@@ -169,6 +245,9 @@ def main(argv: list[str] | None = None) -> None:
             args.allow_remote or os.getenv("CELLVISION_ALLOW_REMOTE") == "1"
         ):
             raise SystemExit("Remote binding requires --allow-remote or CELLVISION_ALLOW_REMOTE=1")
+        if args.background:
+            _start_project_review_in_background(args.port)
+            return
         worker = None
         if not args.no_worker:
             worker = ProjectTaskWorker.from_manifest(
@@ -183,7 +262,13 @@ def main(argv: list[str] | None = None) -> None:
             }, ensure_ascii=False), flush=True)
             worker.start_background(poll_seconds=args.worker_poll_seconds)
         try:
-            uvicorn.run(create_project_app(args.manifest), host=args.host, port=args.port)
+            uvicorn.run(
+                create_project_app(args.manifest),
+                host=args.host,
+                port=args.port,
+                access_log=bool(args.access_log),
+                log_level="info" if args.access_log else "warning",
+            )
         finally:
             if worker is not None:
                 worker.stop()
@@ -205,6 +290,25 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps({"event": "worker_once_finished", "task": result}, ensure_ascii=False, indent=2), flush=True)
         else:
             worker.run_forever(poll_seconds=args.poll_seconds)
+        return
+    if args.command == "runtime-info":
+        print(json.dumps(detect_compute_runtime(args.device).as_dict(), ensure_ascii=False, indent=2))
+        return
+    if args.command == "catalog-sync":
+        manifest_path = Path(args.manifest).expanduser().resolve()
+        catalog = ProjectCatalog(catalog_path_for_manifest(manifest_path))
+        if args.force:
+            paths = sorted(
+                manifest_path.parent.parent.glob("*/project.json"),
+                key=lambda item: item.as_posix().casefold(),
+            )
+            synced = sum(
+                catalog.sync_manifest(path, force=True) is not None
+                for path in paths
+            )
+        else:
+            synced = catalog.reconcile_all(manifest_path)
+        print(json.dumps({"synced_projects": synced, **catalog.status()}, ensure_ascii=False, indent=2))
         return
     config = load_config(args.config)
     if args.command == "audit":

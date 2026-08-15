@@ -21,6 +21,7 @@ from skimage import measure
 
 from .active_learning import build_review_queue
 from .config import artifact_path
+from .project_catalog import ProjectCatalog
 from .dense_candidates import augment_candidates_with_dense_raw_proposals
 from .hierarchy import suppress_nested_single_candidates
 from .review_context import build_review_context, compute_well_registration
@@ -69,6 +70,7 @@ from .v2_mask_review import (
     mask_review_summary,
     save_mask_review,
 )
+from .runtime import production_mode_enabled
 
 
 SCHEMA = """
@@ -1331,6 +1333,21 @@ def create_app(
     project_back_url: str | None = None,
     review_base_url: str | None = None,
 ) -> FastAPI:
+    catalog_context = config.get("_catalog_context")
+    catalog: ProjectCatalog | None = None
+    catalog_manifest_path = ""
+    catalog_plate_id = ""
+    if isinstance(catalog_context, dict):
+        catalog_manifest_path = str(catalog_context.get("manifest_path") or "")
+        project_id = str(catalog_context.get("project_id") or "")
+        plate_slug = str(catalog_context.get("plate_slug") or "")
+        catalog_plate_id = f"{project_id}:{plate_slug}" if project_id and plate_slug else ""
+        catalog_path = catalog_context.get("catalog_path")
+        if catalog_path and catalog_manifest_path and catalog_plate_id:
+            try:
+                catalog = ProjectCatalog(str(catalog_path))
+            except (OSError, sqlite3.Error):  # catalog sync must not block review startup
+                catalog = None
     database_path = artifact_path(config, "annotations", "annotations.db")
     images_manifest_path = artifact_path(config, "manifests", "images.csv")
     database = initialize_database(database_path)
@@ -1449,6 +1466,40 @@ def create_app(
         "payload": None,
     }
     quick_summary_lock = RLock()
+
+    def sync_catalog_after_review(
+        source: str,
+        *,
+        wells: set[str] | list[str] | tuple[str, ...] | None = None,
+        reviewer: str = "",
+        action_id: str = "",
+        operation: str = "review_save",
+    ) -> None:
+        """Best-effort projection update after an authoritative review save."""
+
+        if catalog is None or not catalog_manifest_path or not catalog_plate_id:
+            return
+        try:
+            try:
+                quick_review_summary(force=True)
+            except Exception:
+                # Some specialized review routes do not have a quick-review
+                # candidate table; their primary DB/report save still syncs.
+                pass
+            catalog.sync_review_update(
+                catalog_manifest_path,
+                catalog_plate_id,
+                wells=wells,
+                source=source,
+                reviewer=reviewer,
+                action_id=action_id,
+                operation=operation,
+            )
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            # The per-plate annotations DB remains the source of truth.  A
+            # transient catalog lock or malformed optional report must never
+            # turn a successful review save into a failed user action.
+            return
 
     def gated_settings() -> dict[str, Any]:
         return config.get("gated_report", {})
@@ -2284,7 +2335,7 @@ def create_app(
     @app.post("/api/mask-review-save")
     def mask_review_save(payload: MaskReviewSavePayload) -> dict[str, Any]:
         try:
-            return save_mask_review(
+            result = save_mask_review(
                 config,
                 database,
                 round_id=payload.round_id,
@@ -2294,6 +2345,8 @@ def create_app(
                 reviewer=payload.reviewer,
                 notes=payload.notes,
             )
+            sync_catalog_after_review("mask_review", reviewer=payload.reviewer)
+            return result
         except (FileNotFoundError, ValueError, OSError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -2409,12 +2462,18 @@ def create_app(
                 [item.model_dump() for item in payload.items],
                 payload.reviewer,
             )
+            sync_catalog_after_review("teaching_review", reviewer=payload.reviewer)
             return {"status": "saved", "saved": saved}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/teach-train")
     def teach_train() -> dict[str, Any]:
+        if production_mode_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Model training is disabled in production compute-only mode",
+            )
         try:
             return train_teaching_classifier(config, database)
         except ValueError as exc:
@@ -2449,6 +2508,7 @@ def create_app(
                 [item.model_dump() for item in payload.items],
                 payload.reviewer,
             )
+            sync_catalog_after_review("multiplicity_review", reviewer=payload.reviewer)
             return {"status": "saved", "saved": saved}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2874,6 +2934,7 @@ def create_app(
                 [item.model_dump() for item in payload.items],
                 payload.reviewer,
             )
+            sync_catalog_after_review("integrated_review", reviewer=payload.reviewer)
             return {"status": "saved", "saved": saved}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3310,6 +3371,13 @@ def create_app(
             except Exception:  # pragma: no cover - cache failure must not undo a save
                 quick_summary_cache["signature"] = None
                 quick_summary_cache["payload"] = None
+            sync_catalog_after_review(
+                "quick_review",
+                wells=affected_wells,
+                reviewer=payload.reviewer,
+                action_id=str(undo_action_id),
+                operation="quick_review_save",
+            )
             return {
                 "status": "saved",
                 "saved_standard": saved_standard,
@@ -3414,6 +3482,13 @@ def create_app(
         except Exception:  # pragma: no cover - cache failure must not undo a restore
             quick_summary_cache["signature"] = None
             quick_summary_cache["payload"] = None
+        sync_catalog_after_review(
+            "quick_review",
+            wells=affected_wells,
+            reviewer=payload.reviewer,
+            action_id=str(row["undo_action_id"]),
+            operation="quick_review_undo",
+        )
         undone_well = str(row["well"]).upper()
         screening_row = None
         screening_source = artifact_path(
@@ -3448,6 +3523,11 @@ def create_app(
 
     @app.post("/api/integrated-review-new-round")
     def integrated_new_round() -> dict[str, Any]:
+        if production_mode_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Model training is disabled in production compute-only mode",
+            )
         try:
             dense_candidates = (
                 augment_candidates_with_dense_raw_proposals(
@@ -3560,6 +3640,12 @@ def create_app(
                 (well, payload.decision, payload.reviewer, payload.notes, updated),
             )
         summary = build_well_screening(config, database, selected_wells={well})
+        sync_catalog_after_review(
+            "screening_review",
+            wells={well},
+            reviewer=payload.reviewer,
+            operation="screening_review_save",
+        )
         return {"status": "saved", "well": well, "summary": summary}
 
     @app.post("/api/late-growth-review")
@@ -3590,6 +3676,12 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         summary = build_well_screening(config, database, selected_wells={well})
         gated_summary, updated_report = refresh_gated_report()
+        sync_catalog_after_review(
+            "late_growth_review",
+            wells={well},
+            reviewer=payload.reviewer,
+            operation="late_growth_review_save",
+        )
         source = artifact_path(config, "predictions", "latest_well_screening.csv")
         frame = pd.read_csv(source)
         selected = frame[frame["well"].astype(str).str.upper() == well]
@@ -3635,12 +3727,18 @@ def create_app(
                 [item.model_dump() for item in payload.items],
                 payload.reviewer,
             )
+            sync_catalog_after_review("auto_review", reviewer=payload.reviewer)
             return {"status": "saved", "saved": saved}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/auto-review-new-round")
     def auto_review_new_round() -> dict[str, Any]:
+        if production_mode_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Model training is disabled in production compute-only mode",
+            )
         try:
             training = train_teaching_classifier(config, database)
             generated = generate_auto_annotation_round(config, database)
@@ -3773,6 +3871,11 @@ def create_app(
     def annotations_create(payload: AnnotationPayload) -> dict[str, Any]:
         try:
             annotation_id = save_annotation(database, payload.model_dump())
+            sync_catalog_after_review(
+                "annotation_review",
+                wells={payload.well.upper()},
+                reviewer=payload.reviewer,
+            )
             return {"status": "saved", "annotation_id": annotation_id}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -3801,6 +3904,11 @@ def create_app(
     def lineage_reviews_create(payload: LineageReviewPayload) -> dict[str, Any]:
         try:
             review_id = save_lineage_review(database, payload.model_dump())
+            sync_catalog_after_review(
+                "lineage_review",
+                wells={payload.well.upper()},
+                reviewer=payload.reviewer,
+            )
             return {"status": "saved", "review_id": review_id}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

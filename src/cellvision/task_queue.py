@@ -131,6 +131,38 @@ class TaskQueueStore:
             self.write(tasks)
         return value
 
+    def ensure(self, task: dict[str, Any]) -> dict[str, Any]:
+        """Insert a task only when its id is not already present.
+
+        This is used when importing task records written by older versions of
+        the project hub.  The operation is guarded by the same per-file lock
+        as the normal lifecycle methods, so repeated page refreshes or a
+        concurrent worker cannot create duplicate task rows.
+        """
+
+        value = dict(task)
+        value.setdefault("status", "queued")
+        value.setdefault("attempts", 0)
+        value.setdefault("progress_current", 0)
+        value.setdefault("progress_total", int(value.get("group_count", 0) or 0))
+        value.setdefault("progress_percent", 0)
+        value.setdefault("progress_stage", str(value.get("status") or "queued"))
+        value.setdefault("progress_boards", [])
+        value.setdefault("elapsed_seconds", 0.0)
+        now = _now()
+        value.setdefault("created_at", now)
+        value.setdefault("updated_at", now)
+        self._with_progress_defaults(value)
+        task_key = str(value.get("task_id") or "")
+        with _lock_for(self.path):
+            tasks = self.read()
+            for existing in tasks:
+                if task_key and str(existing.get("task_id") or "") == task_key:
+                    return existing
+            tasks.append(value)
+            self.write(tasks)
+        return value
+
     def update(self, task_id: str, **fields: Any) -> dict[str, Any] | None:
         with _lock_for(self.path):
             tasks = self.read()

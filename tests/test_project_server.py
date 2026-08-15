@@ -275,3 +275,176 @@ def test_new_task_records_creator_and_uses_folder_name_for_project(
     assert json.loads(project_queue.read_text(encoding="utf-8"))[0]["task_id"] == task["task_id"]
     assert not main_queue.exists()
     assert project["created_by"] == "张三"
+
+
+def test_legacy_task_plans_are_restored_to_the_task_list(tmp_path: Path):
+    projects_root = tmp_path / "projects"
+    main_dir = projects_root / "main"
+    main_dir.mkdir(parents=True)
+    manifest_path = main_dir / "project.json"
+    manifest_path.write_text(
+        json.dumps({
+            "project_id": "main",
+            "project_name": "Main",
+            "task_id": "task-legacy-1",
+            "status": "queued",
+            "plates": [],
+        }),
+        encoding="utf-8",
+    )
+    plan_dir = main_dir / "task_plans"
+    plan_dir.mkdir()
+    (plan_dir / "task-legacy-1.json").write_text(
+        json.dumps({
+            "task_id": "task-legacy-1",
+            "name": "历史任务",
+            "created_by": "LL",
+            "root": str(tmp_path / "source"),
+            "index": str(tmp_path / "source" / "sessions.idx"),
+            "selected_timepoint_labels": ["Day0", "Day1"],
+            "endpoint_day_label": "Day1",
+            "endpoint_day_number": 1,
+            "sessions": [{
+                "group_id": "G1",
+                "board_id": "T1-1",
+                "timepoint_label": "T0",
+                "day_label": "Day0",
+            }],
+            "created_at": "2026-08-10T00:00:00+00:00",
+        }),
+        encoding="utf-8",
+    )
+
+    app = create_project_app(manifest_path)
+    tasks_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks"
+        and "GET" in getattr(route, "methods", set())
+    )
+
+    restored = tasks_endpoint()
+    assert [task["task_id"] for task in restored] == ["task-legacy-1"]
+    assert restored[0]["status"] == "queued"
+    assert restored[0]["created_by"] == "LL"
+    assert restored[0]["project_id"] == "main"
+    assert restored[0]["plan_path"].endswith("task_plans\\task-legacy-1.json")
+
+    queue_path = main_dir / "task_queue.json"
+    queued = json.loads(queue_path.read_text(encoding="utf-8"))
+    assert [task["task_id"] for task in queued] == ["task-legacy-1"]
+    assert [task["task_id"] for task in tasks_endpoint("main")] == ["task-legacy-1"]
+
+    delete_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks/{task_id}"
+        and "DELETE" in getattr(route, "methods", set())
+    )
+    deleted = delete_endpoint("task-legacy-1")
+    assert deleted["status"] == "deleted"
+    assert (plan_dir / "task-legacy-1.json.deleted").exists()
+    assert tasks_endpoint() == []
+    assert tasks_endpoint("main") == []
+
+    # A new app instance must not resurrect the deleted plan either.
+    fresh_app = create_project_app(manifest_path)
+    fresh_tasks_endpoint = next(
+        route.endpoint for route in fresh_app.routes
+        if getattr(route, "path", "") == "/api/project/tasks"
+        and "GET" in getattr(route, "methods", set())
+    )
+    assert fresh_tasks_endpoint() == []
+
+
+def test_deleting_a_migrated_task_removes_duplicate_queue_copies(tmp_path: Path):
+    projects_root = tmp_path / "projects"
+    first_dir = projects_root / "first"
+    second_dir = projects_root / "second"
+    first_dir.mkdir(parents=True)
+    second_dir.mkdir(parents=True)
+    first_manifest = first_dir / "project.json"
+    second_manifest = second_dir / "project.json"
+    first_manifest.write_text(
+        json.dumps({"project_id": "first", "project_name": "First", "plates": []}),
+        encoding="utf-8",
+    )
+    second_manifest.write_text(
+        json.dumps({"project_id": "second", "project_name": "Second", "plates": []}),
+        encoding="utf-8",
+    )
+    task = {
+        "task_id": "task-duplicate",
+        "name": "Duplicate legacy task",
+        "project_id": "first",
+        "project_manifest": str(first_manifest),
+        "plan_path": str(first_dir / "task_plans" / "task-duplicate.json"),
+        "status": "cancelled",
+    }
+    (first_dir / "task_plans").mkdir()
+    (first_dir / "task_plans" / "task-duplicate.json").write_text(
+        json.dumps(task), encoding="utf-8"
+    )
+    (first_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
+    (second_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
+
+    app = create_project_app(first_manifest)
+    tasks_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks"
+        and "GET" in getattr(route, "methods", set())
+    )
+    delete_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks/{task_id}"
+        and "DELETE" in getattr(route, "methods", set())
+    )
+    assert [item["task_id"] for item in tasks_endpoint()] == ["task-duplicate"]
+    assert delete_endpoint("task-duplicate")["status"] == "deleted"
+    assert tasks_endpoint() == []
+    assert json.loads((first_dir / "task_queue.json").read_text(encoding="utf-8")) == []
+    assert json.loads((second_dir / "task_queue.json").read_text(encoding="utf-8")) == []
+
+
+def test_deleting_a_task_from_a_legacy_queue_removes_its_project_queue_copy(
+    tmp_path: Path,
+):
+    projects_root = tmp_path / "projects"
+    main_dir = projects_root / "main"
+    child_dir = projects_root / "child"
+    main_dir.mkdir(parents=True)
+    child_dir.mkdir(parents=True)
+    main_manifest = main_dir / "project.json"
+    child_manifest = child_dir / "project.json"
+    main_manifest.write_text(
+        json.dumps({"project_id": "main", "project_name": "Main", "plates": []}),
+        encoding="utf-8",
+    )
+    child_manifest.write_text(
+        json.dumps({"project_id": "child", "project_name": "Child", "plates": []}),
+        encoding="utf-8",
+    )
+    task = {
+        "task_id": "task-legacy-copy",
+        "name": "Legacy copy",
+        "project_id": "child",
+        "project_manifest": str(child_manifest),
+        "status": "cancelled",
+    }
+    (main_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
+    (child_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
+
+    app = create_project_app(main_manifest)
+    tasks_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks"
+        and "GET" in getattr(route, "methods", set())
+    )
+    delete_endpoint = next(
+        route.endpoint for route in app.routes
+        if getattr(route, "path", "") == "/api/project/tasks/{task_id}"
+        and "DELETE" in getattr(route, "methods", set())
+    )
+    assert [item["task_id"] for item in tasks_endpoint()] == ["task-legacy-copy"]
+    assert delete_endpoint("task-legacy-copy")["status"] == "deleted"
+    assert tasks_endpoint() == []
+    assert json.loads((main_dir / "task_queue.json").read_text(encoding="utf-8")) == []
+    assert json.loads((child_dir / "task_queue.json").read_text(encoding="utf-8")) == []

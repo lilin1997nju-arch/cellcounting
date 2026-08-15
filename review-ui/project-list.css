@@ -21,6 +21,11 @@ button:disabled{opacity:.48;cursor:not-allowed}
 .section-heading h2{margin:0 0 5px;font-size:22px}
 .muted{color:#718285;font-size:14px;line-height:1.5;margin:0}
 .badge{padding:6px 10px;background:#e7f3ef;border-radius:999px;font-size:13px;color:#19706a;white-space:nowrap}
+.project-list-toolbar{display:flex;align-items:end;justify-content:space-between;gap:16px;margin:0 0 14px}
+.project-search{display:flex;align-items:center;gap:10px;margin:0;color:#536c6d;font-size:13px;font-weight:700}
+.project-search input{width:min(420px,52vw);margin:0;padding:9px 11px;background:#fbfdfb}
+.project-pagination{display:flex;align-items:center;justify-content:center;gap:14px;margin-top:16px}
+.project-pagination button{padding:7px 12px;font-size:13px}
 .project-table-wrap{overflow:auto;border:1px solid #e2eae6;border-radius:10px}
 .project-table{width:100%;min-width:1080px;border-collapse:collapse}
 .project-table th,.project-table td{text-align:left;padding:15px 14px;border-top:1px solid #e7eeeb;vertical-align:middle}
@@ -102,4 +107,7 @@ input{display:block;width:100%;margin-top:7px;padding:11px 12px;border:1px solid
   .task-board-time{text-align:left}
   .task-actions{justify-content:flex-start}
   .timepoint-picker{grid-template-columns:repeat(2,1fr)}
+  .project-list-toolbar{align-items:stretch;flex-direction:column;gap:8px}
+  .project-search{align-items:stretch;flex-direction:column;gap:6px}
+  .project-search input{width:100%}
 }

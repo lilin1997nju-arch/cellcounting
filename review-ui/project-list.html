@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-list.css?v=20260811-project-list-v4">
+  <link rel="stylesheet" href="/project-assets/project-list.css?v=20260812-project-list-v5">
 </head>
 <body>
   <header class="hub-header">
@@ -26,6 +26,13 @@
       <div><h2>项目</h2><p class="muted">项目之间相互独立；点击项目行进入对应板子审核。</p></div>
         <span id="projectCount" class="badge"></span>
       </div>
+      <div class="project-list-toolbar">
+        <label class="project-search" for="projectSearch">
+          <span>搜索项目</span>
+          <input id="projectSearch" type="search" placeholder="项目名称、ID、路径或创建人" autocomplete="off">
+        </label>
+        <span id="projectFilterMeta" class="muted"></span>
+      </div>
       <div class="project-table-wrap">
         <table class="project-table">
           <thead>
@@ -41,6 +48,11 @@
           <tbody id="projectRows"><tr><td colspan="6" class="empty">正在加载项目…</td></tr></tbody>
         </table>
       </div>
+      <nav id="projectPagination" class="project-pagination" aria-label="项目列表分页" hidden>
+        <button id="projectPrev" class="secondary" type="button">上一页</button>
+        <span id="projectPageInfo" class="muted"></span>
+        <button id="projectNext" class="secondary" type="button">下一页</button>
+      </nav>
     </section>
     <section class="panel">
       <div class="section-heading"><div><h2>任务队列</h2><p class="muted">新任务先解析文件夹并确认时间点，随后按末点数据快速排除无明显生长的孔。</p><p class="task-queue-note">queued 表示排队中、尚未开始；执行后会显示阶段和进度。</p></div></div>
@@ -61,7 +73,7 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-list.js?v=20260811-project-list-v4"></script>
+  <script src="/project-assets/project-list.js?v=20260812-project-list-v5"></script>
   <script>if(new URLSearchParams(location.search).get("new-task")==="1")document.getElementById("taskDialog").showModal();</script>
 </body>
 </html>

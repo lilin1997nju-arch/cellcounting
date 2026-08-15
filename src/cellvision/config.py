@@ -100,9 +100,15 @@ def load_config(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
 
     # Environment overrides are intentionally applied last so the same YAML
     # can run locally, in Docker, or on a lab server without rewriting files.
+    # A project worker writes an explicit absolute artifact/data path for each
+    # generated plate. Those paths must remain isolated even when the parent
+    # production process has global CELLVISION_*_ROOT defaults.
+    ignore_path_env_overrides = bool(
+        config.get("runtime", {}).get("ignore_path_env_overrides", False)
+    )
     for variable, (section, key) in _PATH_ENV_OVERRIDES.items():
         value = os.getenv(variable)
-        if value:
+        if value and not (ignore_path_env_overrides and section == "paths"):
             config.setdefault(section, {})[key] = value
 
     if validate:

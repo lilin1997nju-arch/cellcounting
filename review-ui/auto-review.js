@@ -1542,13 +1542,18 @@ document.addEventListener("keydown", event => {
     undoLastSave();
     return;
   }
+  if (event.key.toLowerCase() === "s") {
+    event.preventDefault();
+    saveWell(false);
+    return;
+  }
   const labels = {
     "1": "single",
     "2": "touching_doublet",
-    "3": "cluster_3plus",
-    "4": "debris",
+    "3": "debris",
+    "4": "cluster_3plus",
     "5": "uncertain",
-    "0": "invalid"
+    "6": "invalid"
   };
   if (labels[event.key]) {
     event.preventDefault();
