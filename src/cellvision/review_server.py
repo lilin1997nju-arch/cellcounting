@@ -156,7 +156,7 @@ def create_app(
         config,
         pd.read_csv(images_manifest_path),
     )
-    review_html_path = Path(__file__).resolve().parents[2] / "review-ui" / "index.html"
+    review_ui_dir = Path(__file__).resolve().parents[2] / "review-ui"
     teaching_html_path = (
         Path(__file__).resolve().parents[2] / "review-ui" / "teach.html"
     )
@@ -180,9 +180,6 @@ def create_app(
     )
     mask_review_html_path = (
         Path(__file__).resolve().parents[2] / "review-ui" / "mask-review.html"
-    )
-    screening_html_path = (
-        Path(__file__).resolve().parents[2] / "review-ui" / "screening.html"
     )
     app = FastAPI(title="Cell Vision Local Review")
     escaped_project_back_url = html.escape(project_back_url or "", quote=True)
@@ -1031,7 +1028,7 @@ def create_app(
         return context
     app.mount(
         "/assets",
-        StaticFiles(directory=review_html_path.parent),
+        StaticFiles(directory=review_ui_dir),
         name="review-assets",
     )
 

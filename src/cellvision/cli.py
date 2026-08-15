@@ -11,9 +11,7 @@ import uvicorn
 
 from .active_learning import build_review_queue
 from .audit import run_audit
-from .baseline import generate_baseline
 from .config import load_config
-from .infer import infer_smoke
 from .manifest import build_manifest, split_sequences
 from .session_index import write_session_group_manifest
 from .review_server import create_app
@@ -60,18 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output session-level CSV; a .groups.csv and .summary.json are created alongside it",
     )
     sessions.add_argument("--timepoint-origin", type=int, choices=(0, 1), default=0)
-    baseline = subparsers.add_parser("baseline")
-    baseline.add_argument("--config", default="configs/default.yaml")
-    baseline.add_argument("--wells", default="A1,B3,F12,G2,H6")
     train = subparsers.add_parser("train")
     train.add_argument(
         "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v3-temporal-pairwise-model"]
     )
     train.add_argument("--config", default="configs/default.yaml")
-    infer = subparsers.add_parser("infer")
-    infer.add_argument("--config", default="configs/model.yaml")
-    infer.add_argument("--checkpoint", required=True)
-    infer.add_argument("--wells", default="A1,B3,F12,G2,H6")
     infer_v2 = subparsers.add_parser("infer-v2")
     infer_v2.add_argument("--config", default="configs/default.yaml")
     infer_v2.add_argument("--checkpoint", required=True)
@@ -320,9 +311,6 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "build-review-queue":
         result = build_review_queue(config)
         print(f"review_candidates={len(result)}")
-    elif args.command == "baseline":
-        result = generate_baseline(config, _wells(args.wells))
-        print(f"candidate_objects={len(result)}")
     elif args.command == "train":
         if args.model == "weak-segmenter":
             run_dir = train_weak_segmenter(config)
@@ -335,9 +323,6 @@ def main(argv: list[str] | None = None) -> None:
         else:
             raise SystemExit(f"Unsupported training model: {args.model}")
         print(str(run_dir))
-    elif args.command == "infer":
-        result = infer_smoke(config, args.checkpoint, _wells(args.wells))
-        print(str(result))
     elif args.command == "infer-v2":
         print(str(infer_v2_instances(config, args.checkpoint)))
     elif args.command == "evaluate-v2":
