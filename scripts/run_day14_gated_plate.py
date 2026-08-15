@@ -82,7 +82,6 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             source / "models" / "teaching_classifier.pt",
             source / "models" / "multiplicity_classifier.pt",
             source / "v2" / "models" / "latest_instance_segmenter.pt",
-            source / "v2" / "models" / "latest_temporal_evidence.pt",
         ],
         extra={"group_id": str(args.group_id), "endpoint_day_label": getattr(args, "endpoint_day_label", "Day14")},
     )
@@ -152,7 +151,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _run_stage(
         stages,
         "v2_temporal_evidence",
-        lambda: infer_v2_temporal_evidence(config, source / "v2" / "models" / "latest_temporal_evidence.pt"),
+        lambda: infer_v2_temporal_evidence(config),
     )
     early_path = artifact_path(config, "predictions", "latest_well_screening.csv")
     _run_stage(stages, "early_well_screening", lambda: build_well_screening(config, database))

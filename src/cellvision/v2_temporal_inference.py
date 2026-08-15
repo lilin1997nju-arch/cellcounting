@@ -1418,7 +1418,7 @@ def resolve_low_cell_noncell_labels(
     return output, int(eligible.sum())
 
 
-def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Path) -> Path:
+def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Path | None = None) -> Path:
     started = time.perf_counter()
     source = artifact_path(config, "predictions", "latest_v2_predictions.csv")
     base_source = source.with_name("latest_v2_pre_temporal_predictions.csv")
@@ -1821,7 +1821,7 @@ def infer_v2_temporal_evidence(config: dict[str, Any], checkpoint_path: str | Pa
         ),
         "round_id": round_id,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
-        "checkpoint_retained_for_retraining": str(Path(checkpoint_path).resolve()),
+        "checkpoint_retained_for_retraining": (str(Path(checkpoint_path).resolve()) if checkpoint_path is not None else None),
         "evaluated_instances": len(outputs),
         "adjustment_applied": int(evaluated["v2_temporal_adjustment_applied"].fillna(False).astype(bool).sum()),
         "static_wall_invalid": int(evaluated["v2_static_wall_artifact"].fillna(False).astype(bool).sum()),

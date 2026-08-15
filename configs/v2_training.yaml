@@ -85,9 +85,6 @@ v2_temporal_model:
   # Warm-start the latest temporal model; replay sampling prevents 2603 from
   # displacing the older temporal boundary.
   learning_rate: 0.0002
-  # Continue from the current temporal model after adding the reviewed 2603
-  # triplets, instead of discarding the learned temporal boundary.
-  initial_checkpoint: artifacts/v2/models/latest_temporal_evidence.pt
   balance_by_plate_and_class: true
   reuse_training_cache: true
   training_sources:

@@ -80,11 +80,8 @@ def run(config_path: str | Path, source_artifacts: str | Path) -> dict[str, Any]
     started = time.perf_counter()
     source = Path(source_artifacts).resolve()
     instance_checkpoint = source / "v2" / "models" / "latest_instance_segmenter.pt"
-    temporal_checkpoint = source / "v2" / "models" / "latest_temporal_evidence.pt"
     if not instance_checkpoint.exists():
         raise FileNotFoundError(instance_checkpoint)
-    if not temporal_checkpoint.exists():
-        raise FileNotFoundError(temporal_checkpoint)
 
     database = artifact_path(config, "annotations", "annotations.db")
     _run_stage(stages, "initialize_database", lambda: str(initialize_database(database)))
@@ -144,7 +141,7 @@ def run(config_path: str | Path, source_artifacts: str | Path) -> dict[str, Any]
     _run_stage(
         stages,
         "v2_temporal_evidence",
-        lambda: str(infer_v2_temporal_evidence(config, temporal_checkpoint)),
+        lambda: str(infer_v2_temporal_evidence(config)),
     )
     _run_stage(
         stages,

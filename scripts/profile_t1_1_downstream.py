@@ -34,7 +34,6 @@ def main() -> None:
     parser.add_argument("--teaching-checkpoint", required=True, type=Path)
     parser.add_argument("--multiplicity-checkpoint", required=True, type=Path)
     parser.add_argument("--instance-checkpoint", required=True, type=Path)
-    parser.add_argument("--temporal-checkpoint", required=True, type=Path)
     args = parser.parse_args()
 
     config = load_config(args.config)
@@ -69,7 +68,7 @@ def main() -> None:
         ),
         (
             "v3_temporal_evidence",
-            lambda: infer_v2_temporal_evidence(config, args.temporal_checkpoint),
+            lambda: infer_v2_temporal_evidence(config),
         ),
         (
             "well_screening",

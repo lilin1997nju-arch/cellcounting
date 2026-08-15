@@ -53,7 +53,6 @@ UNREVIEWED_PLATES = ("ql2603-t2-4", "ql2603-t5-1", "ql2603-t5-2")
 
 NEW_INSTANCE = ROOT / "artifacts" / "v2" / "runs" / "v2-instance-20260812-120154" / "model.pt"
 OLD_INSTANCE = ROOT / "artifacts" / "v2" / "models" / "latest_instance_segmenter.pt"
-TEMPORAL_CHECKPOINT = ROOT / "artifacts" / "v2" / "models" / "latest_temporal_evidence.pt"
 
 NEW_MODEL_ROOT = PLATE_ROOT / "ql2603-t1-1" / "models"
 NEW_TEACHING = NEW_MODEL_ROOT / "teaching_classifier.pt"
@@ -193,7 +192,7 @@ def _run_deployment_plate(slug: str, run_root: Path) -> dict[str, Any]:
     v2_path = infer_v2_instances(config, NEW_INSTANCE)
     v2_summary_path = v2_path.with_suffix(".json")
     print(f"{slug}: V3 temporal/state layer", flush=True)
-    temporal_path = infer_v2_temporal_evidence(config, TEMPORAL_CHECKPOINT)
+    temporal_path = infer_v2_temporal_evidence(config)
     temporal_summary_path = temporal_path.with_name("latest_v2_temporal_summary.json")
     v3_path = shadow_root / "predictions" / "latest_v3_predictions.csv"
     _copy_file(temporal_path, v3_path)
@@ -221,7 +220,6 @@ def _run_deployment_plate(slug: str, run_root: Path) -> dict[str, Any]:
         "input": input_record,
         "classifier": classifier,
         "instance_checkpoint": _model_record(NEW_INSTANCE),
-        "temporal_checkpoint": _model_record(TEMPORAL_CHECKPOINT),
         "v3_config": {
             "enabled": bool(config.get("v3_temporal_behavior", {}).get("enabled")),
             "backend": config.get("v3_temporal_behavior", {}).get("backend"),
@@ -614,7 +612,6 @@ def _validate_paths() -> None:
     for path in (
         NEW_INSTANCE,
         OLD_INSTANCE,
-        TEMPORAL_CHECKPOINT,
         NEW_TEACHING,
         NEW_MULTIPLICITY,
         OLD_TEACHING,
@@ -669,7 +666,7 @@ def main() -> None:
             "new_multiplicity": _model_record(NEW_MULTIPLICITY),
             "old_teaching": _model_record(OLD_TEACHING),
             "old_multiplicity": _model_record(OLD_MULTIPLICITY),
-            "temporal": _model_record(TEMPORAL_CHECKPOINT),
+            "temporal": None,
         },
         "v3_actual_backend": "heuristic_behavior_v1 / active state fusion; pairwise checkpoint not available",
         "deployment": deployment,

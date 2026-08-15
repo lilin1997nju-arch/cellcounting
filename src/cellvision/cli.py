@@ -79,7 +79,6 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_v2.add_argument("--config", default="configs/a12_22_training.yaml")
     temporal_v2 = subparsers.add_parser("infer-v2-temporal")
     temporal_v2.add_argument("--config", default="configs/default.yaml")
-    temporal_v2.add_argument("--checkpoint", required=True)
     refinalize_v2 = subparsers.add_parser("refinalize-v2")
     refinalize_v2.add_argument("--config", default="configs/default.yaml")
     resolve_v2_noncell = subparsers.add_parser("resolve-v2-noncell")
@@ -344,7 +343,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "evaluate-v2":
         print(str(write_v2_evaluation(config)))
     elif args.command == "infer-v2-temporal":
-        print(str(infer_v2_temporal_evidence(config, args.checkpoint)))
+        print(str(infer_v2_temporal_evidence(config)))
     elif args.command == "refinalize-v2":
         print(str(refinalize_v2_file(config)))
     elif args.command == "resolve-v2-noncell":

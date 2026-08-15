@@ -54,7 +54,6 @@ MODEL_ROOT = (
     / "ql2603-t1-1"
     / "models"
 )
-TEMPORAL_CHECKPOINT = ROOT / "artifacts" / "v2" / "models" / "latest_temporal_evidence.pt"
 BACKUP_ROOT = ROOT / "artifacts" / "v2" / "runs" / "ql2603_classifier_activation"
 
 # These are the active files changed by the refresh.  Round directories are
@@ -318,8 +317,6 @@ def main() -> None:
     multiplicity_checkpoint = MODEL_ROOT / "multiplicity_classifier.pt"
     if not teaching_checkpoint.exists() or not multiplicity_checkpoint.exists():
         raise FileNotFoundError("The new pooled classifier checkpoints are missing")
-    if not args.no_temporal and not TEMPORAL_CHECKPOINT.exists():
-        raise FileNotFoundError(f"The current temporal checkpoint is missing: {TEMPORAL_CHECKPOINT}")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     backup_root = (
@@ -358,7 +355,7 @@ def main() -> None:
                 "selected_plates": [str(plate["slug"]) for plate in plates],
                 "incomplete_before": incomplete_before,
                 "backup_root": str(backup_root),
-                "temporal_checkpoint": None if args.no_temporal else str(TEMPORAL_CHECKPOINT),
+                "temporal_checkpoint": None,
                 "temporal_plates": sorted(temporal_slugs),
             },
             ensure_ascii=False,
@@ -394,7 +391,7 @@ def main() -> None:
             temporal_summary: dict[str, Any] | None = None
             if not args.no_temporal and slug in temporal_slugs:
                 print(f"[{index}/{len(plates)}] {slug}: V2/V3 temporal refresh", flush=True)
-                infer_v2_temporal_evidence(config, TEMPORAL_CHECKPOINT)
+                infer_v2_temporal_evidence(config)
                 summary_path = prediction_root / "latest_v2_temporal_summary.json"
                 if summary_path.exists():
                     temporal_summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -422,7 +419,7 @@ def main() -> None:
                 "plate": slug,
                 "new_teaching_checkpoint": str(teaching_checkpoint.resolve()),
                 "new_multiplicity_checkpoint": str(multiplicity_checkpoint.resolve()),
-                "temporal_checkpoint": None if args.no_temporal else str(TEMPORAL_CHECKPOINT.resolve()),
+                "temporal_checkpoint": None,
                 "training_head_prediction_counts": {
                     "teaching": int(teaching.get("prediction_count", 0)),
                     "multiplicity": int(multiplicity.get("prediction_count", 0)),
@@ -462,7 +459,7 @@ def main() -> None:
         "backup_root": str(backup_root),
         "new_teaching_checkpoint": str(teaching_checkpoint.resolve()),
         "new_multiplicity_checkpoint": str(multiplicity_checkpoint.resolve()),
-        "temporal_checkpoint": None if args.no_temporal else str(TEMPORAL_CHECKPOINT.resolve()),
+        "temporal_checkpoint": None,
         "temporal_refresh": not args.no_temporal,
         "temporal_plates": sorted(temporal_slugs),
         "plates_processed": [str(plate["slug"]) for plate in plates],

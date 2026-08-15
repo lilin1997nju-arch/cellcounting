@@ -19,21 +19,16 @@ def _safe_name(value: str) -> str:
 def run_shadow_test(
     config_paths: list[str],
     output_root: str,
-    checkpoint: str,
     state_fusion: str = "shadow",
 ) -> Path:
     if state_fusion not in {"shadow", "active"}:
         raise ValueError(f"Unsupported V3 state fusion mode: {state_fusion}")
     root = Path(output_root).expanduser().resolve()
     root.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = Path(checkpoint).expanduser().resolve()
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Temporal checkpoint does not exist: {checkpoint_path}")
 
     report: dict[str, object] = {
         "mode": f"v3_{state_fusion}",
         "state_fusion": state_fusion,
-        "checkpoint": str(checkpoint_path),
         "plates": [],
     }
     for config_path in config_paths:
@@ -53,7 +48,7 @@ def run_shadow_test(
         behavior["enabled"] = True
         behavior["state_fusion"] = state_fusion
         behavior["backend"] = "heuristic_behavior_v1"
-        output = infer_v2_temporal_evidence(config, checkpoint_path)
+        output = infer_v2_temporal_evidence(config)
         summary_path = output.with_name("latest_v2_temporal_summary.json")
         summary = json.loads(summary_path.read_text(encoding="utf-8"))
         predictions = pd.read_csv(output, low_memory=False)
@@ -113,17 +108,13 @@ def main() -> None:
         default="artifacts/v3_shadow_tests/20260809",
     )
     parser.add_argument(
-        "--checkpoint",
-        default="artifacts/v2/models/latest_temporal_evidence.pt",
-    )
-    parser.add_argument(
         "--state-fusion",
         choices=["shadow", "active"],
         default="shadow",
         help="Keep V3 as an audit-only proposal or apply its frame-level conclusion",
     )
     args = parser.parse_args()
-    run_shadow_test(args.configs, args.output, args.checkpoint, args.state_fusion)
+    run_shadow_test(args.configs, args.output, args.state_fusion)
 
 
 if __name__ == "__main__":
