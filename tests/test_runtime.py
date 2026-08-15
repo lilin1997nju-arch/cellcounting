@@ -1,4 +1,4 @@
-from cellvision.runtime import detect_compute_runtime
+from cellvision.runtime import detect_compute_runtime, ensure_training_allowed
 
 
 def test_cpu_runtime_is_always_available():
@@ -21,3 +21,13 @@ def test_cuda_request_falls_back_when_cuda_is_unavailable():
     if not runtime.cuda_available:
         assert runtime.selected_device == "cpu"
         assert runtime.fallback_reason
+
+
+def test_production_mode_blocks_training(monkeypatch):
+    monkeypatch.setenv("CELLVISION_PRODUCTION", "1")
+    try:
+        ensure_training_allowed()
+    except RuntimeError as exc:
+        assert "disabled" in str(exc)
+    else:
+        raise AssertionError("training guard did not reject production mode")

@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .models.morphology_classifier import MorphologyClassifier
 from .pseudo_labels import build_morphology_pseudo_labels
+from .runtime import ensure_training_allowed
 
 
 CLASS_NAMES = ["debris_artifact", "cell"]
@@ -92,6 +93,7 @@ def _training_predictions(
 
 
 def train_morphology_classifier(config: dict[str, Any]) -> Path:
+    ensure_training_allowed()
     settings = config.get("morphology_classifier", {})
     seed = int(settings.get("seed", 20260729))
     random.seed(seed)

@@ -17,6 +17,7 @@ from torchvision.models import ResNet18_Weights, resnet18
 from .config import artifact_path, is_validation_holdout, load_config
 from .dense_candidates import add_wall_neighbor_counts
 from .pseudo_labels import _background_anisotropy, _crop_with_padding
+from .runtime import ensure_training_allowed
 
 
 TEACHING_LABELS = {"cell", "debris", "invalid", "skip"}
@@ -538,6 +539,7 @@ def _joint_morphology_training_examples(
 def train_teaching_classifier(
     config: dict[str, Any], database: str | Path
 ) -> dict[str, Any]:
+    ensure_training_allowed()
     metadata, features = ensure_teaching_features(config)
     targets, training_features = _joint_morphology_training_examples(
         config, database, metadata, features

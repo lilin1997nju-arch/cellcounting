@@ -15,6 +15,7 @@ from .config import artifact_path
 from .models.losses import dice_loss
 from .models.v2_instance_segmenter import SeededInstanceUNet
 from .v2_instance_dataset import V2InstanceDataset, build_v2_instance_cache
+from .runtime import ensure_training_allowed
 
 
 def _device(config: dict[str, Any]) -> torch.device:
@@ -64,6 +65,7 @@ def _instance_sampler_weights(
 
 
 def train_v2_instance_segmenter(config: dict[str, Any]) -> Path:
+    ensure_training_allowed()
     settings = config["v2_instance_segmentation"]
     seed = int(settings.get("seed", 20260802))
     random.seed(seed)

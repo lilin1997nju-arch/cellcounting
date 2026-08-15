@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, Subset, TensorDataset
 from .config import artifact_path
 from .models.temporal_pairwise import TemporalPairwiseNet
 from .temporal_objects import TemporalObjectDescriptor, TemporalPairEvidence
+from .runtime import ensure_training_allowed
 
 
 PAIR_SPECS = ((0, 1), (1, 2), (0, 2))
@@ -170,6 +171,8 @@ def _binary_metrics(logits: torch.Tensor, target: torch.Tensor) -> dict[str, flo
 
 def train_temporal_pairwise_model(config: dict[str, Any]) -> Path:
     """Train the optional low-cost V3 pairwise checkpoint."""
+
+    ensure_training_allowed()
 
     settings = config.get("v3_temporal_behavior", {}).get("pairwise_training", {})
     cache = np.load(build_temporal_pairwise_training_cache(config))

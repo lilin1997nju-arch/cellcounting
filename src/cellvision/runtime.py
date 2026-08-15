@@ -17,6 +17,27 @@ from typing import Any
 SUPPORTED_DEVICE_REQUESTS = ("auto", "cuda", "cpu")
 
 
+def production_mode_enabled() -> bool:
+    """Whether this process is running in compute-only production mode."""
+
+    return os.getenv("CELLVISION_PRODUCTION", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def ensure_training_allowed() -> None:
+    """Reject model training when the process is marked as production."""
+
+    if production_mode_enabled():
+        raise RuntimeError(
+            "Model training is disabled in CELLVISION_PRODUCTION mode; "
+            "run training in a separate development environment."
+        )
+
+
 def _normalise_request(value: str | None) -> str:
     requested = str(value or os.getenv("CELLVISION_DEVICE", "auto")).strip().lower()
     if requested not in SUPPORTED_DEVICE_REQUESTS:
@@ -147,4 +168,3 @@ def cuda_runtime_enabled(requested_device: str | None = None) -> bool:
     """Whether CUDA synchronisation should be used for this process."""
 
     return detect_compute_runtime(requested_device).selected_device == "cuda"
-

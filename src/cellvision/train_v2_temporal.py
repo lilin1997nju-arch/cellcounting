@@ -18,6 +18,7 @@ from .config import artifact_path, is_validation_holdout, load_config
 from .models.v2_temporal_evidence import TemporalEvidenceNet
 from .v2_instance_dataset import _crop
 from .v2_instance_inference import decode_rle
+from .runtime import ensure_training_allowed
 
 
 CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
@@ -413,6 +414,7 @@ def build_temporal_training_cache(config: dict[str, Any]) -> Path:
 
 
 def train_v2_temporal_model(config: dict[str, Any]) -> Path:
+    ensure_training_allowed()
     settings = config["v2_temporal_model"]
     cache = np.load(build_temporal_training_cache(config))
     dataset = TensorDataset(*(torch.from_numpy(cache[key]) for key in ("images", "numeric", "present", "same", "static", "static_valid")))

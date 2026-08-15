@@ -20,6 +20,7 @@ from .teaching import (
     joint_training_sources,
     save_teaching_labels,
 )
+from .runtime import ensure_training_allowed
 
 
 MULTIPLICITY_LABELS = {
@@ -802,6 +803,7 @@ def _multiplicity_targets_for_source(
 def train_multiplicity_classifier(
     config: dict[str, Any], database: str | Path
 ) -> dict[str, Any]:
+    ensure_training_allowed()
     metadata, features = ensure_teaching_features(config)
     target_parts: list[pd.DataFrame] = []
     feature_parts: list[np.ndarray] = []

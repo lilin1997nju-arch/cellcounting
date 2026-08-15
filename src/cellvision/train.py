@@ -21,6 +21,7 @@ from .datasets import WeakMaskDataset
 from .models.instance_segmenter import TinyUNet
 from .models.losses import dice_loss
 from .patches import build_weak_patch_cache
+from .runtime import ensure_training_allowed
 
 
 def _metrics(logits: torch.Tensor, targets: torch.Tensor, threshold: float) -> dict[str, float]:
@@ -117,6 +118,7 @@ def _write_diagnostic_images(
 
 
 def train_weak_segmenter(config: dict[str, Any]) -> Path:
+    ensure_training_allowed()
     model_config = config["weak_segmenter"]
     seed = int(model_config["seed"])
     random.seed(seed)
