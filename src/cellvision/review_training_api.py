@@ -12,14 +12,28 @@ from .multiplicity import (
     ensure_multiplicity_table,
     multiplicity_queue,
     multiplicity_stats,
+    generate_integrated_training_round,
+    integrated_review_queue,
+    integrated_review_stats,
+    save_integrated_reviews,
     save_categorized_review_labels,
 )
 from .review_payloads import MultiplicityLabelsPayload, TeachingLabelsPayload
+from .review_payloads import (
+    AutoReviewsPayload,
+    IntegratedReviewsPayload,
+    MultiplicityLabelsPayload,
+    TeachingLabelsPayload,
+)
 from .runtime import production_mode_enabled
 from .teaching import (
     save_teaching_labels,
     teaching_queue,
     teaching_stats,
+    auto_annotation_queue,
+    auto_annotation_stats,
+    save_auto_annotation_reviews,
+    generate_auto_annotation_round,
     train_teaching_classifier,
 )
 
@@ -133,4 +147,133 @@ def register_training_routes(
             )
             deleted = int(cursor.rowcount or 0)
         return {"status": "deleted", "deleted": deleted}
+
+
+
+def register_round_routes(
+    app: FastAPI,
+    config: dict[str, Any],
+    database: str | Path,
+    sync_catalog_after_review: Any,
+) -> None:
+    """Register integrated-review and auto-review round routes."""
+
+    @app.get("/api/integrated-review-stats")
+    def integrated_stats() -> dict[str, Any]:
+        return integrated_review_stats(config, database)
+
+
+    @app.get("/api/integrated-review-candidates")
+    def integrated_candidates(
+        mode: str = "all", limit: int = 30
+    ) -> list[dict[str, Any]]:
+        if mode not in {
+            "all",
+            "cell",
+            "doublet",
+            "debris",
+            "uncertain",
+            "reviewed",
+        }:
+            raise HTTPException(status_code=422, detail="Invalid review mode")
+        return integrated_review_queue(
+            config, database, mode, min(limit, 100)
+        )
+
+    @app.post("/api/integrated-review-labels")
+    def integrated_labels_create(
+        payload: IntegratedReviewsPayload,
+    ) -> dict[str, Any]:
+        try:
+            saved = save_integrated_reviews(
+                database,
+                payload.round_id,
+                [item.model_dump() for item in payload.items],
+                payload.reviewer,
+            )
+            sync_catalog_after_review("integrated_review", reviewer=payload.reviewer)
+            return {"status": "saved", "saved": saved}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/integrated-review-new-round")
+    def integrated_new_round() -> dict[str, Any]:
+        if production_mode_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Model training is disabled in production compute-only mode",
+            )
+        try:
+            dense_candidates = (
+                augment_candidates_with_dense_raw_proposals(
+                    config, database
+                )
+            )
+            ensure_teaching_features(config, force=True)
+            morphology_training = train_teaching_classifier(
+                config, database
+            )
+            morphology_round = generate_auto_annotation_round(
+                config, database
+            )
+            multiplicity_training = train_multiplicity_classifier(
+                config, database
+            )
+            integrated_round = generate_integrated_training_round(
+                config, database
+            )
+            well_screening = build_well_screening(config, database)
+            return {
+                "dense_candidates": dense_candidates,
+                "morphology_training": morphology_training,
+                "morphology_round": morphology_round,
+                "multiplicity_training": multiplicity_training,
+                "integrated_round": integrated_round,
+                "well_screening": well_screening,
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+    @app.get("/api/auto-review-stats")
+    def auto_review_stats() -> dict[str, Any]:
+        return auto_annotation_stats(config, database)
+
+    @app.get("/api/auto-review-candidates")
+    def auto_review_candidates(
+        mode: str = "needs_review", limit: int = 30
+    ) -> list[dict[str, Any]]:
+        if mode not in {"needs_review", "cell", "audit", "reviewed"}:
+            raise HTTPException(status_code=422, detail="Invalid review mode")
+        return auto_annotation_queue(config, database, mode, limit)
+
+    @app.post("/api/auto-review-labels")
+    def auto_review_labels_create(
+        payload: AutoReviewsPayload,
+    ) -> dict[str, Any]:
+        try:
+            saved = save_auto_annotation_reviews(
+                database,
+                payload.round_id,
+                [item.model_dump() for item in payload.items],
+                payload.reviewer,
+            )
+            sync_catalog_after_review("auto_review", reviewer=payload.reviewer)
+            return {"status": "saved", "saved": saved}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/auto-review-new-round")
+    def auto_review_new_round() -> dict[str, Any]:
+        if production_mode_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Model training is disabled in production compute-only mode",
+            )
+        try:
+            training = train_teaching_classifier(config, database)
+            generated = generate_auto_annotation_round(config, database)
+            return {"training": training, "round": generated}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
