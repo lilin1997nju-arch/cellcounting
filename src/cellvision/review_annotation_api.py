@@ -144,5 +144,3 @@ def register_annotation_routes(
             return {"status": "saved", "review_id": review_id}
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-    return app

@@ -17,7 +17,8 @@ from .multiplicity import (
     save_integrated_reviews,
     save_multiplicity_labels,
 )
-from .review_helpers import _visible_v2_review_instances, _with_final_decisions
+from .hierarchy import suppress_nested_single_candidates
+from .review_helpers import _boolean_series, _visible_v2_review_instances, _with_final_decisions
 from .review_storage import _summary_json_safe
 from .review_summary import (
     SUMMARY_VERSION,
@@ -30,7 +31,7 @@ from .review_summary import (
 from .well_screening import build_well_screening
 from fastapi import FastAPI, HTTPException
 from .review_context import build_review_context
-from .review_payloads import QuickReviewUndoPayload, QuickReviewWellPayload
+from .review_payloads import QuickReviewObjectItem, QuickReviewUndoPayload, QuickReviewWellPayload
 from .review_storage import (
     _capture_quick_review_undo_snapshot,
     _restore_quick_review_undo_snapshot,

@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import pandas as pd
+
 from .multiplicity import ensure_integrated_review_table, ensure_multiplicity_table
 
 

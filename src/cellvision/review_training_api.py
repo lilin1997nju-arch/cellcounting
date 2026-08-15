@@ -8,6 +8,7 @@ from typing import Any, Callable
 from fastapi import FastAPI, HTTPException
 
 from .config import artifact_path
+from .dense_candidates import augment_candidates_with_dense_raw_proposals
 from .multiplicity import (
     ensure_multiplicity_table,
     multiplicity_queue,
@@ -17,8 +18,8 @@ from .multiplicity import (
     integrated_review_stats,
     save_integrated_reviews,
     save_categorized_review_labels,
+    train_multiplicity_classifier,
 )
-from .review_payloads import MultiplicityLabelsPayload, TeachingLabelsPayload
 from .review_payloads import (
     AutoReviewsPayload,
     IntegratedReviewsPayload,
@@ -26,6 +27,7 @@ from .review_payloads import (
     TeachingLabelsPayload,
 )
 from .runtime import production_mode_enabled
+from .well_screening import build_well_screening
 from .teaching import (
     save_teaching_labels,
     teaching_queue,
@@ -34,6 +36,7 @@ from .teaching import (
     auto_annotation_stats,
     save_auto_annotation_reviews,
     generate_auto_annotation_round,
+    ensure_teaching_features,
     train_teaching_classifier,
 )
 

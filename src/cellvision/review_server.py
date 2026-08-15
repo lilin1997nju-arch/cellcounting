@@ -63,7 +63,6 @@ from .review_mask_api import register_mask_routes
 from .review_screening_api import register_screening_routes
 from .review_training_api import register_round_routes, register_training_routes
 from .review_image_cache import patch_cache_path, render_patch, render_review_image, report_image_cache_path, review_image_cache_path
-from .decode import inspect_tiff
 from .gated_screening import build_gated_plate_report
 from .v2_mask_review import (
     create_model_comparison_round,
@@ -481,4 +480,6 @@ def create_app(
     register_screening_routes(app, config, database, images_manifest, gated_lookup, ui_screening_status, ui_screening_status_label, ui_status_aliases, refresh_gated_report, sync_catalog_after_review)
 
     register_image_routes(app, config, images_manifest, database)
+
+    return app
 

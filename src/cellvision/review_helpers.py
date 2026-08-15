@@ -10,6 +10,8 @@ from PIL import Image
 from scipy import ndimage, signal
 from skimage import measure
 
+from .decode import inspect_tiff
+
 
 def _review_images_manifest(
     config: dict[str, Any], base: pd.DataFrame
