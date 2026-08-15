@@ -264,13 +264,17 @@ dense_detection:
   interior_response_percentile: 96.5
   wall_buffer_response_percentile: 98.0
   # Percentiles alone force proposals even in empty textured fields. Reviewed
-  # dense cells/debris start well above these floors, while blank-field peaks
-  # cluster below 12. CF components and manual anchors are unaffected.
-  minimum_interior_peak_response: 18.0
+  # Reviewed QL2603 interior cells overwhelmingly clear 30.  This removes
+  # low-value textured peaks before classifier/U-Net inference; CF components,
+  # the wall buffer, rescue, and wall-residual branches are unaffected.
+  minimum_interior_peak_response: 30.0
   minimum_wall_buffer_peak_response: 20.0
   duplicate_radius_px: 7
   rebuild_timepoints: ["T0", "T1", "T2"]
   multiscale_contrast_weight: 0.70
+  # A 3-sigma Gaussian support retained 374/375 reviewed T1-1 cell proposals
+  # when combined with the response floor above, while reducing response time.
+  multiscale_gaussian_truncate: 3.0
   dynamic_wall_mask_enabled: true
   wall_profile_target_size_px: 768
   wall_search_start_fraction: 0.38
