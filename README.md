@@ -20,6 +20,10 @@
 
 建议复制 `.env.example` 为 `.env`，把原始数据、模型、数据库和 artifact 分开配置。
 
+## Windows 生产推理部署
+
+生产端只需要计算，不需要训练模型。使用 [`docs/production-windows.md`](docs/production-windows.md) 中的 `scripts/setup_production.ps1` 一键创建独立的 `.venv-production`；脚本会自动判断 NVIDIA/CUDA 是否可用，GPU 不可用时安装 CPU PyTorch 并回退到 CPU worker。模型发布包必须包含 `models/` 和 `v2/models/` 下的四个 checkpoint，生产模式会禁止训练 CLI 和训练接口。
+
 ## 常用命令
 
 ```powershell
@@ -37,12 +41,31 @@
   --host 127.0.0.1 --port 8777
 ```
 
+Windows 下如果不希望服务占用前台 PowerShell 窗口，可使用后台模式：
+
+```powershell
+.\.venv\Scripts\python.exe -m cellvision review-project `
+  --manifest artifacts/projects/ql2603/project.json `
+  --host 127.0.0.1 --port 8777 --background
+```
+
+后台服务默认关闭逐请求访问日志，日志写入 `artifacts/logs/review-project-8777.stdout.log` 和 `.stderr.log`。
+
 健康检查：
 
 ```text
 http://127.0.0.1:8777/api/health
 http://127.0.0.1:8777/api/ready
 ```
+
+项目目录使用 `artifacts/projects/project_catalog.sqlite` 作为可重建的项目索引。主页的搜索和分页由 SQL 服务端执行；任务、板子、孔当前结论和审核历史会在对应保存链路完成后同步。手动重建/校验：
+
+```powershell
+.\.venv\Scripts\python.exe -m cellvision catalog-sync `
+  --manifest artifacts/projects/ql2603/project.json --force
+```
+
+状态接口：`GET /api/catalog/status`；单板孔结论接口：`GET /api/project/catalog-wells?project_id=...&plate_slug=...`。
 
 ## 测试
 

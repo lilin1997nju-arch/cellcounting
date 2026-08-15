@@ -1,0 +1,17 @@
+# Production runtime dependencies only.
+#
+# torch and torchvision are installed separately by setup_production.ps1 from
+# the official PyTorch CPU/CUDA wheel index after the host is probed.
+# pytest and development-only packages are intentionally excluded.
+numpy>=2.0,<3.0
+pandas>=2.2,<4.0
+openpyxl>=3.1,<4.0
+Pillow>=10.0,<13.0
+PyYAML>=6.0,<7.0
+tifffile>=2025.0,<2027.0
+scipy>=1.14,<2.0
+scikit-image>=0.24,<0.27
+fastapi>=0.115,<1.0
+pydantic>=2.9,<3.0
+uvicorn>=0.32,<1.0
+psutil>=6.0,<8.0

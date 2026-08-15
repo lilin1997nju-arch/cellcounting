@@ -37,6 +37,16 @@ Windows 服务器也应保持相同的逻辑分层，不要把原始图片复制
   --host 127.0.0.1 --port 8777
 ```
 
+Windows 本地使用时可加 `--background` 让 8777 服务在隐藏进程中运行，避免前台 PowerShell 持续显示访问日志：
+
+```powershell
+.\.venv\Scripts\python.exe -m cellvision review-project `
+  --manifest artifacts/projects/ql2603/project.json `
+  --host 127.0.0.1 --port 8777 --background
+```
+
+服务日志默认写入 `artifacts/logs/review-project-8777.stdout.log` 和 `.stderr.log`；需要逐请求日志时显式添加 `--access-log`。
+
 如果由容器或反向代理访问容器内部端口，需要明确设置 `CELLVISION_ALLOW_REMOTE=1`，不要默认暴露到实验室网络。
 
 健康检查：
@@ -45,6 +55,28 @@ Windows 服务器也应保持相同的逻辑分层，不要把原始图片复制
 GET /api/health
 GET /api/ready
 ```
+
+## project catalog
+
+项目集合使用 `artifacts/projects/project_catalog.sqlite` 作为轻量索引层。原始图片、每板 `annotations.db` 和报告文件仍是详细数据源；catalog 保存项目、板子、任务、任务板级进度、孔当前结论和孔结论历史。服务启动/项目列表请求会按文件修改时间增量同步，任务 worker 和审核保存接口会主动写入同步事件。
+
+接口包括：
+
+```text
+GET /api/projects?q=QL2603&page=1&page_size=10
+GET /api/project?project_id=ql2603
+GET /api/catalog/status
+GET /api/project/catalog-wells?project_id=ql2603&plate_slug=ql2603-t1-1
+```
+
+如果需要从文件报告重新校验整个集合：
+
+```powershell
+.\.venv\Scripts\python.exe -m cellvision catalog-sync `
+  --manifest artifacts/projects/ql2603/project.json --force
+```
+
+人工审核写入时，`well_current` 保留当前生效的人工结论，`model_category_code` 保留最新模型结论，`well_decision_history` 记录每次保存/撤销/同步；后续模型报告刷新不会覆盖人工结论。
 
 任务状态接口：
 

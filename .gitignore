@@ -1,9 +1,11 @@
 .venv/
+.venv-production/
 __pycache__/
 .pytest_cache/
 .pytest-tmp/
 *.pyc
 .env
+.env.production
 *.log
 src/cellvision_local.egg-info/
 configs/generated/
