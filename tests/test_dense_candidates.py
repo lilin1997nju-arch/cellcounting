@@ -1,9 +1,37 @@
 import numpy as np
 
+import cellvision.dense_candidates as dense_candidates
 from cellvision.dense_candidates import (
     _polar_wall_residual_peaks,
+    _select_response_backend,
     _zone_peak_indices,
 )
+
+
+def test_multiscale_backend_auto_uses_cuda_when_available(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dense_candidates,
+        "_CUDA_STATUS",
+        (True, "test-gpu"),
+    )
+
+    assert _select_response_backend({"multiscale_backend": "auto"}) == (
+        "cuda",
+        "test-gpu",
+    )
+
+
+def test_multiscale_backend_auto_falls_back_to_cpu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        dense_candidates,
+        "_CUDA_STATUS",
+        (False, "cuda_unavailable"),
+    )
+
+    assert _select_response_backend({"multiscale_backend": "auto"}) == (
+        "cpu",
+        "cuda_unavailable",
+    )
 
 
 def test_zone_peak_indices_do_not_fill_empty_texture_tiles() -> None:

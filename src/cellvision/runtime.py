@@ -121,10 +121,17 @@ def detect_compute_runtime(requested_device: str | None = None) -> ComputeRuntim
                 if gpu_count > 0:
                     gpu_name = str(torch.cuda.get_device_name(0))
                 cuda_version = str(getattr(torch.version, "cuda", "") or "")
+                # is_available() can be true while the driver fails on the
+                # first real allocation. Exercise one tiny tensor so auto
+                # mode chooses CUDA only when the runtime is actually usable.
+                torch.empty(1, device="cuda").add_(1).item()
+                torch.cuda.synchronize()
         except Exception as exc:  # a broken driver must behave like no CUDA
             probe_error = f"CUDA 检测失败：{type(exc).__name__}: {exc}"
             cuda_available = False
             gpu_count = 0
+            gpu_name = ""
+            cuda_version = ""
     except Exception as exc:  # a CPU-only environment may not have torch yet
         probe_error = f"PyTorch 不可用：{type(exc).__name__}: {exc}"
 

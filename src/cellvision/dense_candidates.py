@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import time
 from pathlib import Path
@@ -21,6 +22,185 @@ from skimage.measure import regionprops
 
 from .config import artifact_path
 from .stage_cache import stage_fingerprint
+
+
+_CUDA_STATUS: tuple[bool, str] | None = None
+
+
+def _cuda_status() -> tuple[bool, str]:
+    """Return whether CUDA is usable without making it a hard dependency."""
+    global _CUDA_STATUS
+    if _CUDA_STATUS is not None:
+        return _CUDA_STATUS
+    try:
+        import torch
+
+        if bool(torch.cuda.is_available()):
+            _CUDA_STATUS = (True, torch.cuda.get_device_name(0))
+        else:
+            _CUDA_STATUS = (False, "cuda_unavailable")
+    except Exception as exc:  # pragma: no cover - depends on local runtime
+        _CUDA_STATUS = (False, f"torch_or_cuda_error:{type(exc).__name__}")
+    return _CUDA_STATUS
+
+
+def _select_response_backend(settings: dict[str, Any]) -> tuple[str, str]:
+    requested = str(settings.get("multiscale_backend", "auto")).strip().lower()
+    cuda_available, detail = _cuda_status()
+    if requested in {"cpu", "scipy"}:
+        return "cpu", "configured_cpu"
+    if requested in {"cuda", "gpu"}:
+        return ("cuda", detail) if cuda_available else ("cpu", detail)
+    return ("cuda", detail) if cuda_available else ("cpu", detail)
+
+
+def _gaussian_response_cpu(
+    raw: np.ndarray,
+    *,
+    contrast_weight: float,
+    gaussian_truncate: float,
+    sigma_scale: float = 1.0,
+) -> np.ndarray:
+    fine = gaussian_filter(
+        raw, 1.2 * sigma_scale, truncate=gaussian_truncate
+    )
+    background = gaussian_filter(
+        raw, 12.0 * sigma_scale, truncate=gaussian_truncate
+    )
+    medium = gaussian_filter(
+        raw, 4.0 * sigma_scale, truncate=gaussian_truncate
+    )
+    response = background - fine
+    contrast = np.abs(medium - fine)
+    return np.maximum(response, contrast_weight * contrast).astype(
+        np.float32, copy=False
+    )
+
+
+def _torch_gaussian_separable(
+    image: Any,
+    sigma: float,
+    truncate: float,
+    torch_module: Any,
+    functional: Any,
+) -> Any:
+    radius = max(1, int(math.ceil(float(sigma) * float(truncate))))
+    positions = torch_module.arange(
+        -radius,
+        radius + 1,
+        dtype=image.dtype,
+        device=image.device,
+    )
+    kernel = torch_module.exp(-0.5 * (positions / float(sigma)) ** 2)
+    kernel = kernel / kernel.sum()
+    horizontal = kernel.reshape(1, 1, 1, -1)
+    vertical = kernel.reshape(1, 1, -1, 1)
+    padded = functional.pad(
+        image,
+        (radius, radius, 0, 0),
+        mode="reflect",
+    )
+    filtered = functional.conv2d(padded, horizontal)
+    padded = functional.pad(
+        filtered,
+        (0, 0, radius, radius),
+        mode="reflect",
+    )
+    return functional.conv2d(padded, vertical)
+
+
+def _cuda_response_and_maxima(
+    batch: np.ndarray,
+    *,
+    contrast_weight: float,
+    gaussian_truncate: float,
+    minimum_distance: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Run the fine response and max-pooling while the data stays on CUDA."""
+    import torch
+    import torch.nn.functional as functional
+
+    device = torch.device("cuda")
+    tensor = torch.from_numpy(np.ascontiguousarray(batch)).to(device=device)
+    tensor = tensor.unsqueeze(1)
+    with torch.inference_mode():
+        fine = _torch_gaussian_separable(
+            tensor, 1.2, gaussian_truncate, torch, functional
+        )
+        background = _torch_gaussian_separable(
+            tensor, 12.0, gaussian_truncate, torch, functional
+        )
+        medium = _torch_gaussian_separable(
+            tensor, 4.0, gaussian_truncate, torch, functional
+        )
+        response = torch.maximum(
+            background - fine,
+            float(contrast_weight) * torch.abs(medium - fine),
+        )
+        padding = int(minimum_distance)
+        padded = functional.pad(
+            response,
+            (padding, padding, padding, padding),
+            mode="replicate",
+        )
+        pooled = functional.max_pool2d(
+            padded,
+            kernel_size=2 * padding + 1,
+            stride=1,
+        )
+        maxima = response == pooled
+    return (
+        response[:, 0].cpu().numpy().astype(np.float32, copy=False),
+        maxima[:, 0].cpu().numpy(),
+    )
+
+
+def _fine_response_and_maxima(
+    raw: np.ndarray,
+    settings: dict[str, Any],
+    *,
+    backend: str,
+    minimum_distance: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """Compute the full ROI response and local maxima."""
+    truncate = float(settings.get("multiscale_gaussian_truncate", 3.0))
+    contrast_weight = float(settings.get("multiscale_contrast_weight", 0.70))
+    response_seconds = 0.0
+    maxima_seconds = 0.0
+    combined_seconds = 0.0
+    response_started = time.perf_counter()
+    if backend == "cuda":
+        batch_response, batch_maxima = _cuda_response_and_maxima(
+            raw[None, ...],
+            contrast_weight=contrast_weight,
+            gaussian_truncate=truncate,
+            minimum_distance=minimum_distance,
+        )
+        combined_seconds = time.perf_counter() - response_started
+        response = batch_response[0]
+        maxima = batch_maxima[0]
+    else:
+        response = _gaussian_response_cpu(
+            raw,
+            contrast_weight=contrast_weight,
+            gaussian_truncate=truncate,
+        )
+        response_seconds = time.perf_counter() - response_started
+        maxima_started = time.perf_counter()
+        kernel = minimum_distance * 2 + 1
+        maxima = maximum_filter(response, size=kernel, mode="nearest") == response
+        maxima_seconds = time.perf_counter() - maxima_started
+    return response, maxima, {
+        "fine_backend": backend,
+        "fine_response_seconds": round(response_seconds, 6),
+        "fine_local_maxima_seconds": round(maxima_seconds, 6),
+        "fine_combined_seconds": round(
+            combined_seconds
+            if backend == "cuda"
+            else response_seconds + maxima_seconds,
+            6,
+        ),
+    }
 
 
 def detect_dynamic_wall_inner_fraction(
@@ -426,7 +606,16 @@ def augment_candidates_with_dense_raw_proposals(
     database: str | Path,
 ) -> dict[str, Any]:
     """Add high-recall raw-image peaks and exact manual cell anchors."""
+    global _CUDA_STATUS
     started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def record_timing(name: str, section_started: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - section_started
+        )
+
+    section_started = time.perf_counter()
     candidate_path = artifact_path(
         config, "pseudo_labels", "morphology_candidates.csv"
     )
@@ -475,6 +664,7 @@ def augment_candidates_with_dense_raw_proposals(
         & (images["decode_status"] == "ok")
         & ~images["well"].astype(str).str.upper().isin(excluded)
     ].copy()
+    record_timing("input_and_configuration", section_started)
     maximum_per_image = int(settings.get("maximum_peaks_per_image", 120))
     minimum_distance = int(settings.get("minimum_peak_distance_px", 9))
     response_percentile = float(
@@ -505,6 +695,11 @@ def augment_candidates_with_dense_raw_proposals(
     minimum_wall_rescue_response = float(
         settings.get("minimum_wall_rescue_peak_response", 28.0)
     )
+    response_backend, response_backend_detail = _select_response_backend(settings)
+    fine_response_seconds = 0.0
+    fine_local_maxima_seconds = 0.0
+    cuda_runtime_fallback_count = 0
+    cuda_runtime_fallback_detail: str | None = None
 
     shift_lookup: dict[tuple[str, str], tuple[float, float]] = {}
     for key, local in candidates.groupby(["well", "timepoint"]):
@@ -593,6 +788,7 @@ def augment_candidates_with_dense_raw_proposals(
         for row in images.itertuples(index=False)
     }
     rows: list[dict[str, Any]] = []
+    section_started = time.perf_counter()
     for row in manual.itertuples(index=False):
         key = (str(row.well), str(row.timepoint))
         image = image_lookup.get(key)
@@ -619,6 +815,7 @@ def augment_candidates_with_dense_raw_proposals(
                 response=1.0,
             )
         )
+    record_timing("manual_anchor_materialization", section_started)
 
     peak_images = images[
         images["timepoint"].astype(str).str.upper().isin(
@@ -635,14 +832,18 @@ def augment_candidates_with_dense_raw_proposals(
         peak_images.itertuples(index=False), start=1
     ):
         key = (str(image.well), str(image.timepoint))
+        section_started = time.perf_counter()
         with Image.open(image.raw_image_path) as opened:
             raw_full = np.asarray(opened.convert("L"), dtype=np.float32)
+        record_timing("raw_image_loading", section_started)
         full_height, full_width = raw_full.shape
+        section_started = time.perf_counter()
         wall_inner_fraction = (
             detect_dynamic_wall_inner_fraction(raw_full, settings)
             if wall_mask_enabled
             else 0.47
         )
+        record_timing("dynamic_wall_detection", section_started)
         wall_geometry_lookup[key] = wall_inner_fraction
         wall_geometry_rows.append(
             {
@@ -689,16 +890,59 @@ def augment_candidates_with_dense_raw_proposals(
             int(np.ceil(center_y + well_radius)) + filter_margin,
         )
         raw = raw_full[roi_y0:roi_y1, roi_x0:roi_x1]
-        fine = gaussian_filter(raw, 1.2)
-        background = gaussian_filter(raw, 12.0)
-        response = background - fine
-        medium = gaussian_filter(raw, 4.0)
-        contrast = np.abs(medium - fine)
-        response = np.maximum(
-            response,
-            float(settings.get("multiscale_contrast_weight", 0.70))
-            * contrast,
+        fine_started = time.perf_counter()
+        try:
+            response, maxima, fine_info = _fine_response_and_maxima(
+                raw,
+                settings,
+                backend=response_backend,
+                minimum_distance=minimum_distance,
+            )
+        except Exception as exc:
+            if response_backend != "cuda":
+                raise
+            # A CUDA driver, context, or memory failure should not abort a
+            # long plate run.  Disable CUDA for the remainder of this stage
+            # and recompute the current ROI with the deterministic CPU path.
+            cuda_runtime_fallback_count += 1
+            cuda_runtime_fallback_detail = (
+                f"{type(exc).__name__}: {exc}"
+            )
+            _CUDA_STATUS = (False, "runtime_failure_cpu_fallback")
+            response_backend = "cpu"
+            response_backend_detail = (
+                "cuda_runtime_failure_cpu_fallback:"
+                f"{type(exc).__name__}"
+            )
+            response, maxima, fine_info = _fine_response_and_maxima(
+                raw,
+                settings,
+                backend="cpu",
+                minimum_distance=minimum_distance,
+            )
+        fine_wall_elapsed = time.perf_counter() - fine_started
+        # The helper reports the response and local-maxima portions separately.
+        fine_response_seconds += float(fine_info.get("fine_response_seconds", 0.0))
+        fine_local_maxima_seconds += float(
+            fine_info.get("fine_local_maxima_seconds", 0.0)
         )
+        fine_combined = float(fine_info.get("fine_combined_seconds", 0.0))
+        fine_response = float(fine_info.get("fine_response_seconds", 0.0))
+        fine_maxima = float(fine_info.get("fine_local_maxima_seconds", 0.0))
+        if response_backend == "cuda":
+            timings["cuda_response_and_maxima"] = timings.get(
+                "cuda_response_and_maxima", 0.0
+            ) + fine_combined
+        timings["shared_multiscale_response"] = timings.get(
+            "shared_multiscale_response", 0.0
+        ) + fine_response
+        timings["local_maxima_filter"] = timings.get(
+            "local_maxima_filter", 0.0
+        ) + fine_maxima
+        timings["response_backend_overhead"] = timings.get(
+            "response_backend_overhead", 0.0
+        ) + max(0.0, fine_wall_elapsed - fine_combined)
+        section_started = time.perf_counter()
         height, width = response.shape
         yy, xx = np.ogrid[:height, :width]
         radial_fraction = np.sqrt(
@@ -722,11 +966,10 @@ def augment_candidates_with_dense_raw_proposals(
             (radial_fraction >= wall_inner_fraction)
             & (radial_fraction < wall_rescue_limit)
         )
-        maxima = response == maximum_filter(
-            response,
-            size=minimum_distance * 2 + 1,
-            mode="nearest",
-        )
+        # Inactive tiles remain zero/false.  They are outside all proposal
+        # zones after the response floor and do not enter peak selection.
+        record_timing("zone_masks", section_started)
+        section_started = time.perf_counter()
         selected_peaks = _zone_peak_indices(
             response,
             maxima,
@@ -739,6 +982,8 @@ def augment_candidates_with_dense_raw_proposals(
             grid_divisions=grid_divisions,
             coverage_per_tile=coverage_per_tile,
         )
+        record_timing("interior_peak_selection", section_started)
+        section_started = time.perf_counter()
         selected_peaks.extend(
             _zone_peak_indices(
                 response,
@@ -753,6 +998,8 @@ def augment_candidates_with_dense_raw_proposals(
                 coverage_per_tile=1,
             )
         )
+        record_timing("wall_buffer_peak_selection", section_started)
+        section_started = time.perf_counter()
         rescue_pool = _zone_peak_indices(
             response,
             maxima,
@@ -765,6 +1012,8 @@ def augment_candidates_with_dense_raw_proposals(
             grid_divisions=grid_divisions,
             coverage_per_tile=1,
         )
+        record_timing("wall_rescue_pool_selection", section_started)
+        section_started = time.perf_counter()
         rescue_surface = gaussian_filter(response, 2.0)
         rescue_threshold = float(
             settings.get("wall_rescue_minimum_blobness", 0.34)
@@ -781,9 +1030,12 @@ def augment_candidates_with_dense_raw_proposals(
                 wall_rescue_arc_rejected += 1
             if len(rescued_peaks) >= rescue_quota:
                 break
+        record_timing("wall_rescue_blobness", section_started)
+        section_started = time.perf_counter()
         wall_residual_peaks = _polar_wall_residual_peaks(
             raw_full, wall_inner_fraction, settings
         )
+        record_timing("wall_residual_detection", section_started)
         wall_residual_peak_count += len(wall_residual_peaks)
         residual_coordinates = np.asarray(
             [
@@ -793,6 +1045,7 @@ def augment_candidates_with_dense_raw_proposals(
             dtype=float,
         )
         if selected_peaks or rescued_peaks or wall_residual_peaks:
+            section_started = time.perf_counter()
             selected_count = 0
             shift_x, shift_y = shift_lookup.get(key, (0.0, 0.0))
             for peak in wall_residual_peaks:
@@ -933,12 +1186,14 @@ def augment_candidates_with_dense_raw_proposals(
                         wall_rescue_blobness=blobness,
                     )
                 )
+            record_timing("candidate_materialization_and_dedup", section_started)
         if image_index % 20 == 0 or image_index == len(peak_images):
             print(
                 f"dense raw candidates: {image_index}/{len(peak_images)}",
                 flush=True,
             )
 
+    section_started = time.perf_counter()
     augmented = pd.concat(
         [candidates, pd.DataFrame(rows)], ignore_index=True
     ).drop_duplicates("candidate_id", keep="last")
@@ -962,6 +1217,7 @@ def augment_candidates_with_dense_raw_proposals(
     ) & ~manual_anchor & ~wall_rescue_anchor
     candidate_stage_wall_excluded = int(outside_dynamic_wall.sum())
     augmented = augmented[~outside_dynamic_wall].copy()
+    record_timing("final_wall_filtering", section_started)
     wall_rescue_anchor = augmented["candidate_source"].astype(str).isin(
         ["wall_cell_rescue_peak", "wall_residual_peak"]
     )
@@ -983,6 +1239,7 @@ def augment_candidates_with_dense_raw_proposals(
         default="well_interior",
     )
     filter_settings = config.get("candidate_filter", {})
+    section_started = time.perf_counter()
     augmented = add_wall_neighbor_counts(
         augmented,
         wall_start=max(
@@ -994,6 +1251,8 @@ def augment_candidates_with_dense_raw_proposals(
             filter_settings.get("wall_chain_neighbor_radius_px", 110)
         ),
     )
+    record_timing("wall_neighbor_features", section_started)
+    section_started = time.perf_counter()
     augmented.to_csv(candidate_path, index=False, encoding="utf-8")
     wall_geometry_path = artifact_path(
         config, "cache", "dynamic_wall_geometry.csv"
@@ -1001,6 +1260,14 @@ def augment_candidates_with_dense_raw_proposals(
     pd.DataFrame(wall_geometry_rows).to_csv(
         wall_geometry_path, index=False, encoding="utf-8"
     )
+    record_timing("output_serialization", section_started)
+    measured_seconds = sum(timings.values())
+    timings["unattributed_overhead"] = max(
+        0.0, time.perf_counter() - started - measured_seconds
+    )
+    timing_seconds = {
+        name: round(seconds, 3) for name, seconds in timings.items()
+    }
     report = {
         "base_candidate_count": int(len(candidates)),
         "manual_anchor_count": int(
@@ -1042,6 +1309,13 @@ def augment_candidates_with_dense_raw_proposals(
         "candidate_manifest": str(candidate_path),
         "stage_fingerprint": dense_fingerprint,
         "cache_hit": False,
+        "response_backend": response_backend,
+        "response_backend_detail": response_backend_detail,
+        "cuda_runtime_fallback_count": cuda_runtime_fallback_count,
+        "cuda_runtime_fallback_detail": cuda_runtime_fallback_detail,
+        "fine_response_seconds": round(fine_response_seconds, 3),
+        "fine_local_maxima_seconds": round(fine_local_maxima_seconds, 3),
+        "timing_seconds": timing_seconds,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     report_path.write_text(

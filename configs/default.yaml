@@ -275,6 +275,9 @@ dense_detection:
   # A 3-sigma Gaussian support retained 374/375 reviewed T1-1 cell proposals
   # when combined with the response floor above, while reducing response time.
   multiscale_gaussian_truncate: 3.0
+  # Automatically use CUDA when PyTorch reports a usable GPU; otherwise use
+  # the SciPy CPU implementation.
+  multiscale_backend: auto
   dynamic_wall_mask_enabled: true
   wall_profile_target_size_px: 768
   wall_search_start_fraction: 0.38

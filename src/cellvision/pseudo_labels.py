@@ -61,6 +61,13 @@ def _component_rows(
         radial_fraction = float(
             np.hypot(x - width / 2, y - height / 2) / min(width, height)
         )
+        # Components above the pseudo-label hard non-cell area limit are
+        # typically the well rim or another large artifact.  Computing their
+        # convex hull solely for ``region.solidity`` dominates extraction time
+        # on full-resolution CF masks, while the area rule already rejects
+        # them unconditionally.  A zero sentinel preserves that rejection and
+        # avoids the unnecessary hull calculation.
+        solidity = float(region.solidity) if region.area <= 1200 else 0.0
         rows.append(
             {
                 "candidate_id": f"{well}:{timepoint}:cf:{component_index}",
@@ -74,7 +81,7 @@ def _component_rows(
                 "diameter_px": float(region.equivalent_diameter_area),
                 "circularity": circularity,
                 "eccentricity": float(region.eccentricity),
-                "solidity": float(region.solidity),
+                "solidity": solidity,
                 "extent": float(region.extent),
                 "radial_fraction": radial_fraction,
             }
@@ -219,6 +226,14 @@ def _assign_pseudo_labels(frame: pd.DataFrame) -> pd.DataFrame:
 
 def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
     started = time.perf_counter()
+    timings: dict[str, float] = {}
+
+    def record_timing(name: str, section_started: float) -> None:
+        timings[name] = timings.get(name, 0.0) + (
+            time.perf_counter() - section_started
+        )
+
+    section_started = time.perf_counter()
     settings = config.get("morphology_classifier", {})
     patch_size = int(settings.get("patch_size_px", 64))
     max_per_class = int(settings.get("max_patches_per_class", 12000))
@@ -249,6 +264,7 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
         },
         version="20260804-fingerprinted",
     )
+    record_timing("input_and_fingerprint", section_started)
     can_reuse = False
     if reuse_candidates and manifest_path.exists():
         cached = pd.read_csv(manifest_path)
@@ -273,12 +289,18 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
             flush=True,
         )
     else:
+        section_started = time.perf_counter()
         rows: list[dict[str, Any]] = []
         grouped_wells = list(selected.groupby("well"))
 
-        def extract_well(item: tuple[str, pd.DataFrame]) -> list[dict[str, Any]]:
+        def extract_well(
+            item: tuple[str, pd.DataFrame],
+        ) -> tuple[list[dict[str, Any]], float, float]:
             well, well_rows = item
+            registration_started = time.perf_counter()
             registration = compute_well_registration(config, images, well)
+            registration_elapsed = time.perf_counter() - registration_started
+            component_started = time.perf_counter()
             local_rows: list[dict[str, Any]] = []
             for image_row in well_rows.itertuples(index=False):
                 shift = registration.get(
@@ -291,13 +313,21 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
                     component["raw_image_path"] = image_row.raw_image_path
                     component["cf_image_path"] = image_row.cf_image_path
                     local_rows.append(component)
-            return local_rows
+            component_elapsed = time.perf_counter() - component_started
+            return local_rows, registration_elapsed, component_elapsed
 
         worker_count = max(1, int(settings.get("candidate_extraction_workers", 4)))
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             extracted = executor.map(extract_well, grouped_wells)
-            for well_index, local_rows in enumerate(extracted, start=1):
+            for well_index, extraction in enumerate(extracted, start=1):
+                local_rows, registration_elapsed, component_elapsed = extraction
                 rows.extend(local_rows)
+                timings["registration"] = timings.get("registration", 0.0) + (
+                    registration_elapsed
+                )
+                timings["component_extraction"] = timings.get(
+                    "component_extraction", 0.0
+                ) + component_elapsed
                 if well_index % 8 == 0 or well_index == len(grouped_wells):
                     print(
                         f"pseudo-label extraction: {well_index}/{len(grouped_wells)} wells, "
@@ -306,13 +336,21 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
                     )
         if not rows:
             raise RuntimeError("No CF-mask candidates were found in T0/T1/T2.")
-        candidates = _add_temporal_support(
-            _add_wall_neighbors(pd.DataFrame(rows))
-        )
+        record_timing("registration_and_component_extraction", section_started)
+        section_started = time.perf_counter()
+        candidates = _add_wall_neighbors(pd.DataFrame(rows))
+        record_timing("wall_neighbor_features", section_started)
+        section_started = time.perf_counter()
+        candidates = _add_temporal_support(candidates)
+        record_timing("temporal_support_features", section_started)
 
-    candidates = _assign_pseudo_labels(
-        _add_background_anisotropy(candidates)
-    )
+    section_started = time.perf_counter()
+    candidates = _add_background_anisotropy(candidates)
+    record_timing("background_anisotropy", section_started)
+    section_started = time.perf_counter()
+    candidates = _assign_pseudo_labels(candidates)
+    record_timing("pseudo_label_rules", section_started)
+    section_started = time.perf_counter()
     candidates.to_csv(manifest_path, index=False, encoding="utf-8")
     source_metadata_path.write_text(
         json.dumps(
@@ -325,7 +363,9 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
         ),
         encoding="utf-8",
     )
+    record_timing("candidate_manifest_serialization", section_started)
 
+    section_started = time.perf_counter()
     labelled = candidates[candidates["pseudo_label"] != "uncertain"].copy()
     sampled_parts: list[pd.DataFrame] = []
     for _, group in labelled.groupby(["pseudo_label", "well"]):
@@ -351,7 +391,9 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
     sampled = pd.concat(balanced_parts, ignore_index=True).sample(
         frac=1, random_state=seed
     )
+    record_timing("training_sample_selection", section_started)
 
+    section_started = time.perf_counter()
     patches: list[np.ndarray] = []
     patch_rows: list[dict[str, Any]] = []
     for raw_path, group in sampled.groupby("raw_image_path", sort=False):
@@ -360,12 +402,14 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
         for row in group.itertuples(index=False):
             patches.append(_crop_with_padding(raw, row.x_px, row.y_px, patch_size))
             patch_rows.append(row._asdict())
+    record_timing("training_patch_extraction", section_started)
     # Keep metadata in exactly the same order as the extracted patch tensor.
     sampled = pd.DataFrame(patch_rows)
     sampled["class_index"] = sampled["pseudo_label"].map(
         {"debris_artifact": 0, "cell": 1}
     )
     cache_path = artifact_path(config, "cache", "morphology_pseudo_labels.npz")
+    section_started = time.perf_counter()
     np.savez_compressed(
         cache_path,
         images=np.stack(patches),
@@ -377,6 +421,11 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
         index=False,
         encoding="utf-8",
     )
+    record_timing("training_cache_serialization", section_started)
+    measured_seconds = sum(timings.values())
+    timings["unattributed_overhead"] = max(
+        0.0, time.perf_counter() - started - measured_seconds
+    )
     summary = {
         "image_count": int(len(selected)),
         "well_count": int(selected["well"].nunique()),
@@ -386,6 +435,9 @@ def build_morphology_pseudo_labels(config: dict[str, Any]) -> Path:
         "training_patch_counts": sampled["pseudo_label"].value_counts().to_dict(),
         "patch_size_px": patch_size,
         "validation_source": "external_queue_required",
+        "timing_seconds": {
+            name: round(seconds, 3) for name, seconds in timings.items()
+        },
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
     cache_path.with_suffix(".json").write_text(
