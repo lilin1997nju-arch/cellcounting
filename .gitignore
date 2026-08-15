@@ -14,3 +14,5 @@ artifacts/*
 artifacts/cache/
 artifacts/models/
 artifacts/runs/*/*.pt
+*.npz
+*.npy
