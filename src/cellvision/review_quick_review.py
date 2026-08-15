@@ -11,7 +11,12 @@ import numpy as np
 import pandas as pd
 
 from .config import artifact_path
-from .multiplicity import ensure_integrated_review_table, ensure_multiplicity_table
+from .multiplicity import (
+    ensure_integrated_review_table,
+    ensure_multiplicity_table,
+    save_integrated_reviews,
+    save_multiplicity_labels,
+)
 from .review_helpers import _visible_v2_review_instances, _with_final_decisions
 from .review_storage import _summary_json_safe
 from .review_summary import (
@@ -23,6 +28,16 @@ from .review_summary import (
     write_summary,
 )
 from .well_screening import build_well_screening
+from fastapi import FastAPI, HTTPException
+from .review_context import build_review_context
+from .review_payloads import QuickReviewUndoPayload, QuickReviewWellPayload
+from .review_storage import (
+    _capture_quick_review_undo_snapshot,
+    _restore_quick_review_undo_snapshot,
+    _summary_json_safe,
+    save_annotation,
+)
+from .teaching import save_teaching_labels
 
 
 def build_quick_review_service(
@@ -690,3 +705,977 @@ def build_quick_review_service(
         lineage_representative_view=lineage_representative_view,
         add_model_candidates=add_model_candidates,
     )
+
+
+def register_quick_review_routes(
+    app: FastAPI,
+    config: dict[str, Any],
+    database: str | Path,
+    images_manifest: pd.DataFrame,
+    quick_review_service: SimpleNamespace,
+    gated_lookup: Any,
+    sync_catalog_after_review: Any,
+    refresh_gated_report: Any,
+) -> None:
+    """Register the quick-review routes for one plate."""
+
+    @app.get("/api/quick-review-stats")
+    def quick_review_stats() -> dict[str, Any]:
+        summary = quick_review_service.quick_review_summary()
+        if summary.get("status") != "ready":
+            return {"status": "not_generated"}
+        return {
+            "status": "ready",
+            **{
+                key: summary[key]
+                for key in (
+                    "round_id",
+                    "well_count",
+                    "completed_well_count",
+                    "pending_well_count",
+                    "object_count",
+                    "reviewed_object_count",
+                    "corrected_object_count",
+                    "temporal_review_object_count",
+                    "label_counts",
+                )
+                if key in summary
+            },
+        }
+
+    @app.get("/api/quick-review-wells")
+    def quick_review_wells(
+        mode: str = "pending",
+        search: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if mode not in {"pending", "reviewed", "all"}:
+            raise HTTPException(
+                status_code=422, detail="Invalid quick review mode"
+            )
+        summary = quick_review_service.quick_review_summary()
+        rows = list(summary.get("wells") or [])
+        if mode == "pending":
+            rows = [row for row in rows if not row.get("completed")]
+        elif mode == "reviewed":
+            rows = [row for row in rows if row.get("completed")]
+        if search:
+            needle = search.strip().upper()
+            rows = [
+                row for row in rows if needle in str(row.get("well", "")).upper()
+            ]
+        return rows
+
+    @app.get("/api/quick-review-well/{well}")
+    def quick_review_well(well: str) -> dict[str, Any]:
+        normalized_well = well.upper()
+        frame = quick_review_service.quick_review_frame()
+        local = frame[frame["well"] == normalized_well].copy()
+        if local.empty:
+            raise HTTPException(
+                status_code=404, detail="Reviewable well unavailable"
+            )
+        screening_path = artifact_path(
+            config, "predictions", "latest_well_screening.csv"
+        )
+        screening: dict[str, Any] = {}
+        roi: dict[str, Any] = {}
+        if screening_path.exists():
+            screening_frame = pd.read_csv(screening_path)
+            selected_screening = screening_frame[
+                screening_frame["well"].astype(str).str.upper()
+                == normalized_well
+            ]
+            if not selected_screening.empty:
+                screening = selected_screening.iloc[0].to_dict()
+                try:
+                    roi = json.loads(str(screening.get("roi_json", "{}")))
+                except json.JSONDecodeError:
+                    roi = {}
+        report = gated_lookup().get(normalized_well, {})
+        display_names = config.get("review", {}).get(
+            "timepoint_display_names",
+            {"T0": "T0", "T1": "T1", "T2": "T2", "T3": "Day7", "T4": "Day14"},
+        )
+        available_images = images_manifest[
+            (images_manifest["well"] == normalized_well)
+            & (images_manifest["timepoint"].isin(["T0", "T1", "T2", "T3", "T4"]))
+            & (images_manifest["decode_status"] == "ok")
+        ]
+        images: dict[str, Any] = {}
+        for timepoint in ["T0", "T1", "T2", "T3", "T4"]:
+            selected = available_images[
+                available_images["timepoint"] == timepoint
+            ]
+            if selected.empty:
+                images[timepoint] = {"available": False}
+                continue
+            row = selected.iloc[0]
+            late_decision = (
+                str(screening.get(f"{timepoint.lower()}_growth_decision", "pending"))
+                if timepoint in {"T3", "T4"}
+                else ""
+            )
+            representative = roi.get(timepoint) or None
+            if timepoint == "T3" and report.get("day7_regions_json"):
+                try:
+                    day7_regions = json.loads(str(report["day7_regions_json"]))
+                except (TypeError, json.JSONDecodeError):
+                    day7_regions = []
+                if day7_regions:
+                    representative = {
+                        "x": float(day7_regions[0]["center_x"]),
+                        "y": float(day7_regions[0]["center_y"]),
+                        "size": float(day7_regions[0]["x1"] - day7_regions[0]["x0"]),
+                    }
+            if timepoint == "T4" and report:
+                day14_positive = str(
+                    report.get("day14_obvious_growth", "")
+                ).strip().lower() in {"1", "true", "yes"}
+                late_decision = (
+                    "obvious_growth"
+                    if day14_positive
+                    else "no_growth"
+                )
+            # The endpoint CF mask is not sufficiently reliable for a visual
+            # overlay.  Keep the raw image and human growth decision, but do
+            # not calculate or return expensive/ambiguous shadow contours.
+            growth_regions: list[dict[str, Any]] = []
+            images[timepoint] = {
+                "available": True,
+                "display_label": str(display_names.get(timepoint, timepoint)),
+                "width_px": int(row["width_px"]),
+                "height_px": int(row["height_px"]),
+                "url": (
+                    f"/api/well-image?well={normalized_well}"
+                    f"&timepoint={timepoint}&max_size=1400"
+                ),
+                "hires_url": (
+                    f"/api/well-image?well={normalized_well}"
+                    f"&timepoint={timepoint}&max_size=4096"
+                ),
+                "annotatable": timepoint in {"T0", "T1", "T2"},
+                "late_growth_decision": late_decision,
+                "late_growth_source": (
+                    "pending"
+                    if pd.isna(
+                        screening.get(
+                            f"{timepoint.lower()}_growth_source", "pending"
+                        )
+                    )
+                    else str(
+                        screening.get(
+                            f"{timepoint.lower()}_growth_source", "pending"
+                        )
+                    )
+                ) if timepoint in {"T3", "T4"} else "",
+                "late_growth_search_stage": (
+                    ""
+                    if pd.isna(
+                        screening.get(
+                            f"{timepoint.lower()}_growth_search_stage", ""
+                        )
+                    )
+                    else str(
+                        screening.get(
+                            f"{timepoint.lower()}_growth_search_stage", ""
+                        )
+                    )
+                ) if timepoint in {"T3", "T4"} else "",
+                "representative_view": representative,
+                "growth_regions": growth_regions,
+                "growth_overlay_style": "none",
+                "default_zoom": (
+                    3.0
+                    if timepoint == "T3"
+                    and representative
+                    else 1.0
+                ),
+            }
+        columns = [
+            "candidate_id",
+            "well",
+            "timepoint",
+            "x_px",
+            "y_px",
+            "area_px",
+            "diameter_px",
+            "integrated_label",
+            "integrated_confidence",
+            "cell_probability",
+            "debris_probability",
+            "invalid_probability",
+            "single_probability",
+            "touching_doublet_probability",
+            "cluster_3plus_probability",
+            "reviewed_label",
+            "decision",
+            "current_label",
+            "final_label",
+            "final_review_label",
+            "final_source",
+            "final_reason_code",
+            "final_reason_text",
+            "final_confidence",
+            "final_status",
+            "is_manual_missed",
+            "temporal_completion_score",
+            "temporal_completion_status",
+            "temporal_completion_source_id",
+            "temporal_completion_direction",
+            "temporal_appearance_status",
+            "temporal_appearance_confidence",
+            "temporal_appearance_match_count",
+            "temporal_mean_patch_similarity",
+            "temporal_mean_mask_iou",
+            "temporal_max_area_ratio",
+            "temporal_appearance_matches",
+            "instance_component_id",
+            "instance_component_distance_px",
+            "instance_footprint_diameter_px",
+            "v2_instance_id",
+            "v2_contour_json",
+            "v2_instance_area_px",
+            "v2_instance_diameter_px",
+            "v2_instance_confidence",
+            "v2_objectness",
+            "v2_wall_overlap",
+            "v2_is_unique_instance",
+            "v2_is_temporal_candidate",
+            "v2_is_reviewable_instance",
+            "v2_is_counting_instance",
+            "v2_auto_invalid_probability_rule",
+            "v2_temporal_same_object_score",
+            "v2_temporal_static_similarity_score",
+            "v2_temporal_candidate_count",
+            "v2_temporal_foreground_similarity",
+            "v2_temporal_shape_similarity",
+            "v2_temporal_change_score",
+            "v2_temporal_growth_score",
+            "v2_temporal_foreground_quality",
+            "v2_temporal_evidence_frame_count",
+            "v2_temporal_pair_count",
+            "v2_temporal_three_frame_static",
+            "v2_temporal_morphology_stable_three_frame",
+            "v2_temporal_morphology_consensus_cell_probability",
+            "v2_temporal_debris_boost",
+            "v2_temporal_cell_boost",
+            "v2_adjusted_cell_probability",
+            "v2_adjusted_debris_probability",
+            "v2_temporal_adjustment_applied",
+            "v2_temporal_reason",
+            "v2_temporal_adjusted_label",
+            "v2_static_wall_artifact",
+            "v2_static_wall_cell_veto",
+            "v2_strong_cell_evidence_frame_count",
+            "v2_temporal_recovered",
+            "v2_temporal_track_id",
+            "v2_low_cell_noncell_resolved",
+            "v2_noncell_resolution_label",
+            "v3_track_behavior",
+            "v3_track_conclusion",
+            "v3_unified_label",
+            "v3_label_mode",
+            "v3_wall_origin",
+            "v3_wall_cell_veto",
+            "v3_wall_strong_cell_frame_count",
+            "v3_behavior_score",
+            "v3_division_interval",
+            "v3_division_veto",
+            "v3_division_rescue",
+            "v3_division_rescue_parent_candidate_id",
+            "v3_division_rescue_child_candidate_ids",
+            "v3_division_rescue_score",
+            "v3_reason",
+            "v3_frame_state",
+            "v3_proposed_label",
+            "v3_proposed_cell_probability",
+            "v3_proposed_debris_probability",
+            "v3_proposed_invalid_probability",
+            "v3_would_change",
+            "v3_identity_score",
+            "v3_static_similarity",
+            "v3_shape_similarity",
+            "v3_morphology_change_score",
+            "v3_semantic_degradation",
+            "v3_degradation_evidence_score",
+            "v3_foreground_quality",
+            "v3_track_frame_count",
+            "v3_track_pair_count",
+            "v3_valid_observations",
+            "v3_persistent_cell_evidence",
+            "v3_cell_to_debris_candidate",
+            "v3_track_id",
+            "v3_timepoint",
+            "v3_reviewed_label",
+        ]
+        columns = [column for column in columns if column in local.columns]
+        timepoint_order = pd.Categorical(
+            local["timepoint"], categories=["T0", "T1", "T2"], ordered=True
+        )
+        local = (
+            local.assign(_timepoint_order=timepoint_order)
+            .sort_values(["_timepoint_order", "y_px", "x_px"])
+            .drop(columns="_timepoint_order")
+        )
+        v3_tracks: list[dict[str, Any]] = []
+        if "v3_track_id" in local.columns:
+            track_frame = local[local["v3_track_id"].fillna("").astype(str).ne("")]
+            for track_id, track in track_frame.groupby("v3_track_id", sort=False):
+                def first_text(column: str) -> str:
+                    if column not in track:
+                        return ""
+                    values = track[column].fillna("").astype(str)
+                    return next((value for value in values if value), "")
+
+                v3_tracks.append(
+                    {
+                        "track_id": str(track_id),
+                        "well": normalized_well,
+                        "behavior": first_text("v3_track_behavior"),
+                        "conclusion": first_text("v3_track_conclusion"),
+                        "unified_label": first_text("v3_unified_label"),
+                        "label_mode": first_text("v3_label_mode"),
+                        "reason": first_text("v3_reason"),
+                        "division_rescue": bool(
+                            _boolean_series(
+                                track.get(
+                                    "v3_division_rescue",
+                                    pd.Series(False, index=track.index),
+                                )
+                            ).any()
+                        )
+                        if "v3_division_rescue" in track
+                        else False,
+                        "division_rescue_parent_candidate_id": first_text(
+                            "v3_division_rescue_parent_candidate_id"
+                        ),
+                        "division_rescue_child_candidate_ids": first_text(
+                            "v3_division_rescue_child_candidate_ids"
+                        ),
+                        "division_rescue_score": float(
+                            pd.to_numeric(
+                                track.get(
+                                    "v3_division_rescue_score",
+                                    pd.Series(0.0, index=track.index),
+                                ),
+                                errors="coerce",
+                            ).fillna(0.0).max()
+                        ),
+                        "reviewed_label": first_text("v3_reviewed_label"),
+                        "candidate_ids": track["candidate_id"].astype(str).tolist(),
+                        "timepoints": track["timepoint"].astype(str).tolist(),
+                        "frame_count": int(len(track)),
+                    }
+                )
+        search_hints: list[dict[str, Any]] = []
+        return {
+            "round_id": str(local.iloc[0]["integrated_round_id"]),
+            "well": normalized_well,
+            "images": images,
+            "objects": (
+                local[columns]
+                .replace({np.nan: None})
+                .to_dict(orient="records")
+            ),
+            "v3_tracks": v3_tracks,
+            "search_hints": search_hints,
+            "screening": {
+                key: (None if pd.isna(value) else value)
+                for key, value in screening.items()
+                if key != "roi_json"
+            },
+            "report": {
+                key: (None if pd.isna(value) else value)
+                for key, value in report.items()
+                if key != "day7_regions_json"
+            },
+            "counts_by_timepoint": {
+                timepoint: int((local["timepoint"] == timepoint).sum())
+                for timepoint in ["T0", "T1", "T2"]
+            },
+        }
+
+
+    @app.post("/api/quick-review-well-labels")
+    def quick_review_well_labels(
+        payload: QuickReviewWellPayload,
+    ) -> dict[str, Any]:
+        affected_wells = {item.well.upper() for item in payload.items}
+        if payload.well:
+            affected_wells.add(payload.well.upper())
+        allowed = {
+            "single",
+            "touching_doublet",
+            "cluster_3plus",
+            "debris",
+            "invalid",
+            "uncertain",
+        }
+        allowed_v3_track_labels = {
+            "dead_cell",
+            "single",
+            "touching_doublet",
+            "cluster_3plus",
+            "debris",
+            "invalid",
+            "uncertain",
+            "unmarked",
+        }
+        for item in payload.items:
+            if (
+                item.predicted_label not in allowed
+                or item.reviewed_label not in allowed
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid quick review label",
+                )
+        for track_review in payload.v3_track_reviews:
+            if track_review.label not in allowed_v3_track_labels:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Invalid V3 track review label",
+                )
+        primary_well = (
+            payload.well.upper()
+            if payload.well
+            else next(iter(affected_wells), "")
+        )
+        undo_snapshot = _capture_quick_review_undo_snapshot(
+            database,
+            payload.round_id,
+            [item.candidate_id for item in payload.items],
+            [item.track_id for item in payload.v3_track_reviews],
+        )
+        undo_snapshot["well"] = primary_well
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            existing_manual = {
+                str(row["candidate_id"]): dict(row)
+                for row in connection.execute(
+                    """
+                    SELECT quick_missed_id, annotation_id, candidate_id
+                    FROM quick_missed_objects
+                    WHERE round_id = ?
+                    """,
+                    (payload.round_id,),
+                ).fetchall()
+            }
+        standard_items: list[dict[str, Any]] = []
+        mappings: list[dict[str, Any]] = []
+        created_session_ids: list[int] = []
+        updated = datetime.now(timezone.utc).isoformat()
+        cell_labels = {
+            "single",
+            "touching_doublet",
+            "cluster_3plus",
+        }
+
+        def object_type_for(label: str) -> str:
+            if label in cell_labels:
+                return "cell"
+            if label == "debris":
+                return "debris"
+            if label == "invalid":
+                return "irrelevant"
+            return "uncertain"
+
+        def sync_training_labels(
+            candidate_id: str,
+            item: QuickReviewObjectItem,
+        ) -> None:
+            if item.reviewed_label in cell_labels:
+                save_teaching_labels(
+                    database,
+                    [
+                        {
+                            "candidate_id": candidate_id,
+                            "well": item.well.upper(),
+                            "timepoint": item.timepoint.upper(),
+                            "x_px": item.x_px,
+                            "y_px": item.y_px,
+                            "label": "cell",
+                            "source": "quick_missed_annotation",
+                        }
+                    ],
+                    payload.reviewer,
+                )
+                save_multiplicity_labels(
+                    database,
+                    [
+                        {
+                            "candidate_id": candidate_id,
+                            "well": item.well.upper(),
+                            "timepoint": item.timepoint.upper(),
+                            "x_px": item.x_px,
+                            "y_px": item.y_px,
+                            "label": item.reviewed_label,
+                            "source": "quick_missed_annotation",
+                        }
+                    ],
+                    payload.reviewer,
+                )
+            elif item.reviewed_label == "debris":
+                save_teaching_labels(
+                    database,
+                    [
+                        {
+                            "candidate_id": candidate_id,
+                            "well": item.well.upper(),
+                            "timepoint": item.timepoint.upper(),
+                            "x_px": item.x_px,
+                            "y_px": item.y_px,
+                            "label": "debris",
+                            "source": "quick_missed_annotation",
+                        }
+                    ],
+                    payload.reviewer,
+                )
+                with sqlite3.connect(database) as connection:
+                    connection.execute(
+                        """
+                        DELETE FROM multiplicity_labels
+                        WHERE candidate_id = ?
+                        """,
+                        (candidate_id,),
+                    )
+            else:
+                with sqlite3.connect(database) as connection:
+                    connection.execute(
+                        "DELETE FROM teaching_labels WHERE candidate_id = ?",
+                        (candidate_id,),
+                    )
+                    connection.execute(
+                        """
+                        DELETE FROM multiplicity_labels
+                        WHERE candidate_id = ?
+                        """,
+                        (candidate_id,),
+                    )
+
+        try:
+            for item in payload.items:
+                manual_row = existing_manual.get(item.candidate_id)
+                if item.is_new:
+                    if item.reviewed_label == "invalid":
+                        continue
+                    image = images_manifest[
+                        (images_manifest["well"] == item.well.upper())
+                        & (
+                            images_manifest["timepoint"]
+                            == item.timepoint.upper()
+                        )
+                    ]
+                    if image.empty:
+                        raise ValueError("Image unavailable for missed target")
+                    image_row = image.iloc[0]
+                    temporary_id = item.candidate_id
+                    annotation_id = save_annotation(
+                        database,
+                        {
+                            "sequence_id": str(
+                                image_row["experiment_id"]
+                            ),
+                            "plate_id": str(image_row["plate_id"]),
+                            "well": item.well.upper(),
+                            "timepoint": item.timepoint.upper(),
+                            "object_id": temporary_id,
+                            "canonical_target_id": temporary_id,
+                            "track_id": temporary_id,
+                            "parent_track_id": None,
+                            "x_px": item.x_px,
+                            "y_px": item.y_px,
+                            "object_type": object_type_for(
+                                item.reviewed_label
+                            ),
+                            "viability": (
+                                "unknown"
+                                if item.reviewed_label in cell_labels
+                                else "not_applicable"
+                            ),
+                            "division_state": "unknown",
+                            "duplicate_of": None,
+                            "reviewer": payload.reviewer,
+                            "confidence": 1.0,
+                            "notes": "quick_review_missed",
+                        },
+                    )
+                    candidate_id = (
+                        f"{item.well.upper()}:{item.timepoint.upper()}:"
+                        f"manual:{annotation_id}"
+                    )
+                    with sqlite3.connect(database) as connection:
+                        connection.execute(
+                            """
+                            INSERT INTO quick_missed_objects (
+                              round_id, annotation_id, candidate_id, well,
+                              timepoint, x_px, y_px, diameter_px,
+                              reviewed_label, reviewer, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                payload.round_id,
+                                annotation_id,
+                                candidate_id,
+                                item.well.upper(),
+                                item.timepoint.upper(),
+                                item.x_px,
+                                item.y_px,
+                                max(4.0, min(item.diameter_px, 96.0)),
+                                item.reviewed_label,
+                                payload.reviewer,
+                                updated,
+                            ),
+                        )
+                    sync_training_labels(candidate_id, item)
+                    mappings.append(
+                        {
+                            "temporary_id": temporary_id,
+                            "candidate_id": candidate_id,
+                            "annotation_id": annotation_id,
+                        }
+                    )
+                elif manual_row:
+                    candidate_id = item.candidate_id
+                    annotation_id = int(manual_row["annotation_id"])
+                    if item.reviewed_label == "invalid":
+                        with sqlite3.connect(database) as connection:
+                            connection.execute(
+                                """
+                                DELETE FROM quick_missed_objects
+                                WHERE candidate_id = ?
+                                """,
+                                (candidate_id,),
+                            )
+                            connection.execute(
+                                """
+                                DELETE FROM annotations
+                                WHERE annotation_id = ?
+                                """,
+                                (annotation_id,),
+                            )
+                            connection.execute(
+                                """
+                                DELETE FROM teaching_labels
+                                WHERE candidate_id = ?
+                                """,
+                                (candidate_id,),
+                            )
+                            connection.execute(
+                                """
+                                DELETE FROM multiplicity_labels
+                                WHERE candidate_id = ?
+                                """,
+                                (candidate_id,),
+                            )
+                        continue
+                    with sqlite3.connect(database) as connection:
+                        connection.execute(
+                            """
+                            UPDATE quick_missed_objects
+                            SET x_px=?, y_px=?, diameter_px=?,
+                                reviewed_label=?, reviewer=?, updated_at=?
+                            WHERE candidate_id=?
+                            """,
+                            (
+                                item.x_px,
+                                item.y_px,
+                                max(4.0, min(item.diameter_px, 96.0)),
+                                item.reviewed_label,
+                                payload.reviewer,
+                                updated,
+                                candidate_id,
+                            ),
+                        )
+                        connection.execute(
+                            """
+                            UPDATE annotations
+                            SET x_px=?, y_px=?, object_type=?, reviewer=?,
+                                notes='quick_review_missed',
+                                updated_at=?
+                            WHERE annotation_id=?
+                            """,
+                            (
+                                item.x_px,
+                                item.y_px,
+                                object_type_for(item.reviewed_label),
+                                payload.reviewer,
+                                updated,
+                                annotation_id,
+                            ),
+                        )
+                    sync_training_labels(candidate_id, item)
+                else:
+                    standard_items.append(
+                        {
+                            "candidate_id": item.candidate_id,
+                            "predicted_label": item.predicted_label,
+                            "reviewed_label": item.reviewed_label,
+                        }
+                    )
+            saved_standard = (
+                save_integrated_reviews(
+                    database,
+                    payload.round_id,
+                    standard_items,
+                    payload.reviewer,
+                )
+                if standard_items
+                else 0
+            )
+            saved_v3_tracks = 0
+            if payload.v3_track_reviews:
+                with sqlite3.connect(database) as connection:
+                    connection.executemany(
+                        """
+                        INSERT INTO temporal_track_reviews (
+                          round_id, track_id, well, label, behavior,
+                          reviewer, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(round_id, track_id) DO UPDATE SET
+                          well=excluded.well,
+                          label=excluded.label,
+                          behavior=excluded.behavior,
+                          reviewer=excluded.reviewer,
+                          updated_at=excluded.updated_at
+                        """,
+                        [
+                            (
+                                payload.round_id,
+                                item.track_id,
+                                item.well.upper(),
+                                item.label,
+                                item.behavior,
+                                payload.reviewer,
+                                updated,
+                            )
+                            for item in payload.v3_track_reviews
+                        ],
+                    )
+                    saved_v3_tracks = len(payload.v3_track_reviews)
+            if payload.duration_ms is not None:
+                corrected_count = sum(
+                    item.reviewed_label != item.predicted_label for item in payload.items
+                )
+                with sqlite3.connect(database) as connection:
+                    session_cursor = connection.execute(
+                        "INSERT INTO quick_review_sessions (round_id, well, reviewer, duration_ms, object_count, corrected_count, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            payload.round_id,
+                            (
+                                payload.well.upper()
+                                if payload.well
+                                else payload.items[0].well.upper()
+                                if payload.items
+                                else ""
+                            ),
+                            payload.reviewer,
+                            max(0, int(payload.duration_ms)),
+                            len(payload.items),
+                            corrected_count,
+                            updated,
+                        ),
+                    )
+                    if session_cursor.lastrowid is not None:
+                        created_session_ids.append(int(session_cursor.lastrowid))
+            undo_snapshot["created_manual"] = mappings
+            undo_snapshot["created_session_ids"] = created_session_ids
+            undo_snapshot_json = json.dumps(
+                _summary_json_safe(undo_snapshot),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            with sqlite3.connect(database) as connection:
+                undo_cursor = connection.execute(
+                    """
+                    INSERT INTO quick_review_undo_actions (
+                      round_id, well, reviewer, snapshot_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payload.round_id,
+                        primary_well,
+                        payload.reviewer,
+                        undo_snapshot_json,
+                        updated,
+                    ),
+                )
+                undo_action_id = int(undo_cursor.lastrowid)
+            screening = build_well_screening(
+                config,
+                database,
+                selected_wells=affected_wells or None,
+            )
+            gated_summary, updated_report = refresh_gated_report()
+            screening_source = artifact_path(
+                config, "predictions", "latest_well_screening.csv"
+            )
+            screening_row = None
+            selected_screening = pd.DataFrame()
+            if screening_source.exists() and primary_well:
+                screening_frame = pd.read_csv(screening_source, low_memory=False)
+                selected_screening = screening_frame[
+                    screening_frame["well"].astype(str).str.upper() == primary_well
+                ]
+            if not selected_screening.empty:
+                screening_row = selected_screening.replace({np.nan: None}).iloc[0].to_dict()
+            try:
+                # Refresh the persistent list index once while the save
+                # request already owns the authoritative updated state.  The
+                # next stats/list requests can then reuse it without parsing
+                # the full prediction table again.
+                quick_review_service.quick_review_summary(force=True)
+            except Exception:  # pragma: no cover - cache failure must not undo a save
+                quick_summary_cache["signature"] = None
+                quick_summary_cache["payload"] = None
+            sync_catalog_after_review(
+                "quick_review",
+                wells=affected_wells,
+                reviewer=payload.reviewer,
+                action_id=str(undo_action_id),
+                operation="quick_review_save",
+            )
+            return {
+                "status": "saved",
+                "saved_standard": saved_standard,
+                "saved_missed": len(mappings),
+                "saved_v3_tracks": saved_v3_tracks,
+                "mappings": mappings,
+                "undo_action": {
+                    "action_id": undo_action_id,
+                    "well": primary_well,
+                    "round_id": payload.round_id,
+                    "created_at": updated,
+                },
+                "well_screening": screening,
+                "screening": screening_row,
+                "gated_report_summary": (
+                    None
+                    if gated_summary is None
+                    else {key: value for key, value in gated_summary.items() if key != "wells"}
+                ),
+                "report": updated_report.get(primary_well),
+            }
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+    @app.get("/api/quick-review-undo")
+    def quick_review_undo_status(reviewer: str = "local_user") -> dict[str, Any]:
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            row = connection.execute(
+                """
+                SELECT undo_action_id, round_id, well, reviewer, created_at
+                FROM quick_review_undo_actions
+                WHERE reviewer = ? AND undone_at IS NULL
+                ORDER BY undo_action_id DESC
+                LIMIT 1
+                """,
+                (reviewer,),
+            ).fetchone()
+        if row is None:
+            return {"available": False}
+        return {
+            "available": True,
+            "action": {
+                "action_id": int(row["undo_action_id"]),
+                "round_id": str(row["round_id"]),
+                "well": str(row["well"]),
+                "reviewer": str(row["reviewer"]),
+                "created_at": str(row["created_at"]),
+            },
+        }
+
+    @app.post("/api/quick-review-undo")
+    def quick_review_undo(payload: QuickReviewUndoPayload) -> dict[str, Any]:
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            if payload.action_id is None:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM quick_review_undo_actions
+                    WHERE reviewer = ? AND undone_at IS NULL
+                    ORDER BY undo_action_id DESC
+                    LIMIT 1
+                    """,
+                    (payload.reviewer,),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM quick_review_undo_actions
+                    WHERE undo_action_id = ?
+                      AND reviewer = ?
+                      AND undone_at IS NULL
+                    """,
+                    (int(payload.action_id), payload.reviewer),
+                ).fetchone()
+        if row is None:
+            return {"status": "empty", "available": False}
+        try:
+            snapshot = json.loads(str(row["snapshot_json"]))
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=500, detail="Undo snapshot is invalid") from exc
+        _restore_quick_review_undo_snapshot(database, snapshot)
+        undone_at = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "UPDATE quick_review_undo_actions SET undone_at = ? WHERE undo_action_id = ?",
+                (undone_at, int(row["undo_action_id"])),
+            )
+        affected_wells = {
+            str(snapshot.get("well", row["well"])).upper()
+        }
+        screening = build_well_screening(
+            config,
+            database,
+            selected_wells=affected_wells,
+        )
+        gated_summary, updated_report = refresh_gated_report()
+        try:
+            quick_review_service.quick_review_summary(force=True)
+        except Exception:  # pragma: no cover - cache failure must not undo a restore
+            quick_summary_cache["signature"] = None
+            quick_summary_cache["payload"] = None
+        sync_catalog_after_review(
+            "quick_review",
+            wells=affected_wells,
+            reviewer=payload.reviewer,
+            action_id=str(row["undo_action_id"]),
+            operation="quick_review_undo",
+        )
+        undone_well = str(row["well"]).upper()
+        screening_row = None
+        screening_source = artifact_path(
+            config, "predictions", "latest_well_screening.csv"
+        )
+        if screening_source.exists():
+            screening_frame = pd.read_csv(screening_source, low_memory=False)
+            selected_screening = screening_frame[
+                screening_frame["well"].astype(str).str.upper() == undone_well
+            ]
+            if not selected_screening.empty:
+                screening_row = selected_screening.replace({np.nan: None}).iloc[0].to_dict()
+        return {
+            "status": "undone",
+            "available": True,
+            "undone_action": {
+                "action_id": int(row["undo_action_id"]),
+                "round_id": str(row["round_id"]),
+                "well": undone_well,
+                "created_at": str(row["created_at"]),
+                "undone_at": undone_at,
+            },
+            "well_screening": screening,
+            "screening": screening_row,
+            "gated_report_summary": (
+                None
+                if gated_summary is None
+                else {key: value for key, value in gated_summary.items() if key != "wells"}
+            ),
+            "report": updated_report.get(undone_well),
+        }
+
