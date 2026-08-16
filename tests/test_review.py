@@ -13,6 +13,7 @@ from cellvision.review_server import (
     save_annotation,
     save_lineage_review,
 )
+from cellvision.review_quick_review import V3_TRACK_REVIEW_LABELS
 from PIL import Image
 
 
@@ -71,6 +72,87 @@ def test_final_decision_contract_prefers_unified_human_track_review():
     assert result["final_confidence"] == 1.0
 
 
+def test_cell_family_track_review_preserves_frame_multiplicity():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "single",
+                "current_label": "single",
+                "reviewed_label": "single",
+                "v3_reviewed_label": "cell",
+                "v3_proposed_label": "single",
+                "integrated_confidence": 0.9,
+            },
+            {
+                "integrated_label": "touching_doublet",
+                "current_label": "touching_doublet",
+                "reviewed_label": "touching_doublet",
+                "v3_reviewed_label": "cell",
+                "v3_proposed_label": "touching_doublet",
+                "integrated_confidence": 0.9,
+            },
+            {
+                "integrated_label": "cluster_3plus",
+                "current_label": "cluster_3plus",
+                "reviewed_label": "cluster_3plus",
+                "v3_reviewed_label": "cell",
+                "v3_proposed_label": "cluster_3plus",
+                "integrated_confidence": 0.9,
+            },
+        ]
+    )
+
+    result = _with_final_decisions(frame)
+
+    assert result["final_label"].tolist() == [
+        "single",
+        "touching_doublet",
+        "cluster_3plus",
+    ]
+    assert set(result["final_source"]) == {"human_track_review"}
+    assert set(result["final_reason_code"]) == {"human_track_cell_review"}
+
+
+def test_legacy_exact_cell_track_review_no_longer_flattens_multiplicity():
+    frame = pd.DataFrame(
+        [
+            {
+                "integrated_label": "single",
+                "current_label": "single",
+                "reviewed_label": "single",
+                "v3_reviewed_label": "single",
+                "v3_proposed_label": "single",
+                "integrated_confidence": 0.9,
+            },
+            {
+                "integrated_label": "touching_doublet",
+                "current_label": "single",
+                "reviewed_label": "single",
+                "v3_reviewed_label": "single",
+                "v3_proposed_label": "touching_doublet",
+                "integrated_confidence": 0.9,
+            },
+        ]
+    )
+
+    result = _with_final_decisions(frame)
+
+    assert result["final_label"].tolist() == ["single", "touching_doublet"]
+
+
+def test_track_review_accepts_cell_family_without_cell_subtype_options():
+    html = (
+        Path(__file__).parents[1] / "review-ui" / "auto-review.html"
+    ).read_text(encoding="utf-8")
+    select = html.split('id="v3TrackLabel"', 1)[1].split("</select>", 1)[0]
+
+    assert "cell" in V3_TRACK_REVIEW_LABELS
+    assert 'value="cell"' in select
+    assert 'value="single"' not in select
+    assert 'value="touching_doublet"' not in select
+    assert 'value="cluster_3plus"' not in select
+
+
 def test_final_decision_contract_exposes_v3_override_as_review_label():
     frame = pd.DataFrame(
         [
@@ -104,6 +186,9 @@ def test_auto_review_uses_authoritative_label_for_controls_and_save():
     assert "button.dataset.label === editableDecisionLabel(object)" in source
     assert "const label = editableDecisionLabel(object);" in source
     assert "reviewed_label: editableDecisionLabel(object)" in source
+    assert 'v3TrackLabelFor(object) === "cell"' in source
+    assert "cellSubtypeLabels.includes(label)" in source
+    assert 'state.v3TrackLabels.set(track.track_id, "cell")' in source
 
 
 def test_final_decision_contract_keeps_v2_label_for_review_only_v3_state():

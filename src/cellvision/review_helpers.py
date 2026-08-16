@@ -258,6 +258,53 @@ def _decision_text(value: Any) -> str:
     return "" if text.lower() in {"nan", "none"} else text
 
 
+CELL_SUBTYPE_LABELS = {"single", "touching_doublet", "cluster_3plus"}
+
+
+def _cell_subtype_for_track_review(
+    row: pd.Series,
+    *,
+    prefer_frame_review: bool,
+    fallback: str = "single",
+) -> str:
+    """Resolve a cell-family track review without flattening multiplicity.
+
+    A track-level review answers whether every member is a biological cell.
+    Single/doublet/3+ remains a frame-level observation and may legitimately
+    change after division.  Legacy track reviews stored an exact cell subtype;
+    for those rows prefer the model's per-frame subtype so an old unified
+    ``single`` review no longer forces every frame back to one cell.
+    """
+
+    reviewed = _decision_text(row.get("reviewed_label"))
+    current = _decision_text(row.get("current_label"))
+    proposed = _decision_text(row.get("v3_proposed_label"))
+    adjusted = _decision_text(row.get("v2_temporal_adjusted_label"))
+    integrated = _decision_text(row.get("integrated_label"))
+    pre_temporal = _decision_text(row.get("v2_pre_temporal_integrated_label"))
+    candidates = (
+        [reviewed, current, proposed, adjusted, integrated, pre_temporal]
+        if prefer_frame_review
+        else [proposed, adjusted, integrated, pre_temporal, reviewed, current]
+    )
+    for label in candidates:
+        if label in CELL_SUBTYPE_LABELS:
+            return label
+
+    probabilities = {
+        "single": _decision_number(row.get("single_probability"), 0.0),
+        "touching_doublet": _decision_number(
+            row.get("touching_doublet_probability"), 0.0
+        ),
+        "cluster_3plus": _decision_number(
+            row.get("cluster_3plus_probability"), 0.0
+        ),
+    }
+    if any(value > 0.0 for value in probabilities.values()):
+        return max(probabilities, key=probabilities.get)
+    return fallback if fallback in CELL_SUBTYPE_LABELS else "single"
+
+
 def _final_review_label(value: Any) -> str:
     """Map the authoritative conclusion to a label supported by frame review."""
 
@@ -325,7 +372,20 @@ def _with_final_decisions(frame: pd.DataFrame) -> pd.DataFrame:
             row.get("v3_behavior_score"), integrated_confidence
         )
 
-        if track_review and track_review != "unmarked":
+        if track_review == "cell" or track_review in CELL_SUBTYPE_LABELS:
+            final_label = _cell_subtype_for_track_review(
+                row,
+                prefer_frame_review=track_review == "cell",
+                fallback=track_review,
+            )
+            source = "human_track_review"
+            reason_code = "human_track_cell_review"
+            reason_text = (
+                "人工已确认整条时序轨迹均属于细胞；"
+                "单细胞、黏连2细胞和3+细胞团保留逐帧结论。"
+            )
+            confidence = 1.0
+        elif track_review and track_review != "unmarked":
             final_label = track_review
             source = "human_track_review"
             reason_code = "human_track_review"

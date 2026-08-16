@@ -36,6 +36,7 @@ const growthDecisionNames = {
   pending: "待确认"
 };
 const labelNames = {
+  cell: "均为细胞（保留各帧数量）",
   single: "单细胞",
   touching_doublet: "粘连2细胞",
   cluster_3plus: "3+细胞团",
@@ -44,6 +45,7 @@ const labelNames = {
   invalid: "无关/误检"
 };
 labelNames.dead_cell = "V3统一死细胞";
+const cellSubtypeLabels = ["single", "touching_doublet", "cluster_3plus"];
 const labelColors = {
   single: "#27d79a",
   touching_doublet: "#24c7d9",
@@ -309,7 +311,7 @@ function renderV3WellSummary() {
   }).join("；");
   const remaining = tracks.length > 5 ? `；另有 ${tracks.length - 5} 条` : "";
   summary.hidden = false;
-  summary.textContent = `V3统一轨迹：本孔 ${tracks.length} 条，${deadCellCount} 条为V3统一死细胞。${preview}${remaining}。点击任一轨迹对象可统一复核 T0/T1/T2。`;
+  summary.textContent = `V3轨迹语义：本孔 ${tracks.length} 条，${deadCellCount} 条为V3统一死细胞。${preview}${remaining}。点击任一轨迹对象可联合复核 T0/T1/T2，并分别保留各帧细胞数量类型。`;
 }
 
 function renderTimepointCard(timepoint, container, annotatable) {
@@ -933,16 +935,37 @@ function hasUnifiedV3Track(object) {
 function v3TrackLabelFor(object) {
   const track = v3TrackFor(object);
   if (!track) return "";
-  return state.v3TrackLabels.get(track.track_id)
+  const label = state.v3TrackLabels.get(track.track_id)
     || track.reviewed_label
     || track.conclusion
     || track.unified_label
-    || (track.division_rescue
-      ? object.v3_proposed_label || object.current_label || "uncertain"
-      : "dead_cell");
+    || (track.division_rescue ? "cell" : "dead_cell");
+  // Older reviews stored a single/doublet/3+ subtype at track level. Treat
+  // those values as the semantic cell family so frame multiplicity can vary.
+  return cellSubtypeLabels.includes(label) ? "cell" : label;
+}
+
+function frameCellSubtype(object) {
+  const candidates = [
+    state.dirty.has(object.candidate_id) ? object.current_label : "",
+    object.reviewed_label,
+    object.v3_proposed_label,
+    object.integrated_label,
+    object.current_label
+  ];
+  const subtype = candidates.find(label => cellSubtypeLabels.includes(label));
+  if (subtype) return subtype;
+  const probabilities = [
+    ["single", Number(object.single_probability || 0)],
+    ["touching_doublet", Number(object.touching_doublet_probability || 0)],
+    ["cluster_3plus", Number(object.cluster_3plus_probability || 0)]
+  ];
+  probabilities.sort((left, right) => right[1] - left[1]);
+  return probabilities[0][0];
 }
 
 function v3StorageLabel(label, object) {
+  if (label === "cell") return frameCellSubtype(object);
   if (label === "dead_cell") return "debris";
   if (label === "unmarked") {
     return object.reviewed_label || object.integrated_label || "uncertain";
@@ -969,7 +992,7 @@ function applyV3TrackLabel(object, label) {
 }
 
 const finalSourceNames = {
-  human_track_review: "人工统一轨迹审核",
+  human_track_review: "人工轨迹语义审核",
   human_frame_review: "人工审核",
   v3_unified_track: "V3 统一轨迹决策",
   v3_temporal: "V3 时序决策",
@@ -983,7 +1006,7 @@ function effectiveFinalLabel(object) {
     ? state.v3TrackLabels.get(track.track_id)
     : "";
   if (pendingTrackLabel && pendingTrackLabel !== "unmarked") {
-    return pendingTrackLabel;
+    return v3StorageLabel(pendingTrackLabel, object);
   }
   if (state.dirty.has(object.candidate_id)) return object.current_label;
   return object.final_label || object.current_label || "uncertain";
@@ -1137,13 +1160,13 @@ function renderSelection() {
       `V3：${labelNames[label] || labelNames.dead_cell}`,
       track.reason || object.v3_reason || "多帧统一证据",
       track.division_rescue ? "跨轨迹分裂补救已触发" : "",
-      "保存时将 T0/T1/T2 作为同一条轨迹处理"
+      label === "cell"
+        ? "轨迹级仅确认均为细胞；单/双/3+按各帧判定保留"
+        : "保存时将 T0/T1/T2 作为同一语义类别处理"
     ].filter(Boolean).join(" · ");
     v3TrackLabel.value = [
       "dead_cell",
-      "single",
-      "touching_doublet",
-      "cluster_3plus",
+      "cell",
       "uncertain",
       "debris",
       "invalid",
@@ -1188,7 +1211,17 @@ function setSelectedLabel(label) {
     !state.dirty.has(object.candidate_id)
     && label === editableDecisionLabel(object)
   ) return;
-  if (hasUnifiedV3Track(object)) {
+  if (
+    hasUnifiedV3Track(object)
+    && v3TrackLabelFor(object) === "cell"
+    && cellSubtypeLabels.includes(label)
+  ) {
+    // Persist the semantic migration as ``cell`` even when an older review
+    // stored ``single``/``touching_doublet`` at track level. The selected
+    // frame keeps its own multiplicity below.
+    const track = v3TrackFor(object);
+    state.v3TrackLabels.set(track.track_id, "cell");
+  } else if (hasUnifiedV3Track(object)) {
     applyV3TrackLabel(object, label);
     return;
   }
