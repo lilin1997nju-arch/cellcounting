@@ -1583,8 +1583,8 @@ document.addEventListener("keydown", event => {
   const labels = {
     "1": "single",
     "2": "touching_doublet",
-    "3": "debris",
-    "4": "cluster_3plus",
+    "3": "cluster_3plus",
+    "4": "debris",
     "5": "uncertain",
     "6": "invalid"
   };
