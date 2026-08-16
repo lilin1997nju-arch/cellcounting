@@ -191,13 +191,14 @@ def build_quick_review_service(
                 with sqlite3.connect(database) as connection:
                     track_reviews = pd.read_sql_query(
                         """
-                        SELECT track_id, label AS v3_reviewed_label
+                        SELECT track_id, label AS v3_reviewed_label, updated_at, temporal_track_review_id
                         FROM temporal_track_reviews
-                        WHERE round_id = ?
+                        ORDER BY updated_at, temporal_track_review_id
                         """,
                         connection,
-                        params=(round_id,),
                     )
+                if not track_reviews.empty:
+                    track_reviews = track_reviews.drop_duplicates("track_id", keep="last")
             except (sqlite3.OperationalError, pd.errors.DatabaseError):
                 track_reviews = pd.DataFrame()
             if not track_reviews.empty:
@@ -213,16 +214,16 @@ def build_quick_review_service(
                 reviewable["v3_reviewed_label"] = None
         else:
             reviewable["v3_reviewed_label"] = None
+        # candidate_id is UNIQUE in quick_missed_objects, so manual additions
+        # survive a round-id change without filtering by round_id.
         with sqlite3.connect(database) as connection:
             manual = pd.read_sql_query(
                 """
                 SELECT candidate_id, well, timepoint, x_px, y_px,
                        diameter_px, reviewed_label, reviewer, updated_at
                 FROM quick_missed_objects
-                WHERE round_id = ?
                 """,
                 connection,
-                params=(round_id,),
             )
         if not manual.empty:
             manual["integrated_round_id"] = round_id
