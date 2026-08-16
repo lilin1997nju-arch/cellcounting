@@ -248,16 +248,19 @@ def _review_progress_for_plate(plate: dict[str, Any]) -> dict[str, Any]:
         )
         with sqlite3.connect(database_path) as connection:
             try:
+                # A later inference round changes integrated_round_id without
+                # migrating human decisions; keep the newest decision per
+                # candidate_id so reviewed progress survives round-id changes.
                 reviews = pd.read_sql_query(
                     """
                     SELECT candidate_id, reviewed_label, updated_at
                     FROM integrated_training_reviews
-                    WHERE round_id = ?
                     ORDER BY updated_at, integrated_review_id
                     """,
                     connection,
-                    params=(round_id,),
                 )
+                if not reviews.empty:
+                    reviews = reviews.drop_duplicates("candidate_id", keep="last")
             except (sqlite3.OperationalError, pd.errors.DatabaseError):
                 reviews = pd.DataFrame()
             try:

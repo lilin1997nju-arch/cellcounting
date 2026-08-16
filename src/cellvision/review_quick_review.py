@@ -41,6 +41,20 @@ from .review_storage import (
 from .teaching import save_teaching_labels
 
 
+V3_TRACK_REVIEW_LABELS = {
+    "cell",
+    "dead_cell",
+    # Retain legacy exact cell-subtype values for existing saved reviews.
+    "single",
+    "touching_doublet",
+    "cluster_3plus",
+    "debris",
+    "invalid",
+    "uncertain",
+    "unmarked",
+}
+
+
 def build_quick_review_service(
     config: dict[str, Any],
     database: str | Path,
@@ -154,13 +168,17 @@ def build_quick_review_service(
         with sqlite3.connect(database) as connection:
             reviews = pd.read_sql_query(
                 """
-                SELECT candidate_id, reviewed_label, decision
+                SELECT candidate_id, reviewed_label, decision, updated_at, integrated_review_id
                 FROM integrated_training_reviews
-                WHERE round_id = ?
+                ORDER BY updated_at, integrated_review_id
                 """,
                 connection,
-                params=(round_id,),
             )
+        # A later inference round changes integrated_round_id without migrating
+        # human decisions.  Match by candidate_id and keep the newest decision
+        # so reviewed progress survives a round-id change.
+        if not reviews.empty:
+            reviews = reviews.drop_duplicates("candidate_id", keep="last")
         reviewable = reviewable.merge(
             reviews, on="candidate_id", how="left"
         )
@@ -1112,16 +1130,6 @@ def register_quick_review_routes(
             "invalid",
             "uncertain",
         }
-        allowed_v3_track_labels = {
-            "dead_cell",
-            "single",
-            "touching_doublet",
-            "cluster_3plus",
-            "debris",
-            "invalid",
-            "uncertain",
-            "unmarked",
-        }
         for item in payload.items:
             if (
                 item.predicted_label not in allowed
@@ -1132,7 +1140,7 @@ def register_quick_review_routes(
                     detail="Invalid quick review label",
                 )
         for track_review in payload.v3_track_reviews:
-            if track_review.label not in allowed_v3_track_labels:
+            if track_review.label not in V3_TRACK_REVIEW_LABELS:
                 raise HTTPException(
                     status_code=422,
                     detail="Invalid V3 track review label",
