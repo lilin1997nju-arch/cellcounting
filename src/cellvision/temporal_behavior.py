@@ -659,10 +659,6 @@ def evaluate_temporal_behavior(
     persistent_cell = bool(
         sum(value >= float(settings.get("persistent_cell_threshold", 0.72)) for value in conditional.values())
         >= int(settings.get("persistent_cell_minimum_frames", 2))
-        or (
-            mean_cell >= float(settings.get("persistent_cell_mean_threshold", 0.65))
-            and any(value >= cell_strong for value in conditional.values())
-        )
     )
     strict_stable_debris = bool(
         signals.complete_triplet

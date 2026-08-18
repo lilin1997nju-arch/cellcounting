@@ -459,7 +459,6 @@ v3_temporal_behavior:
   cell_to_debris_unified_label: "dead_cell"
   persistent_cell_threshold: 0.72
   persistent_cell_minimum_frames: 2
-  persistent_cell_mean_threshold: 0.65
   stable_debris_maximum_morphology_change: 0.25
   stable_debris_maximum_cell_probability: 0.55
   stable_debris_output_cell_max: 0.38

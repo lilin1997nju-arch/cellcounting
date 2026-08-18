@@ -346,3 +346,26 @@ def test_invalid_probability_is_not_removed_from_persistent_cell_evidence():
     assert all(value["v3_persistent_cell_evidence"] is False for value in outputs.values())
     assert {value["v3_track_behavior"] for value in outputs.values()} == {"stable_debris"}
     assert {value["v3_proposed_label"] for value in outputs.values()} == {"debris"}
+
+
+def test_persistent_cell_requires_two_frames_above_threshold():
+    frame = pd.DataFrame(
+        [
+            _row(0, "T0", 0.81, 0.14, label="single"),
+            _row(1, "T1", 0.60, 0.35, label="single"),
+            _row(2, "T2", 0.60, 0.35, label="single"),
+        ]
+    ).set_index("index")
+
+    outputs = evaluate_temporal_behavior(
+        frame,
+        [0, 1, 2],
+        [_edge(0, 1), _edge(1, 2)],
+        _settings(),
+        "W:mean-cell-no-longer-persistent",
+    )
+
+    assert all(
+        value["v3_persistent_cell_evidence"] is False
+        for value in outputs.values()
+    )
