@@ -727,7 +727,12 @@ def save_mask_review(
     reviewed_frame.loc[row_indices, "v2_reviewed_diameter_px"] = reviewed_diameter
     # Recompute overlap ownership and all downstream instance eligibility flags
     # before either persistence target is committed.
-    reviewed_frame = finalize_v2_instances(reviewed_frame, mask_size, set())
+    reviewed_frame = finalize_v2_instances(
+        reviewed_frame,
+        mask_size,
+        set(),
+        config.get("v2_inference", {}),
+    )
     with sqlite3.connect(database_path) as connection:
         connection.execute(
             """

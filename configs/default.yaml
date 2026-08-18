@@ -328,6 +328,26 @@ v2_inference:
   refinement_minimum_iou: 0.70
   # Preserve adjacent lobes for reviewed doublets and larger cell groups.
   group_component_gap_px: 3
+  # Two strong single-cell seeds may receive overlapping masks when one mask
+  # leaks across a bright inter-cell gap. Split that union by marker watershed
+  # before duplicate suppression; true duplicate seeds lack the bright gap.
+  competing_single_split_enabled: true
+  competing_single_minimum_cell_probability: 0.90
+  competing_single_minimum_single_probability: 0.65
+  competing_single_maximum_invalid_probability: 0.10
+  competing_single_minimum_objectness: 0.75
+  competing_single_minimum_instance_confidence: 0.35
+  competing_single_minimum_center_diameter_ratio: 0.65
+  competing_single_maximum_center_diameter_ratio: 1.60
+  competing_single_minimum_gap_contrast: 0.22
+  competing_single_minimum_area_ratio: 0.25
+  competing_single_separator_radius_px: 1
+  # Per-plate, human-confirmed pairs may bypass the automatic candidate and
+  # post-split area-ratio gates. Mask validity and wall rejection still apply.
+  competing_single_confirmed_split_groups: []
+  competing_single_excluded_candidate_ids: []
+  competing_single_confirmed_parent_suppressions: {}
+  manual_candidate_label_overrides: {}
 
 v2_temporal_model:
   maximum_correspondence_distance_px: 128

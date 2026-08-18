@@ -19,6 +19,7 @@ _PATH_ENV_OVERRIDES = {
     "CELLVISION_LOG_ROOT": ("paths", "log_root"),
     "CELLVISION_SHARED_MODEL_ROOT": ("late_growth", "shared_model_root"),
 }
+_ARTIFACT_INFERENCE_OVERRIDES = Path("annotations") / "inference_overrides.yaml"
 
 
 def _resolve_path(value: str, base: Path) -> str:
@@ -118,6 +119,27 @@ def load_config(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
         paths["data_root"] = ""
     paths["data_root"] = _resolve_path(paths["data_root"], PROJECT_ROOT)
     paths["artifact_root"] = _resolve_path(paths.get("artifact_root", "artifacts"), PROJECT_ROOT)
+    # Human-reviewed inference decisions belong to the plate artifacts rather
+    # than generated YAML. Load them after path resolution so project/config
+    # regeneration cannot silently discard confirmed splits or non-cell labels.
+    inference_overrides_path = (
+        Path(paths["artifact_root"]) / _ARTIFACT_INFERENCE_OVERRIDES
+    )
+    if inference_overrides_path.is_file():
+        with inference_overrides_path.open("r", encoding="utf-8") as handle:
+            inference_overrides = yaml.safe_load(handle) or {}
+        if not isinstance(inference_overrides, dict):
+            raise ValueError(
+                f"Inference override root must be a mapping: {inference_overrides_path}"
+            )
+        v2_overrides = inference_overrides.get("v2_inference", inference_overrides)
+        if not isinstance(v2_overrides, dict):
+            raise ValueError(
+                f"v2_inference overrides must be a mapping: {inference_overrides_path}"
+            )
+        config["v2_inference"] = _deep_merge(
+            config.get("v2_inference", {}), v2_overrides
+        )
     for key in ("model_root", "db_root", "log_root"):
         if key in paths and str(paths[key]).strip():
             paths[key] = _resolve_path(paths[key], PROJECT_ROOT)

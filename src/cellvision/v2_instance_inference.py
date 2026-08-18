@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 from scipy.ndimage import binary_fill_holes, gaussian_filter, gaussian_filter1d, label as ndi_label, zoom
 from skimage.morphology import closing, dilation, disk, erosion, remove_small_holes, remove_small_objects
-from skimage.segmentation import inverse_gaussian_gradient, morphological_geodesic_active_contour
+from skimage.segmentation import inverse_gaussian_gradient, morphological_geodesic_active_contour, watershed
 from skimage.measure import find_contours, regionprops
 
 from .config import artifact_path
@@ -214,7 +214,7 @@ def _inference_fingerprint(
         "apply_manual_point_overrides", True
     )
     payload = {
-        "algorithm": "v2-instance-contour-guard-20260812",
+        "algorithm": "v2-instance-competing-seed-split-20260818",
         "predictions": _path_signature(predictions_path),
         "checkpoint": _path_signature(checkpoint_path),
         "annotations": _path_signature(database) if manual_overrides else {"ignored": True},
@@ -266,8 +266,427 @@ def _global_overlap(first: pd.Series, second: pd.Series, size: int) -> tuple[flo
     return intersection / max(area_a + area_b - intersection, 1), intersection / max(min(area_a, area_b), 1)
 
 
-def consolidate_v2_masks(frame: pd.DataFrame, patch_size: int) -> pd.DataFrame:
+def _row_float(row: pd.Series, name: str, default: float) -> float:
+    try:
+        value = float(row.get(name, default))
+    except (TypeError, ValueError):
+        return float(default)
+    return value if np.isfinite(value) else float(default)
+
+
+def _dark_core_gap_score(
+    raw: np.ndarray,
+    first: pd.Series,
+    second: pd.Series,
+) -> float:
+    """Measure whether two dark candidate cores have a background-like gap.
+
+    Duplicate proposals on one cell normally have a dark path between their
+    seeds. Separate phase-contrast cells instead have two dark cores with a
+    bright saddle between them. The score is normalized to local contrast so
+    it remains useful across plates and exposure levels.
+    """
+
+    first_x = _row_float(first, "x_px", np.nan)
+    first_y = _row_float(first, "y_px", np.nan)
+    second_x = _row_float(second, "x_px", np.nan)
+    second_y = _row_float(second, "y_px", np.nan)
+    if not all(np.isfinite(value) for value in (first_x, first_y, second_x, second_y)):
+        return 0.0
+    distance = float(np.hypot(first_x - second_x, first_y - second_y))
+    if distance < 4.0:
+        return 0.0
+
+    height, width = raw.shape
+    pad = max(6, int(np.ceil(distance * 0.75)))
+    left = max(0, int(np.floor(min(first_x, second_x))) - pad)
+    right = min(width, int(np.ceil(max(first_x, second_x))) + pad + 1)
+    top = max(0, int(np.floor(min(first_y, second_y))) - pad)
+    bottom = min(height, int(np.ceil(max(first_y, second_y))) + pad + 1)
+    local = raw[top:bottom, left:right].astype(np.float32)
+    if local.size < 16:
+        return 0.0
+    low, high = np.percentile(local, [5, 90])
+    scale = max(float(high - low), 8.0)
+
+    def core_level(x: float, y: float) -> float:
+        cx, cy = int(round(x)), int(round(y))
+        x0, x1 = max(0, cx - 2), min(width, cx + 3)
+        y0, y1 = max(0, cy - 2), min(height, cy + 3)
+        patch = raw[y0:y1, x0:x1].astype(np.float32)
+        if not patch.size:
+            return float(high)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        values = patch[(xx - x) ** 2 + (yy - y) ** 2 <= 2.25**2]
+        return float(np.median(values if values.size else patch))
+
+    sample_count = max(9, int(np.ceil(distance * 1.5)))
+    fractions = np.linspace(0.28, 0.72, sample_count)
+    line_values = []
+    for fraction in fractions:
+        x = int(round(first_x * (1.0 - fraction) + second_x * fraction))
+        y = int(round(first_y * (1.0 - fraction) + second_y * fraction))
+        if 0 <= x < width and 0 <= y < height:
+            line_values.append(float(raw[y, x]))
+    if len(line_values) < 3:
+        return 0.0
+    gap_level = float(np.percentile(line_values, 75))
+    darker_core_ceiling = max(core_level(first_x, first_y), core_level(second_x, second_y))
+    contrast = (gap_level - darker_core_ceiling) / scale
+    background_fraction = (gap_level - float(low)) / scale
+    if background_fraction < 0.55:
+        return 0.0
+    return max(float(contrast), 0.0)
+
+
+def _strong_single_candidate(row: pd.Series, settings: dict[str, Any]) -> bool:
+    return bool(
+        str(row.get("integrated_label", "")) == "single"
+        and _row_float(row, "cell_probability", 0.0)
+        >= float(settings.get("competing_single_minimum_cell_probability", 0.90))
+        and _row_float(row, "single_probability", 0.0)
+        >= float(settings.get("competing_single_minimum_single_probability", 0.65))
+        and _row_float(row, "invalid_probability", 1.0)
+        <= float(settings.get("competing_single_maximum_invalid_probability", 0.10))
+        and _row_float(row, "v2_objectness", 0.0)
+        >= float(settings.get("competing_single_minimum_objectness", 0.75))
+        and _row_float(row, "v2_instance_confidence", 0.0)
+        >= float(settings.get("competing_single_minimum_instance_confidence", 0.35))
+    )
+
+
+def _split_competing_single_masks(
+    frame: pd.DataFrame,
+    patch_size: int,
+    settings: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    """Split leaked masks when two strong single-cell seeds have a real gap."""
+
     output = frame.copy()
+    output["v2_competing_seed_split"] = False
+    output["v2_competing_seed_rivals"] = ""
+    output["v2_competing_seed_aliases"] = ""
+    output["v2_competing_seed_gap_score"] = 0.0
+    output["v2_competing_seed_human_confirmed"] = False
+    settings = settings or {}
+    if not bool(settings.get("competing_single_split_enabled", True)):
+        return output
+    required = {
+        "raw_image_path", "cell_probability", "single_probability",
+        "invalid_probability", "v2_objectness", "v2_instance_diameter_px",
+    }
+    if not required.issubset(output.columns):
+        return output
+
+    image_cache: dict[str, np.ndarray] = {}
+    minimum_ratio = float(settings.get("competing_single_minimum_center_diameter_ratio", 0.65))
+    maximum_ratio = float(settings.get("competing_single_maximum_center_diameter_ratio", 1.60))
+    minimum_gap = float(settings.get("competing_single_minimum_gap_contrast", 0.22))
+    minimum_area_ratio = float(settings.get("competing_single_minimum_area_ratio", 0.25))
+    confirmed_groups = [
+        {str(candidate_id) for candidate_id in group if str(candidate_id)}
+        for group in settings.get("competing_single_confirmed_split_groups", [])
+        if isinstance(group, (list, tuple, set)) and len(group) >= 2
+    ]
+    excluded_candidate_ids = {
+        str(candidate_id)
+        for candidate_id in settings.get("competing_single_excluded_candidate_ids", [])
+        if str(candidate_id)
+    }
+
+    valid = output[output["v2_mask_valid"] & ~output["v2_wall_rejected"]]
+    for (_, _), group in valid.groupby(["well", "timepoint"], sort=False):
+        group_ids = set(group["candidate_id"].astype(str))
+        group_confirmed_groups = [
+            confirmed_group
+            for confirmed_group in confirmed_groups
+            if confirmed_group.issubset(group_ids)
+        ]
+        group_confirmed_ids = (
+            set().union(*group_confirmed_groups) if group_confirmed_groups else set()
+        )
+        strong_indices = [
+            index for index, row in group.iterrows()
+            if str(row.get("candidate_id", "")) not in excluded_candidate_ids
+            and (
+                _strong_single_candidate(row, settings)
+                or str(row.get("candidate_id", "")) in group_confirmed_ids
+            )
+        ]
+        if len(strong_indices) < 2:
+            continue
+        edges: dict[int, set[int]] = {index: set() for index in strong_indices}
+        pair_scores: dict[tuple[int, int], float] = {}
+        for position, first_index in enumerate(strong_indices):
+            first = output.loc[first_index]
+            for second_index in strong_indices[position + 1 :]:
+                second = output.loc[second_index]
+                first_id = str(first.get("candidate_id", ""))
+                second_id = str(second.get("candidate_id", ""))
+                human_confirmed_pair = any(
+                    {first_id, second_id}.issubset(confirmed_group)
+                    for confirmed_group in group_confirmed_groups
+                )
+                distance = float(np.hypot(
+                    _row_float(first, "x_px", 0.0) - _row_float(second, "x_px", 0.0),
+                    _row_float(first, "y_px", 0.0) - _row_float(second, "y_px", 0.0),
+                ))
+                diameter = max(
+                    _row_float(first, "v2_instance_diameter_px", 0.0),
+                    _row_float(second, "v2_instance_diameter_px", 0.0),
+                    1.0,
+                )
+                ratio = distance / diameter
+                if not human_confirmed_pair and not minimum_ratio <= ratio <= maximum_ratio:
+                    continue
+                iou, containment = _global_overlap(first, second, patch_size)
+                if (
+                    not human_confirmed_pair
+                    and iou < 0.35
+                    and containment < 0.65
+                ):
+                    continue
+                first_path = str(first.get("raw_image_path", ""))
+                second_path = str(second.get("raw_image_path", ""))
+                if not first_path or first_path != second_path:
+                    continue
+                if first_path not in image_cache:
+                    path = Path(first_path)
+                    if not path.exists():
+                        continue
+                    with Image.open(path) as image:
+                        image_cache[first_path] = np.asarray(image.convert("L"), dtype=np.uint8)
+                score = _dark_core_gap_score(image_cache[first_path], first, second)
+                if not human_confirmed_pair and score < minimum_gap:
+                    continue
+                edges[first_index].add(second_index)
+                edges[second_index].add(first_index)
+                pair_scores[(min(first_index, second_index), max(first_index, second_index))] = score
+
+        pending = {index for index, rivals in edges.items() if rivals}
+        while pending:
+            start = pending.pop()
+            component = {start}
+            frontier = [start]
+            while frontier:
+                current = frontier.pop()
+                for neighbor in edges[current]:
+                    if neighbor not in component:
+                        component.add(neighbor)
+                        pending.discard(neighbor)
+                        frontier.append(neighbor)
+            if len(component) < 2:
+                continue
+            indices = sorted(component)
+            rows = [output.loc[index] for index in indices]
+            paths = {str(row.get("raw_image_path", "")) for row in rows}
+            if len(paths) != 1 or not next(iter(paths)):
+                continue
+            raw = image_cache[next(iter(paths))]
+            left = min(int(row.v2_mask_origin_x) for row in rows)
+            top = min(int(row.v2_mask_origin_y) for row in rows)
+            right = max(int(row.v2_mask_origin_x) + patch_size for row in rows)
+            bottom = max(int(row.v2_mask_origin_y) + patch_size for row in rows)
+            union = np.zeros((bottom - top, right - left), dtype=bool)
+            originals: dict[int, np.ndarray] = {}
+            for index, row in zip(indices, rows):
+                mask = decode_rle(str(row.v2_mask_rle), patch_size)
+                originals[index] = mask
+                x0 = int(row.v2_mask_origin_x) - left
+                y0 = int(row.v2_mask_origin_y) - top
+                union[y0 : y0 + patch_size, x0 : x0 + patch_size] |= mask
+            if not union.any():
+                continue
+
+            # Candidate generation can place both a raw and a CF seed on the
+            # same dark core. If each proposal became a watershed marker, a
+            # two-cell scene could be split into three instances. Collapse
+            # near-coincident seeds first, then give every alias the same
+            # refined region so ordinary duplicate suppression keeps one.
+            seed_clusters: list[list[int]] = []
+            for index in indices:
+                row = output.loc[index]
+                assigned_cluster: list[int] | None = None
+                for cluster in seed_clusters:
+                    representative = output.loc[cluster[0]]
+                    distance = float(np.hypot(
+                        _row_float(row, "x_px", 0.0)
+                        - _row_float(representative, "x_px", 0.0),
+                        _row_float(row, "y_px", 0.0)
+                        - _row_float(representative, "y_px", 0.0),
+                    ))
+                    diameter = min(
+                        _row_float(row, "v2_instance_diameter_px", 1.0),
+                        _row_float(representative, "v2_instance_diameter_px", 1.0),
+                    )
+                    if distance <= max(4.0, 0.30 * diameter):
+                        assigned_cluster = cluster
+                        break
+                if assigned_cluster is None:
+                    seed_clusters.append([index])
+                else:
+                    assigned_cluster.append(index)
+            if len(seed_clusters) < 2:
+                continue
+
+            def seed_quality(index: int) -> tuple[float, float]:
+                row = output.loc[index]
+                evidence = (
+                    _row_float(row, "cell_probability", 0.0)
+                    * _row_float(row, "single_probability", 0.0)
+                    * _row_float(row, "v2_objectness", 0.0)
+                    * _row_float(row, "v2_instance_confidence", 0.0)
+                )
+                return evidence, _row_float(row, "v2_instance_area_px", 0.0)
+
+            representatives = [max(cluster, key=seed_quality) for cluster in seed_clusters]
+            cluster_by_index = {
+                index: cluster_number
+                for cluster_number, cluster in enumerate(seed_clusters)
+                for index in cluster
+            }
+            component_ids = {
+                str(output.at[index, "candidate_id"]): index for index in indices
+            }
+            matched_confirmed_groups = [
+                group for group in confirmed_groups if group.issubset(component_ids)
+            ]
+            confirmed_ids = set().union(*matched_confirmed_groups) if matched_confirmed_groups else set()
+
+            raw_canvas = np.full(union.shape, float(np.median(raw)), dtype=np.float32)
+            source_left, source_top = max(left, 0), max(top, 0)
+            source_right, source_bottom = min(right, raw.shape[1]), min(bottom, raw.shape[0])
+            if source_left >= source_right or source_top >= source_bottom:
+                continue
+            raw_canvas[
+                source_top - top : source_bottom - top,
+                source_left - left : source_right - left,
+            ] = raw[source_top:source_bottom, source_left:source_right]
+            markers = np.zeros(union.shape, dtype=np.int32)
+            marker_ids: dict[int, int] = {}
+            used_positions: set[tuple[int, int]] = set()
+            union_points = np.argwhere(union)
+            for marker_id, index in enumerate(representatives, start=1):
+                row = output.loc[index]
+                x = int(round(_row_float(row, "x_px", 0.0))) - left
+                y = int(round(_row_float(row, "y_px", 0.0))) - top
+                if not (0 <= x < union.shape[1] and 0 <= y < union.shape[0]) or not union[y, x]:
+                    nearest = union_points[
+                        np.argmin((union_points[:, 0] - y) ** 2 + (union_points[:, 1] - x) ** 2)
+                    ]
+                    y, x = int(nearest[0]), int(nearest[1])
+                if (y, x) in used_positions:
+                    continue
+                used_positions.add((y, x))
+                markers[y, x] = marker_id
+                marker_ids[index] = marker_id
+            if len(marker_ids) != len(representatives):
+                continue
+            # A watershed line is intentionally retained as background. The
+            # pair passed a bright-gap gate, so preserving a one-pixel divider
+            # prevents the two reviewed contours from touching again merely
+            # because the original leaked union contained a thin bridge.
+            labels = watershed(
+                raw_canvas,
+                markers=markers,
+                mask=union,
+                watershed_line=True,
+            )
+            separator_radius = int(
+                settings.get("competing_single_separator_radius_px", 1)
+            )
+            watershed_line = union & (labels == 0)
+            if separator_radius > 0 and watershed_line.any():
+                labels[dilation(watershed_line, disk(separator_radius))] = 0
+            replacements: dict[int, np.ndarray] = {}
+            acceptable = True
+            assigned_by_cluster: dict[int, np.ndarray] = {}
+            for cluster_number, representative_index in enumerate(representatives):
+                row = output.loc[representative_index]
+                assigned = labels == marker_ids[representative_index]
+                x0 = int(row.v2_mask_origin_x) - left
+                y0 = int(row.v2_mask_origin_y) - top
+                local = assigned[y0 : y0 + patch_size, x0 : x0 + patch_size]
+                yy, xx = np.mgrid[:patch_size, :patch_size]
+                seed_x = _row_float(row, "x_px", patch_size / 2) - int(row.v2_mask_origin_x)
+                seed_y = _row_float(row, "y_px", patch_size / 2) - int(row.v2_mask_origin_y)
+                seed_weights = np.exp(-((xx - seed_x) ** 2 + (yy - seed_y) ** 2) / (2 * 4.0**2))
+                local = _selected_component(local, seed_weights)
+                cluster_ids = {
+                    str(output.at[index, "candidate_id"])
+                    for index in seed_clusters[cluster_number]
+                }
+                area_ratio = 0.0 if cluster_ids & confirmed_ids else minimum_area_ratio
+                if int(local.sum()) < max(
+                    3, int(originals[representative_index].sum() * area_ratio)
+                ):
+                    acceptable = False
+                    break
+                assigned_by_cluster[cluster_number] = assigned
+            if not acceptable:
+                continue
+            for index in indices:
+                row = output.loc[index]
+                assigned = assigned_by_cluster[cluster_by_index[index]]
+                x0 = int(row.v2_mask_origin_x) - left
+                y0 = int(row.v2_mask_origin_y) - top
+                local = assigned[y0 : y0 + patch_size, x0 : x0 + patch_size]
+                seed_x = _row_float(row, "x_px", patch_size / 2) - int(row.v2_mask_origin_x)
+                seed_y = _row_float(row, "y_px", patch_size / 2) - int(row.v2_mask_origin_y)
+                yy, xx = np.mgrid[:patch_size, :patch_size]
+                seed_weights = np.exp(-((xx - seed_x) ** 2 + (yy - seed_y) ** 2) / (2 * 4.0**2))
+                replacements[index] = _selected_component(local, seed_weights)
+            for index, row in zip(indices, rows):
+                mask = replacements[index]
+                area = int(mask.sum())
+                own_cluster = seed_clusters[cluster_by_index[index]]
+                aliases = sorted(
+                    str(output.at[alias, "candidate_id"])
+                    for alias in own_cluster
+                    if alias != index
+                )
+                rivals = sorted(
+                    str(output.at[rival, "candidate_id"])
+                    for rival in indices
+                    if cluster_by_index[rival] != cluster_by_index[index]
+                )
+                scores = [
+                    score
+                    for pair, score in pair_scores.items()
+                    if (
+                        pair[0] in own_cluster
+                        and pair[1] in component
+                        and cluster_by_index[pair[1]] != cluster_by_index[index]
+                    )
+                    or (
+                        pair[1] in own_cluster
+                        and pair[0] in component
+                        and cluster_by_index[pair[0]] != cluster_by_index[index]
+                    )
+                ]
+                output.at[index, "v2_mask_rle"] = _rle(mask)
+                output.at[index, "v2_contour_json"] = _contour(
+                    mask, int(row.v2_mask_origin_x), int(row.v2_mask_origin_y)
+                )
+                output.at[index, "v2_instance_area_px"] = area
+                output.at[index, "v2_instance_diameter_px"] = float(2.0 * np.sqrt(area / np.pi))
+                output.at[index, "v2_competing_seed_split"] = True
+                output.at[index, "v2_competing_seed_rivals"] = "|".join(rivals)
+                output.at[index, "v2_competing_seed_aliases"] = "|".join(aliases)
+                output.at[index, "v2_competing_seed_gap_score"] = max(scores, default=0.0)
+                output.at[index, "v2_competing_seed_human_confirmed"] = bool(
+                    str(row.get("candidate_id", "")) in confirmed_ids
+                )
+    return output
+
+
+def consolidate_v2_masks(
+    frame: pd.DataFrame,
+    patch_size: int,
+    inference_settings: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    output = frame.copy()
+    output = _split_competing_single_masks(output, patch_size, inference_settings)
     output["v2_is_suppressed"] = False
     output["v2_suppressed_by"] = ""
     output["v2_suppression_reason"] = ""
@@ -277,6 +696,12 @@ def consolidate_v2_masks(frame: pd.DataFrame, patch_size: int) -> pd.DataFrame:
         priority = group["integrated_label"].map(
             {"cluster_3plus": 3, "touching_doublet": 2, "single": 1, "debris": 1, "uncertain": 0, "invalid": -1}
         ).fillna(-1)
+        # A human-confirmed split is more authoritative than an overlapping
+        # unsplit cluster/doublet proposal. Process the reviewed child masks
+        # first so the coarse parent is suppressed rather than erasing both.
+        if "v2_competing_seed_human_confirmed" in group:
+            human_confirmed = group["v2_competing_seed_human_confirmed"].fillna(False).astype(bool)
+            priority = priority.where(~human_confirmed, 4)
         ordered = group.assign(_group_priority=priority).sort_values(
             ["_group_priority", "v2_instance_confidence", "integrated_confidence"], ascending=False
         )
@@ -301,6 +726,31 @@ def consolidate_v2_masks(frame: pd.DataFrame, patch_size: int) -> pd.DataFrame:
                 output.at[index, "v2_suppressed_by"] = str(output.at[owner, "candidate_id"])
                 output.at[index, "v2_suppression_reason"] = reason
                 output.at[index, "v2_instance_id"] = str(output.at[owner, "v2_instance_id"])
+    parent_suppressions = (inference_settings or {}).get(
+        "competing_single_confirmed_parent_suppressions", {}
+    )
+    if isinstance(parent_suppressions, dict):
+        candidate_indices = {
+            str(candidate_id): index
+            for index, candidate_id in output["candidate_id"].items()
+        }
+        for parent_id, child_id in parent_suppressions.items():
+            parent_index = candidate_indices.get(str(parent_id))
+            child_index = candidate_indices.get(str(child_id))
+            if parent_index is None or child_index is None:
+                continue
+            parent = output.loc[parent_index]
+            child = output.loc[child_index]
+            if (
+                str(parent.get("well", "")) != str(child.get("well", ""))
+                or str(parent.get("timepoint", "")) != str(child.get("timepoint", ""))
+                or bool(child.get("v2_is_suppressed", False))
+            ):
+                continue
+            output.at[parent_index, "v2_is_suppressed"] = True
+            output.at[parent_index, "v2_suppressed_by"] = str(child_id)
+            output.at[parent_index, "v2_suppression_reason"] = "human_confirmed_split_parent"
+            output.at[parent_index, "v2_instance_id"] = str(child.get("v2_instance_id", ""))
     return output
 
 
@@ -346,6 +796,7 @@ def finalize_v2_instances(
     enriched: pd.DataFrame,
     patch_size: int,
     protected_positive_ids: set[str] | None = None,
+    inference_settings: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     output = enriched.copy()
     protected_positive_ids = protected_positive_ids or set()
@@ -428,8 +879,25 @@ def finalize_v2_instances(
         "debris",
         np.where(low_cell_noncell, "invalid", ""),
     )
+    manual_label_overrides = (inference_settings or {}).get(
+        "manual_candidate_label_overrides", {}
+    )
+    output["v2_manual_label_override"] = False
+    output["v2_manual_label_override_value"] = ""
+    if isinstance(manual_label_overrides, dict):
+        allowed_labels = {
+            "single", "touching_doublet", "cluster_3plus", "debris", "invalid"
+        }
+        for candidate_id, label in manual_label_overrides.items():
+            normalized_label = str(label).strip().lower()
+            if normalized_label not in allowed_labels:
+                continue
+            selected = output["candidate_id"].astype(str) == str(candidate_id)
+            output.loc[selected, "integrated_label"] = normalized_label
+            output.loc[selected, "v2_manual_label_override"] = True
+            output.loc[selected, "v2_manual_label_override_value"] = normalized_label
     output["v2_rescued_from_invalid"] = recoverable & (output["v2_original_integrated_label"] == "invalid")
-    output = consolidate_v2_masks(output, patch_size)
+    output = consolidate_v2_masks(output, patch_size, inference_settings)
     # Keep instance identity, temporal eligibility, review visibility, and
     # final counting as separate states.  A valid low-confidence object must
     # remain available to the temporal model even when it is not yet suitable
@@ -465,6 +933,7 @@ def refinalize_v2_file(config: dict[str, Any], patch_size: int = 96) -> Path:
         source_frame,
         patch_size,
         _reviewed_positive_ids(config, source_frame),
+        config.get("v2_inference", {}),
     )
     summary_path = output_path.with_suffix(".json")
     if summary_path.exists():
@@ -715,7 +1184,12 @@ def infer_v2_instances(
     for name, values in columns.items():
         enriched[name] = values
     enriched = enriched.sort_index()
-    enriched = finalize_v2_instances(enriched, size, _reviewed_positive_ids(config, enriched))
+    enriched = finalize_v2_instances(
+        enriched,
+        size,
+        _reviewed_positive_ids(config, enriched),
+        inference_settings,
+    )
     enriched["integrated_round_id"] = "v2-round-" + datetime.fromtimestamp(Path(checkpoint_path).stat().st_mtime).strftime("%Y%m%d-%H%M%S")
     enriched.to_csv(pre_temporal_output, index=False)
     enriched.to_csv(output, index=False)
@@ -729,6 +1203,7 @@ def infer_v2_instances(
         "valid_instance_count": int(enriched["v2_mask_valid"].sum()),
         "wall_rejected_count": int(enriched["v2_wall_rejected"].sum()),
         "duplicate_or_covered_count": int(enriched["v2_is_suppressed"].sum()),
+        "competing_seed_split_count": int(enriched["v2_competing_seed_split"].sum()),
         "unique_instance_count": int(enriched["v2_is_unique_instance"].sum()),
         "temporal_candidate_count": int(enriched["v2_is_temporal_candidate"].sum()),
         "reviewable_instance_count": int(enriched["v2_is_reviewable_instance"].sum()),

@@ -50,6 +50,37 @@ def test_explicit_worker_paths_can_ignore_global_root_overrides(
     assert config["paths"]["artifact_root"] == str((tmp_path / "board-artifacts").resolve())
 
 
+def test_plate_artifact_inference_overrides_survive_generated_config(tmp_path: Path):
+    artifact_root = tmp_path / "board-artifacts"
+    override_path = artifact_root / "annotations" / "inference_overrides.yaml"
+    override_path.parent.mkdir(parents=True)
+    override_path.write_text(
+        "v2_inference:\n"
+        "  competing_single_confirmed_split_groups:\n"
+        "  - [first, second]\n"
+        "  manual_candidate_label_overrides:\n"
+        "    false-positive: debris\n",
+        encoding="utf-8",
+    )
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        f"paths:\n  data_root: {tmp_path / 'data'}\n"
+        f"  artifact_root: {artifact_root}\n"
+        "v2_inference:\n  competing_single_split_enabled: true\n",
+        encoding="utf-8",
+    )
+
+    config = load_config(path)
+
+    assert config["v2_inference"]["competing_single_split_enabled"] is True
+    assert config["v2_inference"]["competing_single_confirmed_split_groups"] == [
+        ["first", "second"]
+    ]
+    assert config["v2_inference"]["manual_candidate_label_overrides"] == {
+        "false-positive": "debris"
+    }
+
+
 def test_missing_required_path_is_rejected(tmp_path: Path):
     path = tmp_path / "invalid.yaml"
     path.write_text("paths:\n  artifact_root: /artifacts\n", encoding="utf-8")
