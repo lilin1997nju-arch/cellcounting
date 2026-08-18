@@ -16,6 +16,27 @@ from typing import Any
 
 SUPPORTED_DEVICE_REQUESTS = ("auto", "cuda", "cpu")
 
+# Development-only review surfaces must not be discoverable or callable in a
+# production installation.  Keep this list central so both the project hub and
+# the per-plate review app enforce the same boundary.
+PRODUCTION_HIDDEN_ROUTE_PATHS = {
+    "/teach",
+    "/doublet-teach",
+    "/single-doublet-review",
+    "/integrated-review",
+    "/mask-review",
+    "/projects/{project_id}/single-doublet-review",
+    "/projects/{project_id}/mask-review",
+    "/api/auto-review-new-round",
+}
+PRODUCTION_HIDDEN_ROUTE_PREFIXES = (
+    "/api/teach-",
+    "/api/multiplicity-",
+    "/api/integrated-review-",
+    "/api/mask-review",
+    "/api/mask-comparison",
+)
+
 
 def production_mode_enabled() -> bool:
     """Whether this process is running in compute-only production mode."""
@@ -36,6 +57,26 @@ def ensure_training_allowed() -> None:
             "Model training is disabled in CELLVISION_PRODUCTION mode; "
             "run training in a separate development environment."
         )
+
+
+def remove_development_routes(app: Any) -> None:
+    """Remove training and specialist model-audit routes in production.
+
+    Filtering the router makes these endpoints return 404 and removes them
+    from OpenAPI, instead of merely displaying a disabled button or returning
+    a late 403 after the training implementation has already been exposed.
+    """
+
+    if not production_mode_enabled():
+        return
+
+    def retained(route: Any) -> bool:
+        path = str(getattr(route, "path", ""))
+        if path in PRODUCTION_HIDDEN_ROUTE_PATHS:
+            return False
+        return not any(path.startswith(prefix) for prefix in PRODUCTION_HIDDEN_ROUTE_PREFIXES)
+
+    app.router.routes[:] = [route for route in app.router.routes if retained(route)]
 
 
 def _normalise_request(value: str | None) -> str:

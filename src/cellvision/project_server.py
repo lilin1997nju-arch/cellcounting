@@ -51,6 +51,7 @@ from .review_summary import (
 )
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
+from .runtime import remove_development_routes
 from .v2_mask_review import (
     create_model_comparison_round,
     list_mask_review_rounds,
@@ -2938,4 +2939,5 @@ public static class CellVisionWindowFocus
             pass
         return {"status": "deleted", "task": deleted}
 
+    remove_development_routes(app)
     return app

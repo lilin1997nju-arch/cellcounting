@@ -134,18 +134,6 @@ document.querySelectorAll("[data-mode]").forEach(button=>button.onclick=()=>{
 });
 $("reloadButton").onclick=loadBatch;
 $("pageSize").onchange=loadBatch;
-$("trainButton").onclick=async()=>{
-  if(state.busy)return;
-  state.busy=true;
-  $("trainButton").disabled=true;
-  setMessage("正在用审核结果重训形态与数量模型，并更新孔级筛选结果…");
-  try{
-    const result=await api("/api/integrated-review-new-round",{method:"POST"});
-    setMessage(`新一轮已完成：${result.integrated_round.round_id}`);
-    await refreshStats();await loadBatch();
-  }catch(error){setMessage(`重训失败：${error.message}`,true)}
-  finally{state.busy=false;$("trainButton").disabled=false}
-};
 document.addEventListener("keydown",event=>{
   if(event.target.matches("select,input,textarea,button"))return;
   const item=state.items[state.focused];

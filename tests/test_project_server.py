@@ -16,6 +16,41 @@ def test_folder_name_uses_parent_for_sessions_index():
     assert _folder_name(r"E:\\CM\\20260623 QL2603\\sessions.idx") == "20260623 QL2603"
 
 
+def test_production_project_hub_hides_specialist_training_and_mask_routes(
+    tmp_path: Path,
+    monkeypatch,
+):
+    monkeypatch.setenv("CELLVISION_PRODUCTION", "1")
+    manifest_path = tmp_path / "projects" / "main" / "project.json"
+    manifest_path.parent.mkdir(parents=True)
+    manifest_path.write_text(
+        json.dumps({"project_id": "main", "project_name": "Main", "plates": []}),
+        encoding="utf-8",
+    )
+
+    app = create_project_app(manifest_path)
+    paths = {getattr(route, "path", "") for route in app.routes}
+
+    assert "/single-doublet-review" not in paths
+    assert "/mask-review" not in paths
+    assert "/api/multiplicity-training-candidates" not in paths
+    assert "/api/mask-review-rounds" not in paths
+    assert "/api/project/export-results" in paths
+
+
+def test_production_dashboard_has_no_training_or_mask_review_entry():
+    html = (
+        Path(__file__).parents[1] / "review-ui" / "project-dashboard.html"
+    ).read_text(encoding="utf-8")
+    quick_review = (
+        Path(__file__).parents[1] / "review-ui" / "auto-review.html"
+    ).read_text(encoding="utf-8")
+
+    assert "单/粘连训练审核" not in html
+    assert "Mask 轮廓审核" not in html
+    assert "用本轮结果训练并生成下一轮" not in quick_review
+
+
 def test_plate_review_manager_resolves_sibling_projects_and_uses_lru_limit(tmp_path: Path):
     projects_root = tmp_path / "projects"
     main_dir = projects_root / "main"

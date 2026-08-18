@@ -17,10 +17,6 @@ from .session_index import write_session_group_manifest
 from .review_server import create_app
 from .project_server import create_project_app
 from .project_catalog import ProjectCatalog, catalog_path_for_manifest
-from .train import train_weak_segmenter
-from .train_morphology import train_morphology_classifier
-from .train_v2_instance import train_v2_instance_segmenter
-from .temporal_pairwise import train_temporal_pairwise_model
 from .v2_instance_inference import infer_v2_instances, refinalize_v2_file
 from .evaluate_v2 import write_v2_evaluation
 from .v2_temporal_inference import infer_v2_temporal_evidence, refinalize_v2_temporal_noncell_labels
@@ -28,7 +24,12 @@ from .review_image_cache import precache_review_images
 from .late_growth_inference import infer_late_growth
 from .gated_screening import build_gated_plate_report
 from .project_worker import ProjectTaskWorker
-from .runtime import SUPPORTED_DEVICE_REQUESTS, detect_compute_runtime, ensure_training_allowed
+from .runtime import (
+    SUPPORTED_DEVICE_REQUESTS,
+    detect_compute_runtime,
+    ensure_training_allowed,
+    production_mode_enabled,
+)
 
 
 # Keep one stable project-review endpoint.  Starting a new task should reuse
@@ -58,11 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output session-level CSV; a .groups.csv and .summary.json are created alongside it",
     )
     sessions.add_argument("--timepoint-origin", type=int, choices=(0, 1), default=0)
-    train = subparsers.add_parser("train")
-    train.add_argument(
-        "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v3-temporal-pairwise-model"]
-    )
-    train.add_argument("--config", default="configs/default.yaml")
+    if not production_mode_enabled():
+        train = subparsers.add_parser("train")
+        train.add_argument(
+            "model", choices=["weak-segmenter", "morphology-classifier", "v2-instance-segmenter", "v3-temporal-pairwise-model"]
+        )
+        train.add_argument("--config", default="configs/default.yaml")
     infer_v2 = subparsers.add_parser("infer-v2")
     infer_v2.add_argument("--config", default="configs/default.yaml")
     infer_v2.add_argument("--checkpoint", required=True)
@@ -312,6 +314,13 @@ def main(argv: list[str] | None = None) -> None:
         result = build_review_queue(config)
         print(f"review_candidates={len(result)}")
     elif args.command == "train":
+        # Training modules are imported only for the development CLI.  The
+        # production parser does not expose this command at all.
+        from .train import train_weak_segmenter
+        from .train_morphology import train_morphology_classifier
+        from .train_v2_instance import train_v2_instance_segmenter
+        from .temporal_pairwise import train_temporal_pairwise_model
+
         if args.model == "weak-segmenter":
             run_dir = train_weak_segmenter(config)
         elif args.model == "morphology-classifier":

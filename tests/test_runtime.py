@@ -1,4 +1,12 @@
-from cellvision.runtime import detect_compute_runtime, ensure_training_allowed
+import pytest
+from fastapi import FastAPI
+
+from cellvision.cli import build_parser
+from cellvision.runtime import (
+    detect_compute_runtime,
+    ensure_training_allowed,
+    remove_development_routes,
+)
 
 
 def test_cpu_runtime_is_always_available():
@@ -31,3 +39,40 @@ def test_production_mode_blocks_training(monkeypatch):
         assert "disabled" in str(exc)
     else:
         raise AssertionError("training guard did not reject production mode")
+
+
+def test_production_mode_removes_training_and_specialist_review_routes(monkeypatch):
+    monkeypatch.setenv("CELLVISION_PRODUCTION", "1")
+    app = FastAPI()
+
+    @app.get("/api/health")
+    def health():
+        return {"status": "ok"}
+
+    for path in (
+        "/teach",
+        "/single-doublet-review",
+        "/mask-review",
+        "/api/teach-train",
+        "/api/integrated-review-new-round",
+        "/api/mask-review-rounds",
+    ):
+        app.add_api_route(path, lambda: {}, methods=["GET"])
+
+    remove_development_routes(app)
+
+    paths = {getattr(route, "path", "") for route in app.routes}
+    assert "/api/health" in paths
+    assert "/teach" not in paths
+    assert "/single-doublet-review" not in paths
+    assert "/mask-review" not in paths
+    assert "/api/teach-train" not in paths
+    assert "/api/integrated-review-new-round" not in paths
+    assert "/api/mask-review-rounds" not in paths
+
+
+def test_production_cli_does_not_offer_train_command(monkeypatch):
+    monkeypatch.setenv("CELLVISION_PRODUCTION", "1")
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["train", "morphology-classifier"])

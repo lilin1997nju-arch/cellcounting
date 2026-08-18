@@ -1512,31 +1512,6 @@ async function undoLastSave() {
   }
 }
 
-async function generateNextRound() {
-  if (state.busy) return;
-  state.busy = true;
-  $("newRoundButton").disabled = true;
-  setMessage("正在用已审核结果训练形态与粘连模型，并更新下一轮孔级判定…");
-  try {
-    const result = await api("/api/integrated-review-new-round", {
-      method: "POST"
-    });
-    setMessage(`下一轮已生成：${result.integrated_round.round_id}`);
-    state.mode = "pending";
-    document.querySelectorAll("[data-mode]").forEach(button => {
-      button.classList.toggle("active", button.dataset.mode === state.mode);
-    });
-    state.busy = false;
-    await refreshStats();
-    await loadWells();
-  } catch (error) {
-    state.busy = false;
-    setMessage(`训练失败：${error.message}`, true);
-  } finally {
-    $("newRoundButton").disabled = false;
-  }
-}
-
 document.querySelectorAll("[data-mode]").forEach(button => {
   button.onclick = async () => {
     if (state.busy) return;
@@ -1559,7 +1534,6 @@ $("resetButton").onclick = resetWell;
 $("approveButton").onclick = () => saveWell(true);
 $("saveButton").onclick = () => saveWell(false);
 $("undoButton").onclick = undoLastSave;
-$("newRoundButton").onclick = generateNextRound;
 $("plateReportButton").onclick = async () => {
   if (!state.screeningWells.length) await loadScreeningWells();
   renderPlateDialog();

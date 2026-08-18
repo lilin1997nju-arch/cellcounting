@@ -5,17 +5,6 @@ let projectData = null;
 let taskNameAutoValue = "";
 let projectDataPollTimer = null;
 
-if (projectId) {
-  const multiplicityLink = $("multiplicityReviewLink");
-  if (multiplicityLink) {
-    multiplicityLink.href = `/single-doublet-review?project_id=${encodeURIComponent(projectId)}`;
-  }
-  const maskLink = $("maskReviewLink");
-  if (maskLink) {
-    maskLink.href = `/mask-review?project_id=${encodeURIComponent(projectId)}`;
-  }
-}
-
 const toast = text => {
   $("toast").textContent = text;
   $("toast").classList.add("show");
