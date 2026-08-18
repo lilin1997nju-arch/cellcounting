@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>CellVision 离线审核</title>
+  <link rel="stylesheet" href="assets/offline-review.css">
+</head>
+<body>
+  <header>
+    <div><small>CellVision 离线审核包</small><h1 id="title">正在读取任务…</h1></div>
+    <div class="header-actions">
+      <label>审核人 <input id="reviewer" autocomplete="name" placeholder="请输入姓名"></label>
+      <button id="exportButton" class="primary">导出审核结果</button>
+    </div>
+  </header>
+  <main>
+    <aside>
+      <div class="filters">
+        <select id="plateSelect" aria-label="板子"></select>
+        <input id="search" placeholder="搜索孔，如 C2">
+      </div>
+      <div id="progress" class="progress"></div>
+      <div id="wellList" class="well-list"></div>
+    </aside>
+    <section class="workspace">
+      <div class="well-header">
+        <div><small id="plateLabel"></small><h2 id="wellTitle">请选择孔</h2><p id="modelConclusion"></p></div>
+        <div class="well-actions">
+          <label>孔审核状态
+            <select id="screeningDecision">
+              <option value="pending">待审核</option>
+              <option value="approved">认可模型结论</option>
+              <option value="rejected">否决模型结论</option>
+            </select>
+          </label>
+          <button id="completeButton">标记本孔完成</button>
+        </div>
+      </div>
+      <div class="legend">
+        <span class="single">单细胞</span><span class="touching_doublet">相连双细胞</span>
+        <span class="cluster_3plus">3+细胞</span><span class="debris">杂质</span>
+        <span class="invalid">无效</span><span class="uncertain">不确定</span>
+        <span class="hint">点击标记后改判；开启“补漏”后在 T0～T2 图像上点击添加。</span>
+      </div>
+      <div class="toolbar">
+        <button id="zoomOut">−</button><strong id="zoomLabel">100%</strong><button id="zoomIn">＋</button>
+        <button id="zoomReset">复位</button><button id="missedMode">＋补漏</button>
+      </div>
+      <div id="frames" class="frames"></div>
+      <div id="objectEditor" class="object-editor empty">选择一个圈以修改结论</div>
+    </section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="data.js"></script>
+  <script src="assets/offline-review.js"></script>
+</body>
+</html>

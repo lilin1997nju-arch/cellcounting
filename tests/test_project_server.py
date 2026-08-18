@@ -36,6 +36,8 @@ def test_production_project_hub_hides_specialist_training_and_mask_routes(
     assert "/api/multiplicity-training-candidates" not in paths
     assert "/api/mask-review-rounds" not in paths
     assert "/api/project/export-results" in paths
+    assert "/api/project/tasks/{task_id_value}/export-offline-review" in paths
+    assert "/api/project/tasks/{task_id_value}/import-offline-review" in paths
 
 
 def test_production_dashboard_has_no_training_or_mask_review_entry():

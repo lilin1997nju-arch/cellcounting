@@ -42,6 +42,10 @@ from .multiplicity import (
     multiplicity_stats,
     save_categorized_review_labels,
 )
+from .offline_review import (
+    build_offline_review_bundle,
+    import_offline_review_results,
+)
 from .review_server import _visible_v2_review_instances, create_app, initialize_database
 from .review_summary import (
     latest_prediction_path,
@@ -2467,6 +2471,84 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             filename=download_name,
             background=BackgroundTask(_remove_export_file, str(temporary_path)),
         )
+
+    def completed_task_for_offline_review(
+        task_id_value: str,
+        project_id_value: str | None,
+    ) -> tuple[dict[str, Any], Path]:
+        """Resolve a completed task and its owning project manifest."""
+
+        matches = [
+            item
+            for item in tasks_for_project(project_id_value)
+            if str(item.get("task_id") or "") == str(task_id_value)
+        ]
+        if not matches:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        task = matches[0]
+        if str(task.get("status") or "") != "completed":
+            raise HTTPException(status_code=409, detail="只能导出已完成任务的离线审核包")
+        task_manifest_value = str(task.get("project_manifest") or "")
+        task_manifest = (
+            _resolve(task_manifest_value)
+            if task_manifest_value
+            else manifest_for_project(project_id_value)
+        )
+        if not task_manifest.is_file():
+            raise HTTPException(status_code=404, detail="任务所属项目清单不存在")
+        return task, task_manifest
+
+    @app.get("/api/project/tasks/{task_id_value}/export-offline-review")
+    def export_offline_review(
+        task_id_value: str,
+        project_id: str | None = None,
+    ) -> FileResponse:
+        """Download a self-contained, server-free review website."""
+
+        task, task_manifest = completed_task_for_offline_review(
+            task_id_value, project_id
+        )
+        try:
+            bundle_path, _ = build_offline_review_bundle(
+                task_manifest,
+                task,
+                ui_root=ui_root,
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"生成离线审核包失败：{exc}",
+            ) from exc
+        filename = f"{_slug(str(task.get('name') or task_id_value)) or 'cellvision'}-offline-review.zip"
+        return FileResponse(
+            bundle_path,
+            media_type="application/zip",
+            filename=filename,
+            background=BackgroundTask(_remove_export_file, str(bundle_path)),
+        )
+
+    @app.post("/api/project/tasks/{task_id_value}/import-offline-review")
+    def import_offline_review(
+        task_id_value: str,
+        payload: dict[str, Any],
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Apply a result JSON exported by a portable review bundle."""
+
+        task, task_manifest = completed_task_for_offline_review(
+            task_id_value, project_id
+        )
+        try:
+            result = import_offline_review_results(task_manifest, task, payload)
+        except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        sync_catalog_review(
+            task_manifest,
+            source="offline_review",
+            reviewer=str(result.get("reviewer") or "offline_reviewer"),
+            operation="offline_review_import",
+        )
+        return result
 
     @app.get("/api/project/tasks")
     def tasks(project_id: str | None = None) -> list[dict[str, Any]]:

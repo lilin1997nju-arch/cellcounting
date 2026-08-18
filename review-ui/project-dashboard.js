@@ -123,6 +123,10 @@ function taskActions(task) {
   if (status !== "completed" && status !== "running") {
     buttons.push(`<button class="task-action danger" type="button" data-task-action="delete" data-task-id="${esc(task.task_id)}">删除</button>`);
   }
+  if (status === "completed") {
+    buttons.push(`<button class="task-action secondary" type="button" data-task-action="offline-export" data-task-id="${esc(task.task_id)}">导出离线审核包</button>`);
+    buttons.push(`<button class="task-action secondary" type="button" data-task-action="offline-import" data-task-id="${esc(task.task_id)}">导入离线审核结果</button>`);
+  }
   return buttons.length ? `<div class="task-actions">${buttons.join("")}</div>` : "";
 }
 
@@ -148,6 +152,14 @@ async function handleTaskAction(event) {
   const action = button.dataset.taskAction;
   const taskId = button.dataset.taskId;
   if (!action || !taskId || button.disabled) return;
+  if (action === "offline-export") {
+    await exportOfflineReview(taskId, button);
+    return;
+  }
+  if (action === "offline-import") {
+    await chooseOfflineReviewResult(taskId, button);
+    return;
+  }
   if (action === "cancel" && !window.confirm("确定取消这个任务吗？")) return;
   if (action === "delete" && !window.confirm("只会删除任务记录，不会删除原始数据。确定删除吗？")) return;
   button.disabled = true;
@@ -164,6 +176,70 @@ async function handleTaskAction(event) {
   } finally {
     button.disabled = false;
   }
+}
+
+async function exportOfflineReview(taskId, button) {
+  button.disabled = true;
+  const originalText = button.textContent;
+  button.textContent = "正在打包图像…";
+  try {
+    const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+    const response = await fetch(`/api/project/tasks/${encodeURIComponent(taskId)}/export-offline-review${query}`);
+    if (!response.ok) throw new Error(await response.text());
+    const blob = await response.blob();
+    const disposition = response.headers.get("content-disposition") || "";
+    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+    const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = encodedName ? decodeURIComponent(encodedName) : plainName || `${taskId}-offline-review.zip`;
+    document.body.appendChild(link);
+    link.click();
+    URL.revokeObjectURL(link.href);
+    link.remove();
+    toast("离线审核包已导出；解压后双击 index.html 即可审核");
+  } catch (error) {
+    toast(`离线审核包导出失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+    button.textContent = originalText;
+  }
+}
+
+function chooseOfflineReviewResult(taskId, button) {
+  return new Promise(resolve => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = ".json,application/json";
+    input.onchange = async () => {
+      const file = input.files?.[0];
+      if (!file) { resolve(); return; }
+      button.disabled = true;
+      const originalText = button.textContent;
+      button.textContent = "正在导入…";
+      try {
+        const payload = JSON.parse(await file.text());
+        const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
+        const response = await fetch(`/api/project/tasks/${encodeURIComponent(taskId)}/import-offline-review${query}`, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        const result = await response.json();
+        const warning = result.refresh_warnings?.length ? `；${result.refresh_warnings.length} 块板报告刷新失败` : "";
+        toast(`导入完成：更新 ${result.updated_objects || 0} 个对象，补漏 ${result.added_objects || 0} 个${warning}`);
+        await loadProject();
+      } catch (error) {
+        toast(`离线审核结果导入失败：${error.message}`);
+      } finally {
+        button.disabled = false;
+        button.textContent = originalText;
+        resolve();
+      }
+    };
+    input.click();
+  });
 }
 
 async function api(url, options) {
