@@ -99,7 +99,8 @@ def test_project_export_writes_readable_workbook(tmp_path: Path):
     assert sheet.auto_filter.ref == "A1:P3"
     assert [cell.value for cell in sheet[1]] == [
         "任务名称", "板子名称", "孔号", "孔结论",
-        "T0单细胞个数", "T0双细胞个数", "T0多细胞个数", "T0推测细胞总数",
-        "T1单细胞个数", "T1双细胞个数", "T1多细胞个数", "T1推测细胞总数",
-        "T2单细胞个数", "T2双细胞个数", "T2多细胞个数", "T2推测细胞总数",
+        "T0单细胞个数", "T0双细胞个数", "T0多细胞个数",
+        "T1单细胞个数", "T1双细胞个数", "T1多细胞个数",
+        "T2单细胞个数", "T2双细胞个数", "T2多细胞个数",
+        "T0推测细胞总数", "T1推测细胞总数", "T2推测细胞总数",
     ]

@@ -621,14 +621,16 @@ def _write_project_result_excel(
         task_name=task_name,
         category_overrides=category_overrides,
     )
-    columns = ["任务名称", "板子名称", "孔号", "孔结论"] + [
-        field
+    columns = ["任务名称", "板子名称", "孔号", "孔结论"]
+    columns += [
+        f"{timepoint}{label}"
         for timepoint in _EXPORT_TIMEPOINTS
-        for field in (
-            *(f"{timepoint}{label}" for _, label in _EXPORT_COUNT_LABELS),
-            f"{timepoint}推测细胞总数",
-        )
+        for _, label in _EXPORT_COUNT_LABELS
     ]
+    # Keep the three weighted totals adjacent so reviewers can compare the
+    # estimated cell count across T0, T1 and T2 without scanning past the
+    # per-timepoint multiplicity breakdown columns.
+    columns += [f"{timepoint}推测细胞总数" for timepoint in _EXPORT_TIMEPOINTS]
     frame = pd.DataFrame(rows, columns=columns)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(destination, engine="openpyxl") as writer:
