@@ -5,7 +5,7 @@
 .DESCRIPTION
     The script creates a separate virtual environment, installs the runtime
     dependencies, probes the NVIDIA driver, installs a matching PyTorch wheel,
-    writes .env.production, and checks the four model files required by the
+    writes .env.production, and checks the three model files required by the
     production worker. Training packages and pytest are not installed.
 
     With -Device auto (the default), CUDA is preferred only when nvidia-smi is
@@ -22,6 +22,9 @@ param(
     [string]$DbRoot = "",
     [string]$LogRoot = "",
     [string]$Manifest = "",
+    [string]$BasePython = "",
+    [string]$Wheelhouse = "",
+    [switch]$Offline,
     [ValidateSet("auto", "cpu", "cuda")]
     [string]$Device = "auto",
     [int]$Port = 8777,
@@ -84,6 +87,15 @@ function Get-Python312 {
 
 function Install-TorchWheel {
     param([Parameter(Mandatory = $true)][string]$IndexName)
+    if ($Offline) {
+        Write-Host "Installing bundled PyTorch runtime ..." -ForegroundColor Cyan
+        & $script:PythonPath -m pip install --upgrade --force-reinstall --no-warn-script-location `
+            --no-index --find-links $Wheelhouse "torch==2.11.0" "torchvision==0.26.0"
+        if ($LASTEXITCODE -ne 0) {
+            throw "Bundled PyTorch installation failed."
+        }
+        return
+    }
     $indexUrl = "https://download.pytorch.org/whl/$IndexName"
     Write-Host "Installing PyTorch 2.11.0 / Torchvision 0.26.0 from $IndexName ..." -ForegroundColor Cyan
     & $script:PythonPath -m pip install --upgrade --force-reinstall --no-cache-dir --no-warn-script-location `
@@ -95,6 +107,7 @@ function Install-TorchWheel {
 }
 
 function Install-TorchSupport {
+    if ($Offline) { return }
     # These are PyTorch runtime dependencies, not training dependencies. Keep
     # their source on PyPI because the PyTorch wheel indexes are not general
     # package indexes.
@@ -118,7 +131,14 @@ function Get-RuntimeInfo {
 function Install-ProjectEditable {
     # Install the local package without resolving pyproject's unconstrained
     # torch requirement again. The selected wheel is installed explicitly.
-    Invoke-Python @("-m", "pip", "install", "--no-deps", "--no-cache-dir", "-e", $InstallRoot)
+    if ($Offline) {
+        Invoke-Python @(
+            "-m", "pip", "install", "--no-index", "--find-links", $Wheelhouse,
+            "--no-build-isolation", "--no-deps", "-e", $InstallRoot
+        )
+    } else {
+        Invoke-Python @("-m", "pip", "install", "--no-deps", "--no-cache-dir", "-e", $InstallRoot)
+    }
 }
 
 function Test-ModelBundle {
@@ -162,11 +182,29 @@ if ([string]::IsNullOrWhiteSpace($DataRoot)) {
     throw "DataRoot could not be resolved."
 }
 
+if ($Offline) {
+    if ([string]::IsNullOrWhiteSpace($Wheelhouse)) {
+        $Wheelhouse = Join-Path $InstallRoot "wheelhouse"
+    } else {
+        $Wheelhouse = Get-AbsolutePath -Value $Wheelhouse -BasePath $InstallRoot
+    }
+    if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
+        throw "Offline wheelhouse not found: $Wheelhouse"
+    }
+}
+
 foreach ($directory in @($DataRoot, $ArtifactRoot, $ModelRoot, $DbRoot, $LogRoot)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
-$basePython = Get-Python312
+$basePython = if ([string]::IsNullOrWhiteSpace($BasePython)) {
+    Get-Python312
+} else {
+    Get-AbsolutePath -Value $BasePython -BasePath $InstallRoot
+}
+if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
+    throw "Base Python executable not found: $basePython"
+}
 $venvRoot = Join-Path $InstallRoot ".venv-production"
 if ($ForceRecreate -and (Test-Path -LiteralPath $venvRoot)) {
     $resolvedVenv = [IO.Path]::GetFullPath($venvRoot)
@@ -184,9 +222,10 @@ if (-not (Test-Path -LiteralPath (Join-Path $venvRoot "Scripts\python.exe") -Pat
 $script:PythonPath = Join-Path $venvRoot "Scripts\python.exe"
 
 Write-Host "Installing base Python tooling ..." -ForegroundColor Cyan
-Invoke-Python @("-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel")
+$pipSource = if ($Offline) { @("--no-index", "--find-links", $Wheelhouse) } else { @() }
+Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("pip", "setuptools", "wheel"))
 Write-Host "Installing production runtime dependencies ..." -ForegroundColor Cyan
-Invoke-Python @("-m", "pip", "install", "--upgrade", "--no-cache-dir", "-r", (Join-Path $InstallRoot "requirements-production.txt"))
+Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("-r", (Join-Path $InstallRoot "requirements-production.txt")))
 
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $nvidiaUsable = $false
@@ -202,7 +241,12 @@ $tryCuda = ($Device -eq "cuda") -or ($Device -eq "auto" -and $nvidiaPresent)
 $runtime = $null
 $installedWheel = "cpu"
 
-if ($tryCuda) {
+if ($Offline) {
+    Install-TorchWheel -IndexName "offline"
+    Install-ProjectEditable
+    $runtime = Get-RuntimeInfo -RequestedDevice $Device
+    $installedWheel = if ([string]$runtime.torch_version -match "\+(.+)$") { $matches[1] } else { "cpu" }
+} elseif ($tryCuda) {
     foreach ($cudaIndex in @("cu128", "cu126")) {
         try {
             Install-TorchWheel -IndexName $cudaIndex
@@ -220,7 +264,7 @@ if ($tryCuda) {
     }
 }
 
-if ($null -eq $runtime -or $runtime.selected_device -ne "cuda") {
+if (-not $Offline -and ($null -eq $runtime -or $runtime.selected_device -ne "cuda")) {
     Install-TorchWheel -IndexName "cpu"
     Install-TorchSupport
     Install-ProjectEditable
@@ -234,7 +278,7 @@ if ($runtime.selected_device -ne "cpu" -and $runtime.selected_device -ne "cuda")
 
 $modelBundleReady = Test-ModelBundle -Root $ModelRoot
 if (-not $modelBundleReady -and -not $SkipModelCheck) {
-    throw "Production model bundle is incomplete. Copy the four checkpoint files into $ModelRoot or rerun with -SkipModelCheck."
+    throw "Production model bundle is incomplete. Copy the three checkpoint files into $ModelRoot or rerun with -SkipModelCheck."
 }
 
 $manifestParent = Split-Path -Parent $Manifest

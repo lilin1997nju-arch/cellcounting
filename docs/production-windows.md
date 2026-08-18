@@ -11,26 +11,46 @@ cellvision-db/           # 预留的数据库目录；当前版本的 annotation
 cellvision-logs/         # 服务和 worker 日志
 ```
 
+## 推荐：无网络电脑一键安装包
+
+在一台可联网的 Windows 构建机上，从干净且已提交的 Git 工作区执行：
+
+```powershell
+.\scripts\build_offline_release.ps1 -TorchVariant cpu
+```
+
+脚本会生成 `release\CellVision-offline-<Git节点>-cpu.zip`。ZIP 内已经包含：
+
+- 该 Git 节点的完整生产应用代码和 `RELEASE_GIT_COMMIT.txt`；
+- 三个生产 checkpoint 及 SHA-256；
+- Python 3.12 安装程序；
+- Windows Python 依赖、CPU PyTorch 和 torchvision 的完整 wheelhouse；
+- `RELEASE.json` 和全包 `SHA256SUMS.txt`；
+- 双击即可执行的 `Install-CellVision.cmd`。
+
+把 ZIP 复制到无网络电脑，完整解压后双击 `Install-CellVision.cmd`。安装器会先验证每个文件的 SHA-256，再把旧版本移动到带时间戳的备份目录，安装本包 Python/依赖、创建桌面快捷方式并启动服务。安装过程不会访问网络；默认程序目录是 `%LOCALAPPDATA%\CellVision`，原始数据入口是“文档\CellVisionData”，运行状态保存在 `%LOCALAPPDATA%\CellVisionState`。
+
+CPU 包可在所有生产电脑运行。若生产电脑确定有兼容 NVIDIA 驱动，可在联网构建机改用 `-TorchVariant cu128` 生成 CUDA 包；运行时仍会以真实的 `torch.cuda.is_available()` 为准，失败则回退 CPU。
+
 ## 需要准备的内容
 
 - Windows 10/11 x64 或 Windows Server。
 - Python 3.11--3.13；脚本优先使用 `py -3.12`。
 - 原始数据目录，包含项目导入所需的 `sessions.idx`、TIFF/CF 图像和仪器导出的 cells CSV。
 - 一个项目清单 `project.json`。它可以由项目服务创建，也可以从开发环境复制到生产机；清单中的原始数据路径必须是生产机可访问的绝对路径。
-- 发布模型包中的四个文件：
+- 发布模型包中的三个文件：
 
 ```text
 <MODEL_ROOT>/models/teaching_classifier.pt
 <MODEL_ROOT>/models/multiplicity_classifier.pt
 <MODEL_ROOT>/v2/models/latest_instance_segmenter.pt
-<MODEL_ROOT>/v2/models/latest_temporal_evidence.pt
 ```
 
 GPU 不是必需条件。GPU 机器需要可用的 NVIDIA 驱动；不要求单独安装 CUDA Toolkit。脚本先检查 `nvidia-smi`/NVIDIA 适配器，再安装官方 PyTorch CUDA wheel，最后以 `torch.cuda.is_available()` 的真实结果决定是否使用 CUDA。任何驱动或 CUDA 探测失败都会自动回退到 CPU。
 
 ## 一键配置
 
-先把整个项目目录复制到生产机，例如 `E:\CellVision`，再在该目录打开 PowerShell：
+以下是联网安装/维护方式；全新离线生产机优先使用上一节的一键包。先把整个项目目录复制到生产机，例如 `E:\CellVision`，再在该目录打开 PowerShell：
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
@@ -102,7 +122,7 @@ Device=auto
 脚本生成的 `.env.production` 会设置 `CELLVISION_PRODUCTION=1`。此模式下：
 
 - `cellvision train ...` 会直接拒绝执行；
-- `/api/teach-train`、`/api/integrated-review-new-round`、`/api/auto-review-new-round` 返回 403；
+- 训练、单/双细胞专项审核和 Mask 审核页面及 API 不注册到生产路由，访问返回 404；
 - worker 只加载已发布 checkpoint 做推理，并把结果写入 artifact/DB/log 目录；
 - 原始图像和模型目录应赋予只读权限；
 - `generate_auto_annotation_round`、`generate_integrated_training_round` 等名称中的 “round” 是推理结果/审核队列生成，不会更新模型 checkpoint，不等同于训练。
