@@ -238,7 +238,7 @@ def build_gated_plate_report(
     *,
     early_screening_csv: str | Path | None = None,
     sessions_csv: str | Path | None = None,
-    locate_day7: bool = True,
+    locate_day7: bool = False,
     day14_growth_overrides: dict[str, str] | None = None,
     endpoint_day_label: str = "Day14",
 ) -> dict[str, Any]:
@@ -251,14 +251,11 @@ def build_gated_plate_report(
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-    existing_day7: dict[str, dict[str, Any]] = {}
-    existing_report = output / "plate_overview.csv"
-    if not locate_day7 and existing_report.exists():
-        previous = pd.read_csv(existing_report, low_memory=False)
-        if "well" in previous.columns:
-            existing_day7 = previous.set_index(
-                previous["well"].astype(str).str.upper()
-            ).to_dict(orient="index")
+    # The former Day7 density locator could not reliably identify where later
+    # growth originated.  It is intentionally disabled even when an older
+    # caller passes locate_day7=True; stale regions are not carried forward.
+    # The previous-timepoint image remains available as a full-well view.
+    _ = (locate_day7, sessions_csv)
     endpoint = pd.read_csv(day14_csv, low_memory=False)
     endpoint = endpoint[endpoint["group_id"].astype(str) == str(group_id)].copy()
     if endpoint.empty:
@@ -279,16 +276,6 @@ def build_gated_plate_report(
                 early = early[early["group_id"].astype(str) == str(group_id)]
             early["well"] = early["well"].astype(str).str.upper()
             early_lookup = early.drop_duplicates("well", keep="last").set_index("well").to_dict(orient="index")
-
-    day7_dir: Path | None = None
-    if sessions_csv:
-        sessions = pd.read_csv(sessions_csv, low_memory=False)
-        selected = sessions[
-            (sessions["group_id"].astype(str) == str(group_id))
-            & (sessions["day_label"].astype(str).str.lower() == "day7")
-        ]
-        if not selected.empty:
-            day7_dir = Path(str(selected.iloc[-1]["session_path"]))
 
     rows: list[dict[str, Any]] = []
     for well in PLATE_WELLS:
@@ -343,26 +330,15 @@ def build_gated_plate_report(
                 decision.get("undetermined_reason_label", "")
             ).replace("Day14", str(endpoint_day_label))
 
-        previous_day7 = existing_day7.get(well, {})
-        previous_regions: list[dict[str, Any]] = []
-        try:
-            previous_regions = json.loads(str(previous_day7.get("day7_regions_json", "[]")))
-        except (TypeError, json.JSONDecodeError):
-            previous_regions = []
         day7_result: dict[str, Any] = {
-            "available": _as_bool(previous_day7.get("day7_available"), False),
-            "method": str(previous_day7.get("day7_method", "not_run")),
-            "regions": previous_regions,
+            "available": False,
+            "method": "disabled_full_well_only",
+            "regions": [],
         }
-        if locate_day7 and endpoint_positive and not is_control and day7_dir is not None:
-            cf_path = day7_dir / f"{well}-cf.tif"
-            day7_result = locate_day7_dense_regions(cf_path)
 
         evidence_notes: list[str] = []
         if _as_bool(early_row.get("has_debris"), False):
             evidence_notes.append("存在杂质")
-        if day14_positive and not is_control and not day7_result.get("regions"):
-            evidence_notes.append("Day7未定位到代表性高密区域")
 
         rows.append({
             "group_id": group_id,

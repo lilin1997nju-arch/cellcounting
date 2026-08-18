@@ -835,18 +835,12 @@ def register_quick_review_routes(
                 if timepoint in {"T3", "T4"}
                 else ""
             )
-            representative = roi.get(timepoint) or None
-            if timepoint == "T3" and report.get("day7_regions_json"):
-                try:
-                    day7_regions = json.loads(str(report["day7_regions_json"]))
-                except (TypeError, json.JSONDecodeError):
-                    day7_regions = []
-                if day7_regions:
-                    representative = {
-                        "x": float(day7_regions[0]["center_x"]),
-                        "y": float(day7_regions[0]["center_y"]),
-                        "size": float(day7_regions[0]["x1"] - day7_regions[0]["x0"]),
-                    }
+            # Late images are review evidence only.  The former Day7 density
+            # locator was not accurate enough to justify automatic panning or
+            # zooming, so T3/T4 always open as a complete well field.
+            representative = (
+                None if timepoint in {"T3", "T4"} else roi.get(timepoint) or None
+            )
             if timepoint == "T4" and report:
                 day14_positive = str(
                     report.get("day14_obvious_growth", "")
@@ -904,12 +898,7 @@ def register_quick_review_routes(
                 "representative_view": representative,
                 "growth_regions": growth_regions,
                 "growth_overlay_style": "none",
-                "default_zoom": (
-                    3.0
-                    if timepoint == "T3"
-                    and representative
-                    else 1.0
-                ),
+                "default_zoom": 1.0,
             }
         columns = [
             "candidate_id",

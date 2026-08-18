@@ -157,14 +157,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     _run_stage(stages, "early_well_screening", lambda: build_well_screening(config, database))
     final = _run_stage(
         stages,
-        "day7_localization_and_final_report",
+        "final_report",
         lambda: build_gated_plate_report(
             args.day14_csv,
             args.group_id,
             output_dir,
             early_screening_csv=early_path,
             sessions_csv=args.sessions_csv,
-            locate_day7=True,
+            locate_day7=False,
             endpoint_day_label=getattr(args, "endpoint_day_label", "Day14"),
         ),
     )

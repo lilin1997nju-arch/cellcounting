@@ -182,3 +182,38 @@ def test_day14_human_no_growth_override_replaces_automatic_positive(tmp_path) ->
     assert rows["G3"]["day14_obvious_growth"] is False
     assert rows["G3"]["day14_screening_decision"] == "human_no_growth"
     assert rows["G3"]["final_category"] == "no_obvious_growth"
+
+
+def test_plate_report_disables_late_localization_and_drops_stale_regions(tmp_path) -> None:
+    endpoint = pd.DataFrame([{
+        "group_id": "plate-1",
+        "well": "A2",
+        "is_positive_control": False,
+        "day14_obvious_sheet_growth": True,
+        "screening_decision": "retain",
+        "raw_image_path": "A2.tif",
+        "cf_mask_path": "A2-cf.tif",
+    }])
+    endpoint_path = tmp_path / "endpoint.csv"
+    endpoint.to_csv(endpoint_path, index=False)
+    output = tmp_path / "report"
+    output.mkdir()
+    pd.DataFrame([{
+        "well": "A2",
+        "day7_available": True,
+        "day7_method": "legacy_locator",
+        "day7_regions_json": json.dumps([{"center_x": 100, "center_y": 120}]),
+    }]).to_csv(output / "plate_overview.csv", index=False)
+
+    result = build_gated_plate_report(
+        endpoint_path,
+        "plate-1",
+        output,
+        locate_day7=True,
+    )
+
+    row = next(item for item in result["wells"] if item["well"] == "A2")
+    assert row["day7_available"] is False
+    assert row["day7_method"] == "disabled_full_well_only"
+    assert json.loads(row["day7_regions_json"]) == []
+    assert "Day7未定位" not in row["evidence_notes"]

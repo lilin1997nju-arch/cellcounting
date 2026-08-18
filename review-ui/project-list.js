@@ -56,7 +56,7 @@ const boardStageNames = {
   v2_instance_segmentation: "实例分割",
   v2_temporal_evidence: "时序证据分析",
   early_well_screening: "孔级筛选",
-  day7_localization_and_final_report: "生成最终报告",
+  final_report: "生成最终报告",
   completed: "已完成",
   error: "失败",
 };

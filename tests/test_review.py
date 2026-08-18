@@ -153,6 +153,16 @@ def test_track_review_accepts_cell_family_without_cell_subtype_options():
     assert 'value="cluster_3plus"' not in select
 
 
+def test_late_review_copy_requires_full_well_view_without_default_zoom():
+    root = Path(__file__).parents[1] / "review-ui"
+    html = (root / "auto-review.html").read_text(encoding="utf-8")
+    script = (root / "auto-review.js").read_text(encoding="utf-8")
+
+    assert "晚期图像只展示完整孔视野" in html
+    assert "不自动定位或放大" in html
+    assert "applyRepresentativeLateView" not in script
+
+
 def test_final_decision_contract_exposes_v3_override_as_review_label():
     frame = pd.DataFrame(
         [

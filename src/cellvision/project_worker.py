@@ -45,7 +45,7 @@ _STAGE_PROGRESS = {
     "v2_instance_segmentation": 78,
     "v2_temporal_evidence": 88,
     "early_well_screening": 95,
-    "day7_localization_and_final_report": 99,
+    "final_report": 99,
 }
 
 

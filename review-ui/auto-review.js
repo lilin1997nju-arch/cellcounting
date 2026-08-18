@@ -353,7 +353,6 @@ function renderTimepointCard(timepoint, container, annotatable) {
         defaultViewApplied: existing?.defaultViewApplied || false
       });
       fitAndDraw(timepoint);
-      applyRepresentativeLateView(timepoint);
     };
     image.src = appUrl(imageInfo.url);
     canvas.onpointerdown = event => pointerDown(timepoint, event);
@@ -393,26 +392,6 @@ function lateEvidenceText(imageInfo) {
   const stage = stageNames[imageInfo.late_growth_search_stage]
     || imageInfo.late_growth_search_stage || "";
   return `${source}判定${stage ? ` · ${stage}` : ""}`;
-}
-
-function applyRepresentativeLateView(timepoint) {
-  if (!lateTimepoints.includes(timepoint)) return;
-  const entry = state.canvases.get(timepoint);
-  const view = state.views.get(timepoint);
-  if (!entry || !view || entry.defaultViewApplied) return;
-  entry.defaultViewApplied = true;
-  const representative = entry.imageInfo.representative_view;
-  const zoom = Number(entry.imageInfo.default_zoom || 1);
-  if (!representative || zoom <= 1) return;
-  const baseX = Number(representative.x) / entry.imageInfo.width_px * entry.image.clientWidth;
-  const baseY = Number(representative.y) / entry.imageInfo.height_px * entry.image.clientHeight;
-  view.zoom = Math.min(10, zoom);
-  view.panX = entry.canvas.clientWidth / 2 - baseX * view.zoom;
-  view.panY = entry.canvas.clientHeight / 2 - baseY * view.zoom;
-  clampView(timepoint);
-  ensureHighResolution(timepoint);
-  applyImageTransform(timepoint);
-  drawTimepoint(timepoint);
 }
 
 function breakdownText(objects) {
