@@ -4,6 +4,8 @@ __pycache__/
 .pytest_cache/
 .pytest-tmp/
 .pytest-*/
+.release-smoke-*/
+release/
 *.pyc
 .env
 .env.production
