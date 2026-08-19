@@ -916,6 +916,24 @@ def _queue_path(manifest_path: Path) -> Path:
 def _project_manifest_paths(current: Path) -> list[Path]:
     """Find sibling project manifests for the hub homepage."""
 
+    try:
+        current_value = json.loads(current.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        current_value = {}
+    current_dict = current_value if isinstance(current_value, dict) else {}
+    configured = current_dict.get("project_manifest_paths")
+    if isinstance(configured, list):
+        paths: list[Path] = []
+        for value in configured:
+            candidate = Path(os.path.expandvars(str(value))).expanduser()
+            if not candidate.is_absolute():
+                candidate = current.parent / candidate
+            candidate = candidate.resolve()
+            if candidate.is_file():
+                paths.append(candidate)
+        if bool(current_dict.get("review_hub")):
+            return sorted(set(paths), key=lambda path: path.as_posix().casefold())
+
     root = current.parent.parent
     paths = [path for path in root.glob("*/project.json") if path.is_file()]
     if current.is_file() and current not in paths:
@@ -2293,6 +2311,42 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "loaded_plates": [item["plate_slug"] for item in loaded if item["project_id"] == project_id],
             "loaded_review_apps": loaded,
             "project_count": len(_project_manifest_paths(manifest_file)),
+        }
+
+    @app.get("/api/review-platform/status")
+    def installed_review_platform_status() -> dict[str, Any]:
+        if os.environ.get("CELLVISION_REVIEW_PLATFORM") != "1":
+            raise HTTPException(status_code=404, detail="review platform is not enabled")
+        from .review_platform import review_platform_status
+
+        return review_platform_status()
+
+    @app.post("/api/review-platform/import-package")
+    def import_review_platform_package() -> dict[str, Any]:
+        if os.environ.get("CELLVISION_REVIEW_PLATFORM") != "1":
+            raise HTTPException(status_code=404, detail="review platform is not enabled")
+        from .review_platform import (
+            choose_review_package,
+            register_review_package,
+            review_platform_status,
+            write_review_hub_manifest,
+        )
+
+        selected = choose_review_package()
+        if selected is None:
+            return {"status": "cancelled", **review_platform_status()}
+        try:
+            entrypoint, metadata = register_review_package(selected)
+            write_review_hub_manifest()
+            catalog.sync_manifest(entrypoint, force=True, source="offline_review_import")
+            refresh_catalog(force=True)
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {
+            "status": "imported",
+            "project_id": str(metadata.get("project_id") or ""),
+            "project_name": str(metadata.get("project_name") or metadata.get("project_id") or ""),
+            **review_platform_status(),
         }
 
     @app.get("/api/catalog/status")

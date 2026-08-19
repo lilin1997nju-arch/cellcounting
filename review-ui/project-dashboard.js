@@ -151,7 +151,7 @@ function offlineProgress(task) {
   return `<div class="offline-export-state ${active ? "active" : ""}" data-offline-progress="${esc(task.task_id)}">
     <div class="offline-progress-line"><span>${esc(state.progress_message || "尚未导出审核数据包")}</span><b>${Math.round(percent)}%</b></div>
     <div class="offline-progress"><i style="width:${percent}%"></i></div>
-    ${ready ? `<code class="offline-package-path">${esc(state.package_path)}</code><small>请复制整个任务数据文件夹；审核电脑双击该目录中的 Start-Offline-Review.cmd。</small>` : ""}
+    ${ready ? `<code class="offline-package-path">${esc(state.package_path)}</code><small>请复制整个 .cvreview 文件夹；在审核电脑的 Cell Vision 审核平台中点击“导入审核数据”并选择该文件夹。</small>` : ""}
   </div>`;
 }
 
@@ -380,7 +380,7 @@ function renderProject(data) {
   if ($("offlineReviewHelp")) {
     $("offlineReviewHelp").textContent = data.portable_review
       ? "当前由轻量审核平台打开；板子审核界面、轮廓和快捷键与生产版本一致。"
-      : "准备完整任务审核目录；复制整个任务文件夹后，离线电脑使用的界面、轮廓和快捷键与生产审核一致。";
+      : "导出无环境依赖的 .cvreview 数据文件夹；复制到审核电脑任意位置后，通过 Cell Vision 审核平台导入。";
   }
 
   const plates = data.plates || [];

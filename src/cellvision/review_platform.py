@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .review_data_package import DATA_PACKAGE_MANIFEST, validate_review_data_package
+from .review_data_package import DATA_PACKAGE_FORMAT, DATA_PACKAGE_MANIFEST, validate_review_data_package
 
 
 def _platform_home() -> Path:
@@ -65,7 +65,10 @@ def register_review_package(package_root: str | Path) -> tuple[Path, dict[str, A
     }
     packages = [
         item for item in packages
-        if isinstance(item, dict) and str(item.get("package_id") or "") != record["package_id"]
+        if isinstance(item, dict)
+        and str(item.get("package_id") or "") != record["package_id"]
+        and str(item.get("package_path") or "") != record["package_path"]
+        and str(item.get("project_id") or "") != record["project_id"]
     ]
     packages.append(record)
     registry = {"version": 1, "packages": packages}
@@ -74,6 +77,65 @@ def register_review_package(package_root: str | Path) -> tuple[Path, dict[str, A
     temporary.write_text(json.dumps(registry, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
     return root / str(metadata["entrypoint"]), metadata
+
+
+def write_review_hub_manifest() -> Path:
+    """Write the lightweight hub manifest for every available imported package."""
+
+    registry = _read_registry()
+    packages = registry.get("packages") if isinstance(registry.get("packages"), list) else []
+    manifests: list[str] = []
+    for item in packages:
+        if not isinstance(item, dict):
+            continue
+        package_root = Path(str(item.get("package_path") or "")).expanduser()
+        metadata_path = package_root / DATA_PACKAGE_MANIFEST
+        if not metadata_path.is_file():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if metadata.get("format") != DATA_PACKAGE_FORMAT:
+            continue
+        entrypoint = package_root / str(metadata.get("entrypoint") or "")
+        if entrypoint.is_file():
+            manifests.append(str(entrypoint.resolve()))
+
+    hub = _platform_home() / "hub" / "project.json"
+    hub.parent.mkdir(parents=True, exist_ok=True)
+    value = {
+        "project_id": "offline-review-hub",
+        "project_name": "Cell Vision 离线审核平台",
+        "root": ".",
+        "portable_review": True,
+        "review_hub": True,
+        "project_manifest_paths": manifests,
+        "plates": [],
+    }
+    temporary = hub.with_name(f".{hub.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(hub)
+    return hub
+
+
+def review_platform_status() -> dict[str, Any]:
+    registry = _read_registry()
+    packages = registry.get("packages") if isinstance(registry.get("packages"), list) else []
+    items = []
+    for item in packages:
+        if not isinstance(item, dict):
+            continue
+        value = dict(item)
+        value["available"] = (Path(str(item.get("package_path") or "")) / DATA_PACKAGE_MANIFEST).is_file()
+        items.append(value)
+    return {
+        "enabled": True,
+        "package_count": len(items),
+        "available_count": sum(1 for item in items if item["available"]),
+        "missing_count": sum(1 for item in items if not item["available"]),
+        "packages": items,
+    }
 
 
 def choose_review_package() -> Path | None:
@@ -102,11 +164,12 @@ def _available_port(requested: int) -> int:
     raise OSError("没有可用的本地审核服务端口")
 
 
-def _open_browser_when_ready(port: int, project_id: str) -> None:
+def _open_browser_when_ready(port: int, project_id: str = "") -> None:
     for _ in range(80):
         try:
             with socket.create_connection(("127.0.0.1", port), timeout=0.25):
-                webbrowser.open(f"http://127.0.0.1:{port}/projects/{project_id}/")
+                target = f"/projects/{project_id}/" if project_id else "/"
+                webbrowser.open(f"http://127.0.0.1:{port}{target}")
                 return
         except OSError:
             time.sleep(0.25)
@@ -120,12 +183,12 @@ def main() -> None:
     parser.add_argument("--no-browser", action="store_true")
     args = parser.parse_args()
 
-    package = Path(args.package).expanduser().resolve() if args.package else choose_review_package()
-    if package is None:
-        return
-    manifest_path, metadata = register_review_package(package)
+    if args.package:
+        register_review_package(Path(args.package).expanduser().resolve())
+    manifest_path = write_review_hub_manifest()
     os.environ["CELLVISION_PRODUCTION"] = "1"
     os.environ["CELLVISION_PORTABLE_REVIEW"] = "1"
+    os.environ["CELLVISION_REVIEW_PLATFORM"] = "1"
     os.environ["CELLVISION_DEVICE"] = "cpu"
 
     import uvicorn
@@ -135,7 +198,7 @@ def main() -> None:
     if not args.no_browser:
         threading.Thread(
             target=_open_browser_when_ready,
-            args=(port, str(metadata["project_id"])),
+            args=(port,),
             daemon=True,
         ).start()
     uvicorn.run(

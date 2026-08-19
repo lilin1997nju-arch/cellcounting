@@ -12,7 +12,7 @@ from cellvision.review_data_package import (
     prepare_review_data_package,
     validate_review_data_package,
 )
-from cellvision.review_platform import register_review_package
+from cellvision.review_platform import register_review_package, write_review_hub_manifest
 
 
 def _project(tmp_path: Path) -> tuple[Path, dict]:
@@ -177,3 +177,46 @@ def test_installed_review_platform_registers_package_and_tracks_identity(tmp_pat
     project = project_endpoint(project_id="project-1")
     assert project["project_id"] == "project-1"
     assert project["portable_review"] is True
+
+
+def test_installed_review_platform_hub_lists_multiple_imported_projects(tmp_path: Path, monkeypatch):
+    first_manifest, first_task = _project(tmp_path / "first")
+    second_manifest, second_task = _project(tmp_path / "second")
+    second_value = json.loads(second_manifest.read_text(encoding="utf-8"))
+    second_value["project_id"] = "project-2"
+    second_value["project_name"] = "Project 2"
+    second_manifest.write_text(json.dumps(second_value), encoding="utf-8")
+    first_package, _ = prepare_review_data_package(first_manifest, first_task, git_commit="abc123")
+    second_package, _ = prepare_review_data_package(second_manifest, second_task, git_commit="abc123")
+    monkeypatch.setenv("CELLVISION_REVIEW_HOME", str(tmp_path / "review-home"))
+    monkeypatch.setenv("CELLVISION_REVIEW_PLATFORM", "1")
+    monkeypatch.setenv("CELLVISION_PORTABLE_REVIEW", "1")
+
+    register_review_package(first_package)
+    register_review_package(second_package)
+    hub = write_review_hub_manifest()
+
+    hub_value = json.loads(hub.read_text(encoding="utf-8"))
+    assert hub_value["review_hub"] is True
+    assert len(hub_value["project_manifest_paths"]) == 2
+
+    from cellvision.project_server import create_project_app
+
+    app = create_project_app(hub)
+    projects_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", "") == "/api/projects"
+    )
+    result = projects_endpoint(q="", page=1, page_size=10)
+    assert result["total"] == 2
+    assert {item["project_id"] for item in result["items"]} == {"project-1", "project-2"}
+
+    status_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", "") == "/api/review-platform/status"
+    )
+    status = status_endpoint()
+    assert status["available_count"] == 2
+    assert status["missing_count"] == 0

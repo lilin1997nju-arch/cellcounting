@@ -10,6 +10,9 @@ let projectTotalPages = 1;
 let projectAggregate = null;
 let projectSearchTimer = null;
 let projectPollTimer = null;
+let reviewPlatformMode = false;
+let reviewPlatformStatus = null;
+let platformModeChecked = false;
 
 const esc = value => String(value ?? "").replace(/[&<>\"]/g, character => ({
   "&": "&amp;",
@@ -28,6 +31,38 @@ async function api(url, options) {
   const response = await fetch(url, options);
   if (!response.ok) throw new Error(await response.text());
   return response.json();
+}
+
+async function configurePlatformMode() {
+  if (platformModeChecked) return;
+  platformModeChecked = true;
+  const response = await fetch("/api/review-platform/status");
+  if (response.status === 404) {
+    if (new URLSearchParams(location.search).get("new-task") === "1") {
+      openNewTaskDialog();
+    }
+    return;
+  }
+  if (!response.ok) throw new Error(await response.text());
+  reviewPlatformStatus = await response.json();
+  reviewPlatformMode = Boolean(reviewPlatformStatus.enabled);
+  if (!reviewPlatformMode) return;
+  document.body.classList.add("review-platform-mode");
+  document.title = "Cell Vision 离线审核平台";
+  $("hubSubtitle").textContent = "导入 .cvreview 审核数据，可从项目列表进入各个板的完整审核界面。";
+  $("projectSectionHelp").textContent = "审核数据可以放在任意路径；导入多个项目后会统一列在这里。";
+  $("newTaskButton").textContent = "导入审核数据";
+  $("taskQueuePanel").hidden = true;
+  closeTaskDialog();
+}
+
+function reviewPlatformMeta(defaultText) {
+  if (!reviewPlatformMode) return defaultText;
+  const missing = Number(reviewPlatformStatus?.missing_count || 0);
+  const available = Number(reviewPlatformStatus?.available_count || 0);
+  return missing
+    ? `已导入 ${available} 个 · ${missing} 个原路径已失效，请重新导入`
+    : `已导入 ${available} 个审核项目`;
 }
 
 function count(value) {
@@ -202,6 +237,13 @@ function dateRange(item) {
   return `${start} ～ ${end}`;
 }
 
+function projectLocation(item) {
+  if (reviewPlatformMode && item.manifest_path) {
+    return String(item.manifest_path).replace(/[\\/]project[\\/]project\.json$/i, "");
+  }
+  return item.root || "未记录数据根目录";
+}
+
 function projectStatus(item) {
   const total = count(item.plate_count);
   const recognized = count(item.recognized_plate_count ?? item.completed_plate_count);
@@ -261,7 +303,7 @@ function renderProjects(items, meta = {}) {
   $("projectCount").textContent = `${totalItems} 个项目`;
   $("projectFilterMeta").textContent = projectSearchTerm.trim()
     ? `搜索到 ${totalItems} 个项目`
-    : `每页最多 ${PROJECTS_PER_PAGE} 个`;
+    : reviewPlatformMeta(`每页最多 ${PROJECTS_PER_PAGE} 个`);
 
   $("summaryCards").innerHTML = [
     summaryCard("项目", totalItems),
@@ -271,7 +313,7 @@ function renderProjects(items, meta = {}) {
   ].join("");
 
   if (!items.length) {
-    rows.innerHTML = `<tr><td colspan="6" class="empty">暂无项目，请新建任务。</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="6" class="empty">${reviewPlatformMode ? "暂无审核项目，请点击“导入审核数据”并选择 .cvreview 文件夹。" : "暂无项目，请新建任务。"}</td></tr>`;
     updateProjectPagination(totalItems, totalPages);
     return;
   }
@@ -285,11 +327,11 @@ function renderProjects(items, meta = {}) {
     const singleCell = count(item.single_cell_origin_well_count ?? categories.single_cell_origin);
     const multiCell = count(categories.multi_cell_origin);
     const undetermined = count(categories.undetermined);
-    const deleteAction = total === 0
+    const deleteAction = !reviewPlatformMode && total === 0
       ? `<button class="project-delete danger" type="button" data-project-delete="${esc(item.project_id)}" data-project-name="${esc(item.project_name || "空项目")}">删除空项目</button>`
       : "";
     return `<tr class="project-row" data-url="${esc(item.detail_url)}">
-      <td><strong class="project-name">${esc(item.project_name)}</strong><span class="project-subline">${esc(item.root || "未记录数据根目录")}</span></td>
+      <td><strong class="project-name">${esc(item.project_name)}</strong><span class="project-subline">${esc(projectLocation(item))}</span></td>
       <td>${dateRange(item)}</td>
       <td>${esc(item.created_by || "—")}</td>
       <td><span class="project-status ${status.className}">${status.label}</span><span class="project-status-detail">已完成识别 ${recognizedCount}/${total} · 已审核 ${reviewedCount}/${total}</span></td>
@@ -336,8 +378,10 @@ async function loadProjects(page = projectPage, { silent = false } = {}) {
 
 async function load() {
   try {
+    await configurePlatformMode();
+    if (reviewPlatformMode) reviewPlatformStatus = await api("/api/review-platform/status");
     await loadProjects(1);
-    await loadTasks();
+    if (!reviewPlatformMode) await loadTasks();
     if (projectPollTimer) clearInterval(projectPollTimer);
     projectPollTimer = setInterval(() => {
       if (document.visibilityState === "visible" && !$('taskDialog')?.open) {
@@ -371,7 +415,7 @@ $("projectNext").addEventListener("click", () => {
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "visible") {
     loadProjects(projectPage, { silent: true }).catch(() => {});
-    loadTasks({ silent: true });
+    if (!reviewPlatformMode) loadTasks({ silent: true });
   }
 });
 
@@ -459,6 +503,19 @@ function closeTaskDialog() {
   if (dialog?.open) dialog.close("cancel");
 }
 
+function openNewTaskDialog() {
+  $("taskDialog").showModal();
+  analysis = null;
+  $("taskName").value = "";
+  $("taskName").dataset.edited = "";
+  taskNameAutoValue = "";
+  $("createdBy").value = "";
+  $("queueButton").disabled = true;
+  $("timepointPicker").hidden = true;
+  $("endpointNote").hidden = true;
+  $("analysisResult").textContent = "选择文件夹后点击解析。";
+}
+
 function folderNameFromPath(value) {
   const parts = String(value || "").replace(/[\\/]+$/, "").split(/[\\/]/).filter(Boolean);
   if (!parts.length) return "";
@@ -479,17 +536,29 @@ function applyDefaultTaskName(value) {
 $("refreshButton").addEventListener("click", load);
 $("closeTaskButton").addEventListener("click", closeTaskDialog);
 $("cancelTaskButton").addEventListener("click", closeTaskDialog);
-$("newTaskButton").addEventListener("click", () => {
-  $("taskDialog").showModal();
-  analysis = null;
-  $("taskName").value = "";
-  $("taskName").dataset.edited = "";
-  taskNameAutoValue = "";
-  $("createdBy").value = "";
-  $("queueButton").disabled = true;
-  $("timepointPicker").hidden = true;
-  $("endpointNote").hidden = true;
-  $("analysisResult").textContent = "选择文件夹后点击解析。";
+$("newTaskButton").addEventListener("click", async () => {
+  if (!reviewPlatformMode) {
+    openNewTaskDialog();
+    return;
+  }
+  const button = $("newTaskButton");
+  button.disabled = true;
+  try {
+    toast("正在打开审核数据选择窗口…");
+    const result = await api("/api/review-platform/import-package", { method: "POST" });
+    reviewPlatformStatus = result;
+    if (result.status === "cancelled") {
+      toast("未选择审核数据");
+      return;
+    }
+    toast(`已导入：${result.project_name || result.project_id}`);
+    projectPage = 1;
+    await loadProjects(1);
+  } catch (error) {
+    toast(`导入失败：${error.message}`);
+  } finally {
+    button.disabled = false;
+  }
 });
 $("browseButton").addEventListener("click", async () => {
   $("analysisResult").textContent = "正在打开文件夹选择器…";

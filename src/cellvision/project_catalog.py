@@ -1160,10 +1160,26 @@ class ProjectCatalog:
 
     def reconcile_all(self, current_manifest: str | Path) -> int:
         current = Path(current_manifest).expanduser().resolve()
-        root = current.parent.parent
-        paths = [path for path in root.glob("*/project.json") if path.is_file()]
-        if current.is_file() and current not in paths:
-            paths.append(current)
+        try:
+            current_value = json.loads(current.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current_value = {}
+        current_dict = current_value if isinstance(current_value, dict) else {}
+        configured = current_dict.get("project_manifest_paths")
+        paths: list[Path] = []
+        if isinstance(configured, list):
+            for value in configured:
+                candidate = Path(os.path.expandvars(str(value))).expanduser()
+                if not candidate.is_absolute():
+                    candidate = current.parent / candidate
+                candidate = candidate.resolve()
+                if candidate.is_file():
+                    paths.append(candidate)
+        if not bool(current_dict.get("review_hub")):
+            root = current.parent.parent
+            paths.extend(path for path in root.glob("*/project.json") if path.is_file())
+            if current.is_file() and current not in paths:
+                paths.append(current)
         live_paths = {str(path.resolve()) for path in paths}
         now = _now()
         with self._connect() as connection:
