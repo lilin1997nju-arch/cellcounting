@@ -48,6 +48,7 @@ try {
     foreach ($name in @("Install-CellVision-Review.cmd", "install_review_platform.ps1")) {
         Copy-Item -LiteralPath (Join-Path $deploy $name) -Destination (Join-Path $target $name)
     }
+    Copy-Item -LiteralPath (Join-Path $application "deploy\windows\install_ui.ps1") -Destination (Join-Path $target "install_ui.ps1")
     [ordered]@{
         product = "Cell Vision Review Platform"
         platform = "windows-x64"

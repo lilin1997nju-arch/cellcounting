@@ -110,6 +110,7 @@ try {
 
     Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\install_offline.ps1") -Destination (Join-Path $releaseRoot "install_offline.ps1")
     Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\Install-CellVision.cmd") -Destination (Join-Path $releaseRoot "Install-CellVision.cmd")
+    Copy-Item -LiteralPath (Join-Path $repository "deploy\windows\install_ui.ps1") -Destination (Join-Path $releaseRoot "install_ui.ps1")
 
     $pythonInstaller = Join-Path $runtime "python-$PythonVersion-amd64.exe"
     $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"

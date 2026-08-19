@@ -8,6 +8,7 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     builder = (ROOT / "scripts" / "build_offline_release.ps1").read_text(encoding="utf-8")
     installer = (ROOT / "deploy" / "offline" / "install_offline.ps1").read_text(encoding="utf-8")
     launcher = (ROOT / "deploy" / "offline" / "Install-CellVision.cmd").read_text(encoding="utf-8")
+    install_ui = (ROOT / "deploy" / "windows" / "install_ui.ps1").read_text(encoding="utf-8")
 
     assert "status --porcelain" in builder
     assert "git_commit" in builder
@@ -25,7 +26,11 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "-Offline" in installer
     assert "-Wheelhouse" in installer
     assert "Move-Item -LiteralPath $InstallRoot" in installer
-    assert "-StartAfterInstall" in launcher
+    assert "install_ui.ps1" in launcher
+    assert "-Mode production" in launcher
+    assert "FolderBrowserDialog" in install_ui
+    assert '"-InstallRoot", $script:selectedInstallRoot' in install_ui
+    assert '"-StartAfterInstall"' in install_ui
 
 
 def test_offline_setup_uses_no_index_and_three_model_contract():
