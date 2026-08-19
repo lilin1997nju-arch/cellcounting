@@ -46,7 +46,11 @@ from .offline_review import (
     export_offline_review_results,
     import_offline_review_results,
 )
-from .portable_review import prepare_portable_review_workspace
+from .review_data_package import (
+    DATA_PACKAGE_FORMAT,
+    prepare_review_data_package,
+    project_export_signature,
+)
 from .review_server import _visible_v2_review_instances, create_app, initialize_database
 from .review_summary import (
     latest_prediction_path,
@@ -934,7 +938,36 @@ def _read_manifest(path: Path) -> dict[str, Any] | None:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    return value if isinstance(value, dict) else None
+    if not isinstance(value, dict):
+        return None
+    base = path.parent
+    for key in (
+        "root",
+        "source_sessions_csv",
+        "source_day14_csv",
+        "source_endpoint_csv",
+    ):
+        item = value.get(key)
+        if item:
+            candidate = Path(os.path.expandvars(str(item))).expanduser()
+            value[key] = str(candidate if candidate.is_absolute() else (base / candidate).resolve())
+    for plate in value.get("plates", []):
+        if not isinstance(plate, dict):
+            continue
+        for key in (
+            "config",
+            "artifact_root",
+            "gated_output_dir",
+            "images_manifest",
+            "pipeline_summary",
+            "report_json",
+        ):
+            item = plate.get(key)
+            if not item:
+                continue
+            candidate = Path(os.path.expandvars(str(item))).expanduser()
+            plate[key] = str(candidate if candidate.is_absolute() else (base / candidate).resolve())
+    return value
 
 
 def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
@@ -1323,7 +1356,9 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     manifest_file = _resolve(manifest_path)
     if not manifest_file.exists():
         raise FileNotFoundError(manifest_file)
-    manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+    manifest = _read_manifest(manifest_file)
+    if manifest is None:
+        raise ValueError(f"Invalid project manifest: {manifest_file}")
     project_name = str(manifest.get("project_name", manifest.get("project_id", "Cell Vision Project")))
     project_id = str(manifest.get("project_id") or manifest_file.parent.name)
     project_back_url = f"/projects/{_slug(project_id)}/"
@@ -2500,11 +2535,16 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         if str(task.get("status") or "") != "completed":
             raise HTTPException(status_code=409, detail="只能导出已完成任务的离线审核包")
         task_manifest_value = str(task.get("project_manifest") or "")
-        task_manifest = (
-            _resolve(task_manifest_value)
-            if task_manifest_value
-            else manifest_for_project(project_id_value)
-        )
+        selected_manifest = manifest_for_project(project_id_value)
+        if task_manifest_value:
+            candidate = Path(task_manifest_value).expanduser()
+            task_manifest = (
+                candidate.resolve()
+                if candidate.is_absolute()
+                else (selected_manifest.parent / candidate).resolve()
+            )
+        else:
+            task_manifest = selected_manifest
         if not task_manifest.is_file():
             raise HTTPException(status_code=404, detail="任务所属项目清单不存在")
         return task, task_manifest
@@ -2541,6 +2581,9 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             if release_commit_file.is_file()
             else "development"
         )
+        current_export_signature = project_export_signature(
+            task_manifest.parent, current_release_commit
+        )
         if isinstance(previous, dict):
             previous_status = str(previous.get("status") or "")
             previous_path_value = str(previous.get("package_path") or "")
@@ -2551,6 +2594,16 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 if isinstance(previous_summary, dict)
                 else ""
             )
+            previous_format = (
+                str(previous_summary.get("format") or "")
+                if isinstance(previous_summary, dict)
+                else ""
+            )
+            previous_signature = (
+                str(previous_summary.get("export_signature") or "")
+                if isinstance(previous_summary, dict)
+                else ""
+            )
             if previous_status == "running":
                 return public_offline_export_state(previous)
             if (
@@ -2558,6 +2611,8 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 and previous_path is not None
                 and previous_path.is_dir()
                 and previous_commit == current_release_commit
+                and previous_format == DATA_PACKAGE_FORMAT
+                and previous_signature == current_export_signature
             ):
                 return public_offline_export_state(previous)
 
@@ -2592,11 +2647,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 })
 
             try:
-                package_path, summary = prepare_portable_review_workspace(
+                package_path, summary = prepare_review_data_package(
                     task_manifest,
                     task,
-                    application_root=PROJECT_ROOT,
-                    release_root=PROJECT_ROOT.parent,
+                    git_commit=current_release_commit,
                     progress_callback=report_progress,
                 )
                 update_offline_export_state(store, task_id_value, {
@@ -2605,7 +2659,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                     "progress_current": int(summary.get("copied_bytes", 1) or 1),
                     "progress_total": int(summary.get("copied_bytes", 1) or 1),
                     "progress_percent": 100,
-                    "progress_message": "完整审核目录已准备好，可直接复制整个任务文件夹",
+                    "progress_message": "无环境依赖的 .cvreview 审核数据包已准备好",
                     "package_path": str(package_path),
                     "summary": summary,
                     "finished_at": datetime.now(timezone.utc).isoformat(),
@@ -2676,7 +2730,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         payload = export_offline_review_results(task_manifest, task)
         filename = (
             f"{_slug(str(task.get('name') or task_id_value)) or 'cellvision'}"
-            "-offline-review-results.json"
+            ".cvreview-result.json"
         )
         return Response(
             content=json.dumps(payload, ensure_ascii=False, indent=2),

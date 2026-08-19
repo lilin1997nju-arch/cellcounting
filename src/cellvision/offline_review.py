@@ -26,6 +26,7 @@ from .review_helpers import _visible_v2_review_instances, _with_final_decisions
 from .review_storage import initialize_database, save_annotation
 from .review_summary import latest_prediction_path
 from .well_screening import build_well_screening, ensure_well_screening_review_table
+from .review_data_package import DATA_PACKAGE_FORMAT, DATA_PACKAGE_MANIFEST
 
 
 BUNDLE_FORMAT = "cellvision-offline-review"
@@ -38,6 +39,25 @@ LABELS = {
     "invalid",
     "uncertain",
 }
+
+
+def _review_data_identity(manifest_file: Path) -> dict[str, Any] | None:
+    package_root = manifest_file.parent.parent
+    metadata_path = package_root / DATA_PACKAGE_MANIFEST
+    if not metadata_path.is_file():
+        return None
+    try:
+        metadata = _read_json(metadata_path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if metadata.get("format") != DATA_PACKAGE_FORMAT:
+        return None
+    return {
+        "format": DATA_PACKAGE_FORMAT,
+        "package_id": str(metadata.get("package_id") or ""),
+        "content_sha256": str(metadata.get("content_sha256") or ""),
+        "production_git_commit": str(metadata.get("production_git_commit") or ""),
+    }
 
 
 def _resolve(value: str | Path, *, relative_to: Path | None = None) -> Path:
@@ -370,6 +390,20 @@ def import_offline_review_results(
         raise ValueError("审核结果与当前任务不匹配")
     if str(payload.get("project_id") or "") != str(manifest.get("project_id") or manifest_file.parent.name):
         raise ValueError("审核结果与当前项目不匹配")
+    expected_summary = (
+        task.get("offline_export", {}).get("summary", {})
+        if isinstance(task.get("offline_export"), dict)
+        else {}
+    )
+    if isinstance(expected_summary, dict) and expected_summary.get("format") == DATA_PACKAGE_FORMAT:
+        identity = payload.get("data_package")
+        if not isinstance(identity, dict):
+            raise ValueError("审核结果缺少 .cvreview 数据包身份")
+        if str(identity.get("package_id") or "") != str(expected_summary.get("package_id") or ""):
+            raise ValueError("审核结果来自另一份 .cvreview 数据包")
+        expected_content = str(expected_summary.get("content_sha256") or "")
+        if expected_content and str(identity.get("content_sha256") or "") != expected_content:
+            raise ValueError("审核结果的数据包校验标识不匹配")
     reviewer = str(payload.get("reviewer") or "offline_reviewer").strip() or "offline_reviewer"
     plate_lookup = {
         str(item.get("slug") or item.get("board_id") or ""): item
@@ -539,6 +573,9 @@ def export_offline_review_results(
         "reviewer": "offline_reviewer",
         "plates": [],
     }
+    data_identity = _review_data_identity(manifest_file)
+    if data_identity is not None:
+        payload["data_package"] = data_identity
     reviewers: list[str] = []
     for plate in manifest.get("plates", []):
         if not isinstance(plate, dict):

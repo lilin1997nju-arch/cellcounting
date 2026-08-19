@@ -109,10 +109,27 @@ def create_app(
     database_path = artifact_path(config, "annotations", "annotations.db")
     images_manifest_path = artifact_path(config, "manifests", "images.csv")
     database = initialize_database(database_path)
-    images_manifest = _review_images_manifest(
-        config,
-        pd.read_csv(images_manifest_path),
-    )
+    base_images_manifest = pd.read_csv(images_manifest_path)
+    for column in (
+        "raw_image_path",
+        "cf_image_path",
+        "cells_csv_path",
+        "metrics_csv_path",
+    ):
+        if column not in base_images_manifest.columns:
+            continue
+        base_images_manifest[column] = base_images_manifest[column].map(
+            lambda value: str(
+                (
+                    Path(str(value))
+                    if Path(str(value)).is_absolute()
+                    else (images_manifest_path.parent / str(value)).resolve()
+                )
+            )
+            if str(value).strip() and str(value).casefold() != "nan"
+            else ""
+        )
+    images_manifest = _review_images_manifest(config, base_images_manifest)
     review_ui_dir = Path(__file__).resolve().parents[2] / "review-ui"
     teaching_html_path = (
         Path(__file__).resolve().parents[2] / "review-ui" / "teach.html"

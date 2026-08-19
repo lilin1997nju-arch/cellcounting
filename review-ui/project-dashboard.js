@@ -149,7 +149,7 @@ function offlineProgress(task) {
   const active = String(state.status || "") === "running";
   const ready = String(state.status || "") === "completed" && state.package_path;
   return `<div class="offline-export-state ${active ? "active" : ""}" data-offline-progress="${esc(task.task_id)}">
-    <div class="offline-progress-line"><span>${esc(state.progress_message || "尚未准备完整审核目录")}</span><b>${Math.round(percent)}%</b></div>
+    <div class="offline-progress-line"><span>${esc(state.progress_message || "尚未导出审核数据包")}</span><b>${Math.round(percent)}%</b></div>
     <div class="offline-progress"><i style="width:${percent}%"></i></div>
     ${ready ? `<code class="offline-package-path">${esc(state.package_path)}</code><small>请复制整个任务数据文件夹；审核电脑双击该目录中的 Start-Offline-Review.cmd。</small>` : ""}
   </div>`;
@@ -159,7 +159,7 @@ function renderOfflineTask(task) {
   const portable = Boolean(projectData?.portable_review);
   const actions = portable
     ? `<button class="task-action primary" type="button" data-task-action="offline-result-export" data-task-id="${esc(task.task_id)}">导出审核结果 JSON</button>`
-    : `<button class="task-action primary" type="button" data-task-action="offline-export" data-task-id="${esc(task.task_id)}">准备完整离线审核目录</button>
+    : `<button class="task-action primary" type="button" data-task-action="offline-export" data-task-id="${esc(task.task_id)}">导出 .cvreview 审核数据包</button>
        <button class="task-action secondary" type="button" data-task-action="offline-import" data-task-id="${esc(task.task_id)}">导入离线审核结果</button>`;
   return `<article class="offline-review-task" data-offline-task="${esc(task.task_id)}">
     <div><strong>${esc(task.name || projectData?.project_name || "已完成任务")}</strong><small>${esc(task.task_id)} · ${task.finished_at ? new Date(task.finished_at).toLocaleString() : "已完成"}</small></div>
@@ -223,9 +223,9 @@ async function exportOfflineReview(taskId, button) {
     }
     updateOfflineProgress(taskId, state);
     if (state.status === "error") throw new Error(state.error || state.progress_message || "准备失败");
-    toast("完整审核目录已准备好；可直接复制整个任务文件夹");
+    toast(".cvreview 审核数据包已准备好，可复制到已安装审核平台的电脑");
   } catch (error) {
-    toast(`完整审核目录准备失败：${error.message}`);
+    toast(`审核数据包导出失败：${error.message}`);
   } finally {
     button.disabled = false;
     button.textContent = originalText;
@@ -379,7 +379,7 @@ function renderProject(data) {
   document.body.classList.toggle("portable-review-mode", Boolean(data.portable_review));
   if ($("offlineReviewHelp")) {
     $("offlineReviewHelp").textContent = data.portable_review
-      ? "当前为完整离线审核副本；板子审核界面、轮廓和快捷键与生产版本一致。"
+      ? "当前由轻量审核平台打开；板子审核界面、轮廓和快捷键与生产版本一致。"
       : "准备完整任务审核目录；复制整个任务文件夹后，离线电脑使用的界面、轮廓和快捷键与生产审核一致。";
   }
 
@@ -460,7 +460,7 @@ async function loadTasks({ silent = false } = {}) {
       : `<div class="empty">暂无待执行任务</div>`;
     $("offlineReviewRows").innerHTML = completedTasks.length
       ? completedTasks.slice().reverse().map(renderOfflineTask).join("")
-      : `<div class="empty">计算完成后可准备离线审核目录</div>`;
+      : `<div class="empty">计算完成后可导出无环境依赖的 .cvreview 数据包</div>`;
     document.querySelectorAll("[data-task-action]").forEach(button => {
       button.addEventListener("click", handleTaskAction);
     });

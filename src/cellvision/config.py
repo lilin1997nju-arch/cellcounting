@@ -114,11 +114,47 @@ def load_config(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
 
     if validate:
         validate_config(config)
+    resolve_relative_to_config = bool(
+        config.get("runtime", {}).get("resolve_paths_relative_to_config", False)
+    )
+    path_base = config_path.parent if resolve_relative_to_config else PROJECT_ROOT
     paths = config.setdefault("paths", {})
     if "data_root" not in paths:
         paths["data_root"] = ""
-    paths["data_root"] = _resolve_path(paths["data_root"], PROJECT_ROOT)
-    paths["artifact_root"] = _resolve_path(paths.get("artifact_root", "artifacts"), PROJECT_ROOT)
+    paths["data_root"] = _resolve_path(paths["data_root"], path_base)
+    paths["artifact_root"] = _resolve_path(paths.get("artifact_root", "artifacts"), path_base)
+    if resolve_relative_to_config:
+        for section_name, key in (
+            ("experiment", "timepoint_directories"),
+            ("review", "late_timepoint_directories"),
+        ):
+            section = config.get(section_name)
+            directories = section.get(key) if isinstance(section, dict) else None
+            if isinstance(directories, dict):
+                section[key] = {
+                    str(label): _resolve_path(str(value), path_base)
+                    for label, value in directories.items()
+                    if str(value).strip()
+                }
+        gated = config.get("gated_report")
+        if isinstance(gated, dict):
+            for key in (
+                "day14_csv",
+                "endpoint_csv",
+                "sessions_csv",
+                "output_dir",
+            ):
+                if str(gated.get(key, "")).strip():
+                    gated[key] = _resolve_path(str(gated[key]), path_base)
+        project_images = config.get("project_images")
+        if isinstance(project_images, dict):
+            for key in (
+                "project_root",
+                "image_root",
+                "active_endpoint_csv",
+            ):
+                if str(project_images.get(key, "")).strip():
+                    project_images[key] = _resolve_path(str(project_images[key]), path_base)
     # Human-reviewed inference decisions belong to the plate artifacts rather
     # than generated YAML. Load them after path resolution so project/config
     # regeneration cannot silently discard confirmed splits or non-cell labels.
@@ -142,10 +178,10 @@ def load_config(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
         )
     for key in ("model_root", "db_root", "log_root"):
         if key in paths and str(paths[key]).strip():
-            paths[key] = _resolve_path(paths[key], PROJECT_ROOT)
+            paths[key] = _resolve_path(paths[key], path_base)
     late_growth = config.get("late_growth")
     if isinstance(late_growth, dict) and str(late_growth.get("shared_model_root", "")).strip():
-        late_growth["shared_model_root"] = _resolve_path(late_growth["shared_model_root"], PROJECT_ROOT)
+        late_growth["shared_model_root"] = _resolve_path(late_growth["shared_model_root"], path_base)
     config.setdefault("runtime", {})
     host = os.getenv("CELLVISION_HOST")
     if host:

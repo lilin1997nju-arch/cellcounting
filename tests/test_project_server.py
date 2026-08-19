@@ -60,7 +60,7 @@ def test_production_dashboard_has_no_training_or_mask_review_entry():
     assert "单/粘连训练审核" not in html
     assert "Mask 轮廓审核" not in html
     assert "用本轮结果训练并生成下一轮" not in quick_review
-    assert "准备完整离线审核目录" in dashboard_js
+    assert "导出 .cvreview 审核数据包" in dashboard_js
     assert "轮廓和快捷键与生产审核一致" in html
 
 
