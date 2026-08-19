@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 from cellvision.portable_review import (
@@ -66,6 +67,17 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
     config_text = (workspace / "project" / "configs" / "plate.yaml").read_text(encoding="utf-8")
     assert str(workspace / "project") in config_text
     assert str(data_root) in config_text
+
+    moved_data_root = tmp_path / "copied task data"
+    moved_workspace = moved_data_root / workspace.name
+    shutil.copytree(workspace, moved_workspace)
+    rebase(moved_workspace)
+    moved_config = (
+        moved_workspace / "project" / "configs" / "plate.yaml"
+    ).read_text(encoding="utf-8")
+    assert str(moved_workspace / "project") in moved_config
+    assert str(moved_data_root) in moved_config
+    assert str(workspace) not in moved_config
 
 
 def test_promote_staging_directory_retries_short_windows_lock(tmp_path: Path, monkeypatch):

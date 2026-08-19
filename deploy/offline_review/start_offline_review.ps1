@@ -26,10 +26,11 @@ if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
     $installer = Get-ChildItem -LiteralPath $runtimeBundle -Filter "python-3.12.*-amd64.exe" -File | Select-Object -First 1
     if ($null -eq $installer) { throw "Bundled Python installer is missing." }
     Write-Host "Installing the bundled offline review runtime ..." -ForegroundColor Cyan
-    $process = Start-Process -FilePath $installer.FullName -ArgumentList @(
+    $installerArguments = @(
         "/quiet", "InstallAllUsers=0", "PrependPath=0", "Include_launcher=0",
         "Include_test=0", "Include_doc=0", "Include_pip=1", "TargetDir=$pythonRoot"
-    ) -Wait -PassThru -WindowStyle Hidden
+    ) | ForEach-Object { ConvertTo-StartProcessArgument -Value ([string]$_) }
+    $process = Start-Process -FilePath $installer.FullName -ArgumentList $installerArguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) { throw "Python installer failed with exit code $($process.ExitCode)." }
 }
 

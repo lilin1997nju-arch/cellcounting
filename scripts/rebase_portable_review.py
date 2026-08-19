@@ -15,10 +15,20 @@ def rebase(package_root: Path) -> Path:
     metadata = json.loads((package_root / "PACKAGE.json").read_text(encoding="utf-8"))
     project_root = package_root / "project"
     data_root = package_root.parent
-    replacements = {
-        str(metadata["source_project_root"]): str(project_root),
-        str(metadata["source_data_root"]): str(data_root),
-    }
+    replacements = {}
+    for source in {
+        str(metadata["source_project_root"]),
+        str(metadata["source_data_root"]),
+        str(metadata.get("last_project_root") or ""),
+        str(metadata.get("last_data_root") or ""),
+    }:
+        if not source:
+            continue
+        destination = project_root if source in {
+            str(metadata["source_project_root"]),
+            str(metadata.get("last_project_root") or ""),
+        } else data_root
+        replacements[source] = str(destination)
     replacements.update({key.replace("\\", "/"): value.replace("\\", "/") for key, value in list(replacements.items())})
     for path in project_root.rglob("*"):
         if not path.is_file() or path.suffix.casefold() not in TEXT_SUFFIXES:
@@ -37,6 +47,12 @@ def rebase(package_root: Path) -> Path:
     manifest["portable_review"] = True
     manifest["root"] = str(data_root)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    metadata["last_project_root"] = str(project_root)
+    metadata["last_data_root"] = str(data_root)
+    (package_root / "PACKAGE.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return manifest_path
 
 
