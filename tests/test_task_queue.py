@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from cellvision import task_queue
 from cellvision.task_queue import TaskQueueStore
 
 
@@ -109,3 +110,22 @@ def test_task_queue_delete_does_not_enforce_completed_guard_at_store_layer(tmp_p
     # The HTTP layer enforces the product rule that completed tasks cannot be
     # deleted; the store remains a small, reusable persistence primitive.
     assert store.delete("task-1")["status"] == "completed"
+
+
+def test_task_queue_retries_windows_atomic_replace(tmp_path: Path, monkeypatch):
+    store = TaskQueueStore(tmp_path / "tasks.json")
+    real_replace = task_queue.os.replace
+    attempts = 0
+
+    def flaky_replace(source, destination):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("temporarily locked")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(task_queue.os, "replace", flaky_replace)
+    store.add({"task_id": "task-1"})
+
+    assert attempts == 3
+    assert store.get("task-1")["task_id"] == "task-1"

@@ -10,6 +10,7 @@ files; writes are atomic and all lifecycle transitions are explicit.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -98,9 +99,21 @@ class TaskQueueStore:
         ] if isinstance(value, list) else []
 
     def write(self, tasks: list[dict[str, Any]]) -> None:
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary = self.path.with_name(
+            f".{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+        )
         temporary.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.path)
+        try:
+            for attempt in range(20):
+                try:
+                    os.replace(temporary, self.path)
+                    return
+                except PermissionError:
+                    if attempt == 19:
+                        raise
+                    time.sleep(min(0.02 * (attempt + 1), 0.2))
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def list(self) -> list[dict[str, Any]]:
         with _lock_for(self.path):
