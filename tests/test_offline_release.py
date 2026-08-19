@@ -8,6 +8,8 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     builder = (ROOT / "scripts" / "build_offline_release.ps1").read_text(encoding="utf-8")
     installer = (ROOT / "deploy" / "offline" / "install_offline.ps1").read_text(encoding="utf-8")
     launcher = (ROOT / "deploy" / "offline" / "Install-CellVision.cmd").read_text(encoding="utf-8")
+    install_ui = (ROOT / "deploy" / "windows" / "install_ui.ps1").read_text(encoding="utf-8")
+    install_ui_bytes = (ROOT / "deploy" / "windows" / "install_ui.ps1").read_bytes()
 
     assert "status --porcelain" in builder
     assert "git_commit" in builder
@@ -16,6 +18,9 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "python-$PythonVersion-amd64.exe" in builder
     assert '"torch==2.11.0"' in builder
     assert '"torchvision==0.26.0"' in builder
+    assert "Reusing offline runtime assets from" in builder
+    assert "runtime_assets_reused_from" in builder
+    assert "Get-AssetContract" in builder
     assert "teaching_classifier.pt" in builder
     assert "multiplicity_classifier.pt" in builder
     assert "latest_instance_segmenter.pt" in builder
@@ -25,7 +30,17 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "-Offline" in installer
     assert "-Wheelhouse" in installer
     assert "Move-Item -LiteralPath $InstallRoot" in installer
-    assert "-StartAfterInstall" in launcher
+    assert 'Join-Path $InstallRoot "Start-CellVision.cmd"' in installer
+    assert 'start "" "http://127.0.0.1:__PORT__/"' in installer
+    assert "$shortcut.TargetPath = $rootLauncherPath" in installer
+    assert "install_ui.ps1" in launcher
+    assert "-Mode production" in launcher
+    assert "FolderBrowserDialog" in install_ui
+    assert install_ui_bytes.startswith(b"\xef\xbb\xbf")
+    assert "INSTALL_UI_PARSE_OK" in install_ui
+    assert "INSTALL_UI_SMOKE_OK" in install_ui
+    assert '"-InstallRoot", $script:selectedInstallRoot' in install_ui
+    assert '"-StartAfterInstall"' in install_ui
 
 
 def test_offline_setup_uses_no_index_and_three_model_contract():

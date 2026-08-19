@@ -87,17 +87,39 @@ $setup = Join-Path $InstallRoot "scripts\setup_production.ps1"
     -Offline -Device $Device -Port $Port
 if ($LASTEXITCODE -ne 0) { throw "Cell Vision runtime setup failed with exit code $LASTEXITCODE." }
 
+$rootLauncherPath = Join-Path $InstallRoot "Start-CellVision.cmd"
+$rootLauncherText = @'
+@echo off
+setlocal
+title Cell Vision
+powershell.exe -NoProfile -Command "try { $r = Invoke-RestMethod -Uri 'http://127.0.0.1:__PORT__/api/ready' -TimeoutSec 2; if ($r.status -eq 'ready') { exit 0 }; exit 1 } catch { exit 1 }"
+if errorlevel 1 (
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_production.ps1" %*
+  if errorlevel 1 (
+    echo.
+    echo Cell Vision failed to start.
+    pause
+    exit /b 1
+  )
+)
+start "" "http://127.0.0.1:__PORT__/"
+exit /b 0
+'@
+$rootLauncherText = $rootLauncherText.Replace("__PORT__", [string]$Port)
+[IO.File]::WriteAllText($rootLauncherPath, $rootLauncherText.TrimStart() + [Environment]::NewLine, (New-Object Text.UTF8Encoding($false)))
+
 $desktop = [Environment]::GetFolderPath("Desktop")
 $shell = New-Object -ComObject WScript.Shell
 $shortcut = $shell.CreateShortcut((Join-Path $desktop "Cell Vision.lnk"))
-$shortcut.TargetPath = "powershell.exe"
-$shortcut.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallRoot 'scripts\start_production.ps1')`" -InstallRoot `"$InstallRoot`""
+$shortcut.TargetPath = $rootLauncherPath
+$shortcut.Arguments = ""
 $shortcut.WorkingDirectory = $InstallRoot
 $shortcut.Description = "Start Cell Vision production service ($($release.git_short_commit))"
 $shortcut.Save()
 
 Write-Host "Installed Git commit: $($release.git_commit)" -ForegroundColor Green
 Write-Host "Application: $InstallRoot" -ForegroundColor Green
+Write-Host "Start: $rootLauncherPath" -ForegroundColor Green
 Write-Host "Data import folder: $dataRoot" -ForegroundColor Green
 if ($StartAfterInstall) {
     & (Join-Path $InstallRoot "scripts\start_production.ps1") -InstallRoot $InstallRoot
