@@ -34,7 +34,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 _STREAM_END = object()
 _STAGE_PROGRESS = {
     "day14_gate": 5,
-    "initialize_database": 10,
+    "materialize_project_images": 12,
+    "initialize_database": 14,
     "build_positive_only_t0_t2_manifest": 18,
     "build_cf_candidates": 26,
     "dense_candidate_augmentation": 34,
@@ -859,7 +860,7 @@ class ProjectTaskWorker:
             config = {
                 "base_config": "configs/default.yaml",
                 "paths": {
-                    "data_root": str(root),
+                    "data_root": str(project_dir / "data"),
                     "artifact_root": str(artifact_root),
                 },
                 "runtime": {
@@ -914,6 +915,13 @@ class ProjectTaskWorker:
                     "sessions_csv": str(sessions_csv),
                     "output_dir": str(gated_dir),
                 },
+                "project_images": {
+                    "enabled": True,
+                    "state": "pending_ingest",
+                    "project_root": str(project_dir),
+                    "image_root": str(project_dir / "data" / "images" / board_slug),
+                    "board_slug": board_slug,
+                },
             }
             config_path.write_text(
                 yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
@@ -934,7 +942,17 @@ class ProjectTaskWorker:
 
         project.update({
             "project_id": project_id,
-            "root": str(root),
+            "root": str(project_dir),
+            "source": {
+                "root": str(root),
+                "index": str(index),
+                "access_policy": "ingest_only",
+            },
+            "image_storage": {
+                "mode": "project_owned_after_endpoint_gate",
+                "root": str(project_dir / "data" / "images"),
+                "no_growth_images_retained": False,
+            },
             "generated_at": project.get("generated_at") or _now(),
             "source_sessions_csv": str(sessions_csv),
             "source_day14_csv": str(endpoint_csv),

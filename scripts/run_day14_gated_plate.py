@@ -24,6 +24,7 @@ from cellvision.manifest import build_manifest
 from cellvision.model_inference import predict_multiplicity_checkpoint, predict_teaching_checkpoint
 from cellvision.multiplicity import generate_integrated_training_round
 from cellvision.pseudo_labels import build_morphology_pseudo_labels
+from cellvision.project_images import materialize_project_images
 from cellvision.review_server import initialize_database
 from cellvision.teaching import generate_auto_annotation_round
 from cellvision.v2_instance_inference import infer_v2_instances
@@ -103,13 +104,36 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         for row in provisional["wells"]
         if bool(row["day14_obvious_growth"]) and not bool(row["is_positive_control"])
     }
+    materialized = _run_stage(
+        stages,
+        "materialize_project_images",
+        lambda: materialize_project_images(
+            args.config,
+            config,
+            positive_wells=positive_wells,
+            gate_rows=provisional["wells"],
+            endpoint_csv=args.day14_csv,
+            group_id=str(args.group_id),
+        ),
+    )
+    config = materialized["config"]
+    active_endpoint_csv = str(materialized["endpoint_csv"])
     if not positive_wells:
+        final = build_gated_plate_report(
+            active_endpoint_csv,
+            args.group_id,
+            output_dir,
+            sessions_csv=args.sessions_csv,
+            locate_day7=False,
+            endpoint_day_label=getattr(args, "endpoint_day_label", "Day14"),
+        )
         summary = {
             "group_id": args.group_id,
             "positive_well_count": 0,
             "stages": stages,
             "total_elapsed_seconds": round(time.perf_counter() - total_started, 3),
-            "report_json": provisional["report_json"],
+            "report_json": final["report_json"],
+            "project_images": {key: value for key, value in materialized.items() if key != "config"},
         }
         create_run_metadata(output_dir, config=config, input_paths=[args.config, args.day14_csv, args.sessions_csv], status="skipped_no_growth", stages=stages, extra={"group_id": str(args.group_id), "metadata_path": str(metadata_path)})
         (output_dir / "pipeline_summary.json").write_text(
@@ -159,7 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         stages,
         "final_report",
         lambda: build_gated_plate_report(
-            args.day14_csv,
+            active_endpoint_csv,
             args.group_id,
             output_dir,
             early_screening_csv=early_path,
@@ -178,6 +202,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "total_elapsed_seconds": round(time.perf_counter() - total_started, 3),
         "report_json": final["report_json"],
         "report_csv": final["report_csv"],
+        "project_images": {key: value for key, value in materialized.items() if key != "config"},
     }
     create_run_metadata(output_dir, config=config, input_paths=[args.config, args.day14_csv, args.sessions_csv], status="completed", stages=stages, extra={"group_id": str(args.group_id), "metadata_path": str(metadata_path)})
     (output_dir / "pipeline_summary.json").write_text(
