@@ -47,6 +47,20 @@ td small{display:block;margin-top:5px;color:#7b8988;font-size:12px}
 .plate-open:hover{text-decoration:underline}
 .empty{text-align:center;color:#8b9997;padding:28px}
 .queue-panel{min-height:100px}
+.offline-review-list{display:grid;gap:10px}
+.offline-review-task{display:grid;grid-template-columns:minmax(260px,1fr) auto;gap:12px 18px;align-items:center;padding:15px;border:1px solid #dce7e2;border-radius:10px;background:#fbfdfb}
+.offline-review-task>div>strong,.offline-review-task>div>small{display:block}
+.offline-review-task>div>small{margin-top:5px;color:#7b8988;font-size:12px}
+.offline-review-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
+.offline-export-state{grid-column:1/-1;padding-top:10px;border-top:1px dashed #dbe7e2}
+.offline-progress-line{display:flex;justify-content:space-between;gap:12px;color:#607370;font-size:12px}
+.offline-progress{height:9px;margin:7px 0;border-radius:999px;background:#e5ece8;overflow:hidden}
+.offline-progress i{display:block;height:100%;background:linear-gradient(90deg,#e3b341,#36a58f);transition:width .25s ease}
+.offline-export-state.active .offline-progress i{background:linear-gradient(90deg,#e3b341,#36a58f,#e3b341);background-size:200% 100%;animation:offline-progress-shimmer 1.2s linear infinite}
+.offline-package-path{display:block;margin-top:9px;padding:9px 11px;border-radius:7px;background:#edf4f1;color:#174b48;white-space:normal;word-break:break-all}
+.offline-export-state small{display:block;margin-top:6px;color:#718285}
+@keyframes offline-progress-shimmer{to{background-position:-200% 0}}
+.portable-review-mode .queue-panel,.portable-review-mode #newTaskLink,.portable-review-mode #renameProjectButton,.portable-review-mode #deleteProjectButton{display:none!important}
 .task-list{display:grid;gap:8px}
 .task-queue-note{margin:8px 0 0;color:#8a5c00;font-size:12px}
 .task{display:grid;grid-template-columns:1.1fr 1.5fr minmax(220px,1.2fr) 1.1fr auto;gap:12px;align-items:center;padding:11px 12px;border:1px solid #e2eae6;border-radius:9px;font-size:14px}
@@ -95,4 +109,6 @@ input{display:block;width:100%;margin-top:7px;padding:11px 12px;border:1px solid
   .task-board{grid-template-columns:1fr;gap:4px}
   .task-board-time{text-align:left}
   .task-actions{justify-content:flex-start}
+  .offline-review-task{grid-template-columns:1fr}
+  .offline-review-actions{justify-content:flex-start}
 }

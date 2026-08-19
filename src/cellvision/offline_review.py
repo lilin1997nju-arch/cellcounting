@@ -13,7 +13,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any
+from typing import Any, Callable
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import pandas as pd
@@ -182,6 +182,7 @@ def build_offline_review_bundle(
     ui_root: str | Path | None = None,
     max_image_size: int = 1400,
     jpeg_quality: int = 86,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     """Create a ZIP and return its temporary path plus a compact summary."""
 
@@ -210,21 +211,35 @@ def build_offline_review_bundle(
     image_count = 0
     object_count = 0
     missing_images: list[str] = []
+    prepared_plates: list[
+        tuple[int, dict[str, Any], dict[str, Path], pd.DataFrame]
+    ] = []
+    total_images = 0
     try:
+        for index, plate in enumerate(manifest.get("plates", []), start=1):
+            if not isinstance(plate, dict):
+                continue
+            paths = _plate_paths(plate, manifest_file)
+            if not paths["images_manifest"].is_file():
+                raise FileNotFoundError(paths["images_manifest"])
+            images = pd.read_csv(paths["images_manifest"])
+            images["well"] = images["well"].astype(str).str.upper()
+            images["timepoint"] = images["timepoint"].astype(str).str.upper()
+            if "decode_status" in images:
+                total_images += int(images["decode_status"].astype(str).eq("ok").sum())
+            else:
+                total_images += int(len(images))
+            prepared_plates.append((index, plate, paths, images))
+        if progress_callback is not None:
+            progress_callback(0, total_images, "已读取项目数据，开始打包审核图像")
+
+        processed_images = 0
         with ZipFile(zip_path, "w", compression=ZIP_DEFLATED, compresslevel=6) as archive:
             archive.write(assets / "offline-review.html", "index.html")
             archive.write(assets / "offline-review.css", "assets/offline-review.css")
             archive.write(assets / "offline-review.js", "assets/offline-review.js")
-            for index, plate in enumerate(manifest.get("plates", []), start=1):
-                if not isinstance(plate, dict):
-                    continue
-                paths = _plate_paths(plate, manifest_file)
-                if not paths["images_manifest"].is_file():
-                    raise FileNotFoundError(paths["images_manifest"])
+            for index, plate, paths, images in prepared_plates:
                 initialize_database(paths["database"])
-                images = pd.read_csv(paths["images_manifest"])
-                images["well"] = images["well"].astype(str).str.upper()
-                images["timepoint"] = images["timepoint"].astype(str).str.upper()
                 round_id, objects = _review_objects(paths["artifact_root"], paths["database"])
                 report = _read_json(paths["report"]) if paths["report"].is_file() else {}
                 report_lookup = {
@@ -262,6 +277,13 @@ def build_offline_review_bundle(
                         source = _resolve(str(row.raw_image_path), relative_to=manifest_file.parent)
                         if not source.is_file():
                             missing_images.append(f"{slug}/{well}/{timepoint}")
+                            processed_images += 1
+                            if progress_callback is not None:
+                                progress_callback(
+                                    processed_images,
+                                    total_images,
+                                    f"正在打包 {plate_data['board_id']} · {well} {timepoint}",
+                                )
                             continue
                         member = f"images/{slug}/{well}/{timepoint}.jpg"
                         jpeg = zip_path.parent / f".{zip_path.stem}-{index}-{well}-{timepoint}.jpg"
@@ -271,6 +293,13 @@ def build_offline_review_bundle(
                         finally:
                             jpeg.unlink(missing_ok=True)
                         image_count += 1
+                        processed_images += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                processed_images,
+                                total_images,
+                                f"正在打包 {plate_data['board_id']} · {well} {timepoint}",
+                            )
                         well_images[timepoint] = {
                             "url": member,
                             "width": width,
@@ -312,6 +341,8 @@ def build_offline_review_bundle(
                 "完成后点击“导出审核结果”，将 JSON 文件复制回生产电脑并在任务页导入。\r\n"
                 "本包只含审核网页与降采样图像，不包含模型、训练功能或原始 TIFF。\r\n",
             )
+        if progress_callback is not None:
+            progress_callback(total_images, total_images, "离线审核包已生成")
     except Exception:
         zip_path.unlink(missing_ok=True)
         raise
@@ -489,3 +520,105 @@ def import_offline_review_results(
         "refresh_warnings": refresh_warnings,
         "reviewer": reviewer,
     }
+
+
+def export_offline_review_results(
+    manifest_path: str | Path,
+    task: dict[str, Any],
+) -> dict[str, Any]:
+    """Serialize reviews made with the normal review UI for production import."""
+
+    manifest_file = _resolve(manifest_path)
+    manifest = _read_json(manifest_file)
+    payload: dict[str, Any] = {
+        "format": BUNDLE_FORMAT,
+        "version": BUNDLE_VERSION,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "task_id": str(task.get("task_id") or manifest.get("task_id") or ""),
+        "project_id": str(manifest.get("project_id") or manifest_file.parent.name),
+        "reviewer": "offline_reviewer",
+        "plates": [],
+    }
+    reviewers: list[str] = []
+    for plate in manifest.get("plates", []):
+        if not isinstance(plate, dict):
+            continue
+        paths = _plate_paths(plate, manifest_file)
+        database = initialize_database(paths["database"])
+        round_id, objects = _review_objects(paths["artifact_root"], database)
+        completed_wells: set[str] = set()
+        screening: dict[str, str] = {}
+        with sqlite3.connect(database) as connection:
+            try:
+                rows = connection.execute(
+                    "SELECT well, reviewer FROM quick_review_sessions ORDER BY updated_at"
+                ).fetchall()
+                completed_wells.update(str(row[0]).upper() for row in rows)
+                reviewers.extend(str(row[1]).strip() for row in rows if row[1])
+            except sqlite3.OperationalError:
+                pass
+            try:
+                rows = connection.execute(
+                    "SELECT well, decision, reviewer FROM well_screening_reviews"
+                ).fetchall()
+                for well, decision, reviewer in rows:
+                    well = str(well).upper()
+                    screening[well] = str(decision)
+                    if str(decision) != "pending":
+                        completed_wells.add(well)
+                    if reviewer:
+                        reviewers.append(str(reviewer).strip())
+            except sqlite3.OperationalError:
+                pass
+
+        object_rows: list[dict[str, Any]] = []
+        if not objects.empty:
+            for row in objects.to_dict(orient="records"):
+                well = str(row.get("well") or "").upper()
+                candidate_id = str(row.get("candidate_id") or "")
+                reviewed = str(
+                    row.get("reviewed_label")
+                    or row.get("final_label")
+                    or row.get("current_label")
+                    or row.get("integrated_label")
+                    or "uncertain"
+                )
+                if reviewed not in LABELS:
+                    reviewed = "uncertain"
+                is_new = bool(row.get("is_manual_missed")) or ":manual:" in candidate_id
+                value = {
+                    "candidate_id": candidate_id,
+                    "reviewed_label": reviewed,
+                    "is_new": is_new,
+                }
+                if is_new:
+                    value.update({
+                        "well": well,
+                        "timepoint": str(row.get("timepoint") or "").upper(),
+                        "x_px": float(row.get("x_px") or 0),
+                        "y_px": float(row.get("y_px") or 0),
+                        "diameter_px": float(row.get("diameter_px") or 18),
+                    })
+                object_rows.append(value)
+
+        all_wells = sorted(
+            set(objects.get("well", pd.Series(dtype=str)).astype(str).str.upper())
+            | set(screening)
+            | completed_wells
+        )
+        payload["plates"].append({
+            "slug": str(plate.get("slug") or plate.get("board_id") or ""),
+            "round_id": round_id,
+            "objects": object_rows,
+            "wells": [
+                {
+                    "well": well,
+                    "screening_decision": screening.get(well, "pending"),
+                    "completed": well in completed_wells,
+                }
+                for well in all_wells
+            ],
+        })
+    if reviewers:
+        payload["reviewer"] = next((value for value in reversed(reviewers) if value), "offline_reviewer")
+    return _json_safe(payload)

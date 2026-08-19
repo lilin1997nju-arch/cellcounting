@@ -8,6 +8,7 @@ from PIL import Image
 from cellvision.offline_review import (
     BUNDLE_FORMAT,
     build_offline_review_bundle,
+    export_offline_review_results,
     import_offline_review_results,
 )
 from cellvision.review_storage import initialize_database
@@ -97,3 +98,39 @@ def test_offline_import_validates_identity_and_saves_decisions(tmp_path: Path):
         assert "任务不匹配" in str(exc)
     else:
         raise AssertionError("mismatched task must be rejected")
+
+
+def test_normal_review_results_can_be_exported_for_production_import(tmp_path: Path):
+    manifest, task = _fixture(tmp_path)
+    import_offline_review_results(manifest, task, {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "Reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [{
+                "candidate_id": "C2:T0:1",
+                "reviewed_label": "touching_doublet",
+                "is_new": False,
+            }],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "approved",
+                "completed": True,
+            }],
+        }],
+    })
+
+    exported = export_offline_review_results(manifest, task)
+
+    assert exported["format"] == BUNDLE_FORMAT
+    assert exported["task_id"] == "task-1"
+    assert exported["project_id"] == "project-1"
+    plate = exported["plates"][0]
+    reviewed = next(item for item in plate["objects"] if item["candidate_id"] == "C2:T0:1")
+    assert reviewed["reviewed_label"] == "touching_doublet"
+    well = next(item for item in plate["wells"] if item["well"] == "C2")
+    assert well == {"well": "C2", "screening_decision": "approved", "completed": True}

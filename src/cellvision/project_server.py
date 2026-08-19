@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 from tempfile import NamedTemporaryFile
-from threading import RLock
+from threading import RLock, Thread
 from collections import OrderedDict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,9 +43,10 @@ from .multiplicity import (
     save_categorized_review_labels,
 )
 from .offline_review import (
-    build_offline_review_bundle,
+    export_offline_review_results,
     import_offline_review_results,
 )
+from .portable_review import prepare_portable_review_workspace
 from .review_server import _visible_v2_review_instances, create_app, initialize_database
 from .review_summary import (
     latest_prediction_path,
@@ -2357,6 +2358,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             return {
                 **catalog_detail,
                 "root": selected_manifest.get("root"),
+                "portable_review": bool(
+                    selected_manifest.get("portable_review")
+                    or os.environ.get("CELLVISION_PORTABLE_REVIEW") == "1"
+                ),
                 "mounted_plates": mounted,
                 "detection_start_date": _project_detection_dates(selected_manifest)[0],
                 "detection_end_date": _project_detection_dates(selected_manifest)[1],
@@ -2396,6 +2401,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 or ""
             ),
             "generated_at": selected_manifest.get("generated_at"),
+            "portable_review": bool(
+                selected_manifest.get("portable_review")
+                or os.environ.get("CELLVISION_PORTABLE_REVIEW") == "1"
+            ),
         }
 
     @app.get("/api/project/export-results")
@@ -2498,34 +2507,123 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             raise HTTPException(status_code=404, detail="任务所属项目清单不存在")
         return task, task_manifest
 
-    @app.get("/api/project/tasks/{task_id_value}/export-offline-review")
-    def export_offline_review(
+    def public_offline_export_state(value: Any) -> dict[str, Any]:
+        state = dict(value) if isinstance(value, dict) else {}
+        state.pop("bundle_path", None)
+        return state
+
+    def update_offline_export_state(
+        store: TaskQueueStore,
+        task_id_value: str,
+        state: dict[str, Any],
+    ) -> dict[str, Any]:
+        value = {**state, "updated_at": datetime.now(timezone.utc).isoformat()}
+        store.update(task_id_value, offline_export=value)
+        return value
+
+    @app.post("/api/project/tasks/{task_id_value}/offline-review-export")
+    def start_offline_review_export(
         task_id_value: str,
         project_id: str | None = None,
-    ) -> FileResponse:
-        """Download a self-contained, server-free review website."""
+    ) -> dict[str, Any]:
+        """Start one observable offline-review bundle build."""
 
         task, task_manifest = completed_task_for_offline_review(
             task_id_value, project_id
         )
-        try:
-            bundle_path, _ = build_offline_review_bundle(
-                task_manifest,
-                task,
-                ui_root=ui_root,
-            )
-        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
-            raise HTTPException(
-                status_code=500,
-                detail=f"生成离线审核包失败：{exc}",
-            ) from exc
-        filename = f"{_slug(str(task.get('name') or task_id_value)) or 'cellvision'}-offline-review.zip"
-        return FileResponse(
-            bundle_path,
-            media_type="application/zip",
-            filename=filename,
-            background=BackgroundTask(_remove_export_file, str(bundle_path)),
-        )
+        store = task_store_for_manifest(task_manifest)
+        previous = task.get("offline_export")
+        if isinstance(previous, dict):
+            previous_status = str(previous.get("status") or "")
+            previous_path_value = str(previous.get("package_path") or "")
+            previous_path = Path(previous_path_value) if previous_path_value else None
+            if previous_status == "running":
+                return public_offline_export_state(previous)
+            if (
+                previous_status == "completed"
+                and previous_path is not None
+                and previous_path.is_dir()
+            ):
+                return public_offline_export_state(previous)
+
+        job_id = f"offline-{task_id()}"
+        initial = update_offline_export_state(store, task_id_value, {
+            "job_id": job_id,
+            "status": "running",
+            "progress_current": 0,
+            "progress_total": 0,
+            "progress_percent": 0,
+            "progress_message": "正在读取项目数据",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+        def build_bundle() -> None:
+            last_percent = -1
+
+            def report_progress(current: int, total: int, message: str) -> None:
+                nonlocal last_percent
+                percent = int(round(current / total * 100)) if total else 0
+                percent = min(99, max(0, percent))
+                if percent == last_percent and current < total:
+                    return
+                last_percent = percent
+                update_offline_export_state(store, task_id_value, {
+                    **initial,
+                    "status": "running",
+                    "progress_current": int(current),
+                    "progress_total": int(total),
+                    "progress_percent": percent,
+                    "progress_message": str(message),
+                })
+
+            try:
+                package_path, summary = prepare_portable_review_workspace(
+                    task_manifest,
+                    task,
+                    application_root=PROJECT_ROOT,
+                    release_root=PROJECT_ROOT.parent,
+                    progress_callback=report_progress,
+                )
+                update_offline_export_state(store, task_id_value, {
+                    **initial,
+                    "status": "completed",
+                    "progress_current": int(summary.get("copied_bytes", 1) or 1),
+                    "progress_total": int(summary.get("copied_bytes", 1) or 1),
+                    "progress_percent": 100,
+                    "progress_message": "完整审核目录已准备好，可直接复制整个任务文件夹",
+                    "package_path": str(package_path),
+                    "summary": summary,
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as exc:
+                update_offline_export_state(store, task_id_value, {
+                    **initial,
+                    "status": "error",
+                    "progress_message": f"生成失败：{type(exc).__name__}: {exc}",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "finished_at": datetime.now(timezone.utc).isoformat(),
+                })
+
+        Thread(
+            target=build_bundle,
+            name=f"cellvision-{job_id}",
+            daemon=True,
+        ).start()
+        return public_offline_export_state(initial)
+
+    @app.get("/api/project/tasks/{task_id_value}/offline-review-export")
+    def offline_review_export_progress(
+        task_id_value: str,
+        project_id: str | None = None,
+        job_id: str = "",
+    ) -> dict[str, Any]:
+        task, _ = completed_task_for_offline_review(task_id_value, project_id)
+        state = task.get("offline_export")
+        if not isinstance(state, dict):
+            return {"status": "idle", "progress_percent": 0}
+        if job_id and str(state.get("job_id") or "") != job_id:
+            raise HTTPException(status_code=404, detail="离线审核包导出任务不存在")
+        return public_offline_export_state(state)
 
     @app.post("/api/project/tasks/{task_id_value}/import-offline-review")
     def import_offline_review(
@@ -2549,6 +2647,27 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             operation="offline_review_import",
         )
         return result
+
+    @app.get("/api/project/tasks/{task_id_value}/export-offline-review-results")
+    def export_offline_review_result_file(
+        task_id_value: str,
+        project_id: str | None = None,
+    ) -> Response:
+        """Export reviews created by the normal UI as an importable JSON file."""
+
+        task, task_manifest = completed_task_for_offline_review(
+            task_id_value, project_id
+        )
+        payload = export_offline_review_results(task_manifest, task)
+        filename = (
+            f"{_slug(str(task.get('name') or task_id_value)) or 'cellvision'}"
+            "-offline-review-results.json"
+        )
+        return Response(
+            content=json.dumps(payload, ensure_ascii=False, indent=2),
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     @app.get("/api/project/tasks")
     def tasks(project_id: str | None = None) -> list[dict[str, Any]]:

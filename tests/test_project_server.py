@@ -36,7 +36,8 @@ def test_production_project_hub_hides_specialist_training_and_mask_routes(
     assert "/api/multiplicity-training-candidates" not in paths
     assert "/api/mask-review-rounds" not in paths
     assert "/api/project/export-results" in paths
-    assert "/api/project/tasks/{task_id_value}/export-offline-review" in paths
+    assert "/api/project/tasks/{task_id_value}/offline-review-export" in paths
+    assert "/api/project/tasks/{task_id_value}/export-offline-review-results" in paths
     assert "/api/project/tasks/{task_id_value}/import-offline-review" in paths
 
 
@@ -47,10 +48,15 @@ def test_production_dashboard_has_no_training_or_mask_review_entry():
     quick_review = (
         Path(__file__).parents[1] / "review-ui" / "auto-review.html"
     ).read_text(encoding="utf-8")
+    dashboard_js = (
+        Path(__file__).parents[1] / "review-ui" / "project-dashboard.js"
+    ).read_text(encoding="utf-8")
 
     assert "单/粘连训练审核" not in html
     assert "Mask 轮廓审核" not in html
     assert "用本轮结果训练并生成下一轮" not in quick_review
+    assert "准备完整离线审核目录" in dashboard_js
+    assert "轮廓和快捷键与生产审核一致" in html
 
 
 def test_plate_review_manager_resolves_sibling_projects_and_uses_lru_limit(tmp_path: Path):

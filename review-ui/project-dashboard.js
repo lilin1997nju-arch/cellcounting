@@ -123,10 +123,6 @@ function taskActions(task) {
   if (status !== "completed" && status !== "running") {
     buttons.push(`<button class="task-action danger" type="button" data-task-action="delete" data-task-id="${esc(task.task_id)}">删除</button>`);
   }
-  if (status === "completed") {
-    buttons.push(`<button class="task-action secondary" type="button" data-task-action="offline-export" data-task-id="${esc(task.task_id)}">导出离线审核包</button>`);
-    buttons.push(`<button class="task-action secondary" type="button" data-task-action="offline-import" data-task-id="${esc(task.task_id)}">导入离线审核结果</button>`);
-  }
   return buttons.length ? `<div class="task-actions">${buttons.join("")}</div>` : "";
 }
 
@@ -147,6 +143,31 @@ function renderTask(task) {
   </div>`;
 }
 
+function offlineProgress(task) {
+  const state = task.offline_export || {};
+  const percent = Math.min(100, Math.max(0, Number(state.progress_percent || 0)));
+  const active = String(state.status || "") === "running";
+  const ready = String(state.status || "") === "completed" && state.package_path;
+  return `<div class="offline-export-state ${active ? "active" : ""}" data-offline-progress="${esc(task.task_id)}">
+    <div class="offline-progress-line"><span>${esc(state.progress_message || "尚未准备完整审核目录")}</span><b>${Math.round(percent)}%</b></div>
+    <div class="offline-progress"><i style="width:${percent}%"></i></div>
+    ${ready ? `<code class="offline-package-path">${esc(state.package_path)}</code><small>请复制整个任务数据文件夹；审核电脑双击该目录中的 Start-Offline-Review.cmd。</small>` : ""}
+  </div>`;
+}
+
+function renderOfflineTask(task) {
+  const portable = Boolean(projectData?.portable_review);
+  const actions = portable
+    ? `<button class="task-action primary" type="button" data-task-action="offline-result-export" data-task-id="${esc(task.task_id)}">导出审核结果 JSON</button>`
+    : `<button class="task-action primary" type="button" data-task-action="offline-export" data-task-id="${esc(task.task_id)}">准备完整离线审核目录</button>
+       <button class="task-action secondary" type="button" data-task-action="offline-import" data-task-id="${esc(task.task_id)}">导入离线审核结果</button>`;
+  return `<article class="offline-review-task" data-offline-task="${esc(task.task_id)}">
+    <div><strong>${esc(task.name || projectData?.project_name || "已完成任务")}</strong><small>${esc(task.task_id)} · ${task.finished_at ? new Date(task.finished_at).toLocaleString() : "已完成"}</small></div>
+    <div class="offline-review-actions">${actions}</div>
+    ${portable ? `<p class="muted">审核使用正常生产界面；结果会实时写入本地副本。完成后导出 JSON，再回生产项目导入。</p>` : offlineProgress(task)}
+  </article>`;
+}
+
 async function handleTaskAction(event) {
   const button = event.currentTarget;
   const action = button.dataset.taskAction;
@@ -158,6 +179,10 @@ async function handleTaskAction(event) {
   }
   if (action === "offline-import") {
     await chooseOfflineReviewResult(taskId, button);
+    return;
+  }
+  if (action === "offline-result-export") {
+    exportOfflineReviewResult(taskId);
     return;
   }
   if (action === "cancel" && !window.confirm("确定取消这个任务吗？")) return;
@@ -181,29 +206,55 @@ async function handleTaskAction(event) {
 async function exportOfflineReview(taskId, button) {
   button.disabled = true;
   const originalText = button.textContent;
-  button.textContent = "正在打包图像…";
+  button.textContent = "正在准备…";
   try {
     const query = projectId ? `?project_id=${encodeURIComponent(projectId)}` : "";
-    const response = await fetch(`/api/project/tasks/${encodeURIComponent(taskId)}/export-offline-review${query}`);
-    if (!response.ok) throw new Error(await response.text());
-    const blob = await response.blob();
-    const disposition = response.headers.get("content-disposition") || "";
-    const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-    const plainName = disposition.match(/filename="?([^";]+)"?/i)?.[1];
-    const link = document.createElement("a");
-    link.href = URL.createObjectURL(blob);
-    link.download = encodedName ? decodeURIComponent(encodedName) : plainName || `${taskId}-offline-review.zip`;
-    document.body.appendChild(link);
-    link.click();
-    URL.revokeObjectURL(link.href);
-    link.remove();
-    toast("离线审核包已导出；解压后双击 index.html 即可审核");
+    let state = await api(`/api/project/tasks/${encodeURIComponent(taskId)}/offline-review-export${query}`, { method: "POST" });
+    const progressQuery = () => {
+      const values = new URLSearchParams();
+      if (projectId) values.set("project_id", projectId);
+      if (state.job_id) values.set("job_id", state.job_id);
+      return values.toString() ? `?${values}` : "";
+    };
+    while (["running", "queued"].includes(String(state.status || "running"))) {
+      updateOfflineProgress(taskId, state);
+      await new Promise(resolve => setTimeout(resolve, 600));
+      state = await api(`/api/project/tasks/${encodeURIComponent(taskId)}/offline-review-export${progressQuery()}`);
+    }
+    updateOfflineProgress(taskId, state);
+    if (state.status === "error") throw new Error(state.error || state.progress_message || "准备失败");
+    toast("完整审核目录已准备好；可直接复制整个任务文件夹");
   } catch (error) {
-    toast(`离线审核包导出失败：${error.message}`);
+    toast(`完整审核目录准备失败：${error.message}`);
   } finally {
     button.disabled = false;
     button.textContent = originalText;
+    await loadTasks({ silent: true });
   }
+}
+
+function updateOfflineProgress(taskId, state) {
+  const root = document.querySelector(`[data-offline-task="${CSS.escape(String(taskId))}"]`);
+  const progress = root?.querySelector("[data-offline-progress]");
+  if (!progress) return;
+  const percent = Math.min(100, Math.max(0, Number(state.progress_percent || 0)));
+  progress.classList.toggle("active", state.status === "running");
+  progress.querySelector(".offline-progress-line span").textContent = state.progress_message || "正在准备";
+  progress.querySelector(".offline-progress-line b").textContent = `${Math.round(percent)}%`;
+  progress.querySelector(".offline-progress i").style.width = `${percent}%`;
+}
+
+function exportOfflineReviewResult(taskId) {
+  const values = new URLSearchParams();
+  if (projectId) values.set("project_id", projectId);
+  const query = values.toString() ? `?${values}` : "";
+  const link = document.createElement("a");
+  link.href = `/api/project/tasks/${encodeURIComponent(taskId)}/export-offline-review-results${query}`;
+  link.download = "";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  toast("正在导出正常审核界面的审核结果");
 }
 
 function chooseOfflineReviewResult(taskId, button) {
@@ -325,6 +376,12 @@ function renderProject(data) {
   projectData = data;
   $("projectName").textContent = data.project_name || data.project_id;
   $("projectMeta").textContent = `${dateRange(data)} · 创建人：${data.created_by || "—"}`;
+  document.body.classList.toggle("portable-review-mode", Boolean(data.portable_review));
+  if ($("offlineReviewHelp")) {
+    $("offlineReviewHelp").textContent = data.portable_review
+      ? "当前为完整离线审核副本；板子审核界面、轮廓和快捷键与生产版本一致。"
+      : "准备完整任务审核目录；复制整个任务文件夹后，离线电脑使用的界面、轮廓和快捷键与生产审核一致。";
+  }
 
   const plates = data.plates || [];
   $("deleteProjectButton").hidden = plates.length !== 0;
@@ -396,13 +453,18 @@ async function loadTasks({ silent = false } = {}) {
       }
       taskStatusHistory.set(id, current);
     });
-    $("taskRows").innerHTML = tasks.length
-      ? tasks.slice().reverse().map(renderTask).join("")
-      : `<div class="empty">暂无任务</div>`;
+    const completedTasks = tasks.filter(task => String(task.status) === "completed");
+    const queueTasks = tasks.filter(task => String(task.status) !== "completed");
+    $("taskRows").innerHTML = queueTasks.length
+      ? queueTasks.slice().reverse().map(renderTask).join("")
+      : `<div class="empty">暂无待执行任务</div>`;
+    $("offlineReviewRows").innerHTML = completedTasks.length
+      ? completedTasks.slice().reverse().map(renderOfflineTask).join("")
+      : `<div class="empty">计算完成后可准备离线审核目录</div>`;
     document.querySelectorAll("[data-task-action]").forEach(button => {
       button.addEventListener("click", handleTaskAction);
     });
-    updateTaskPolling(tasks);
+    updateTaskPolling(queueTasks);
   } catch (error) {
     if (!silent) throw error;
   } finally {

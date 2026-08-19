@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260813-project-v6">
+  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260819-portable-review-v1">
 </head>
 <body>
   <header class="project-header">
@@ -19,7 +19,7 @@
       <button id="exportResultsButton" class="primary" type="button">导出 Excel 结果</button>
       <button id="renameProjectButton" class="secondary" type="button">修改项目名称</button>
       <button id="deleteProjectButton" class="danger" type="button" hidden>删除空项目</button>
-      <a class="primary header-link" href="/?new-task=1">新建任务</a>
+      <a id="newTaskLink" class="primary header-link" href="/?new-task=1">新建任务</a>
     </div>
   </header>
 
@@ -43,9 +43,18 @@
         </table>
       </div>
     </section>
+    <section id="offlineReviewPanel" class="panel offline-review-panel">
+      <div class="panel-heading">
+        <div>
+          <h2>离线审核</h2>
+          <p id="offlineReviewHelp" class="muted">准备完整任务审核目录；复制整个任务文件夹后，离线电脑使用的界面、轮廓和快捷键与生产审核一致。</p>
+        </div>
+      </div>
+      <div id="offlineReviewRows" class="offline-review-list"><div class="empty">计算完成后可准备离线审核目录</div></div>
+    </section>
     <section class="panel queue-panel">
-      <div class="panel-heading"><div><h2>任务队列</h2><p class="muted">新建任务只负责解析和排队；计算按板子顺序执行，避免同时占用显存。</p><p class="task-queue-note">queued 表示排队中、尚未开始；执行后会显示阶段和进度。</p></div></div>
-      <div id="taskRows" class="task-list"><div class="empty">暂无任务</div></div>
+      <div class="panel-heading"><div><h2>任务队列</h2><p class="muted">这里只显示排队中、执行中、失败或取消的任务；完成后自动移入上方项目离线审核区域。</p><p class="task-queue-note">计算按任务启动顺序串行执行，避免同时占用计算资源。</p></div></div>
+      <div id="taskRows" class="task-list"><div class="empty">暂无待执行任务</div></div>
     </section>
   </main>
 
@@ -67,6 +76,6 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-dashboard.js?v=20260813-project-v6"></script>
+  <script src="/project-assets/project-dashboard.js?v=20260819-portable-review-v1"></script>
 </body>
 </html>
