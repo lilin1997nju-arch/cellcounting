@@ -40,6 +40,11 @@ def test_production_project_hub_hides_specialist_training_and_mask_routes(
     assert "/api/project/tasks/{task_id_value}/export-offline-review-results" in paths
     assert "/api/project/tasks/{task_id_value}/import-offline-review" in paths
 
+    server_source = (
+        Path(__file__).parents[1] / "src" / "cellvision" / "project_server.py"
+    ).read_text(encoding="utf-8")
+    assert "previous_commit == current_release_commit" in server_source
+
 
 def test_production_dashboard_has_no_training_or_mask_review_entry():
     html = (

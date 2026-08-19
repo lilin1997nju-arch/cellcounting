@@ -2533,16 +2533,29 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         )
         store = task_store_for_manifest(task_manifest)
         previous = task.get("offline_export")
+        release_commit_file = PROJECT_ROOT / "RELEASE_GIT_COMMIT.txt"
+        current_release_commit = (
+            release_commit_file.read_text(encoding="utf-8").strip()
+            if release_commit_file.is_file()
+            else "development"
+        )
         if isinstance(previous, dict):
             previous_status = str(previous.get("status") or "")
             previous_path_value = str(previous.get("package_path") or "")
             previous_path = Path(previous_path_value) if previous_path_value else None
+            previous_summary = previous.get("summary")
+            previous_commit = (
+                str(previous_summary.get("git_commit") or "")
+                if isinstance(previous_summary, dict)
+                else ""
+            )
             if previous_status == "running":
                 return public_offline_export_state(previous)
             if (
                 previous_status == "completed"
                 and previous_path is not None
                 and previous_path.is_dir()
+                and previous_commit == current_release_commit
             ):
                 return public_offline_export_state(previous)
 
