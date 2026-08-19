@@ -143,10 +143,35 @@ def choose_review_package() -> Path | None:
     from tkinter import filedialog
 
     root = tk.Tk()
-    root.withdraw()
     try:
+        # The review platform normally runs as a hidden background process
+        # while the browser owns the foreground.  Give the native chooser an
+        # invisible, topmost owner so Windows does not place it behind the
+        # browser window.
+        root.overrideredirect(True)
+        root.geometry("1x1+0+0")
+        root.attributes("-topmost", True)
+        try:
+            root.attributes("-alpha", 0.0)
+        except tk.TclError:
+            pass
+        root.deiconify()
+        root.update_idletasks()
+        root.lift()
+        root.focus_force()
+        root.update()
+        if os.name == "nt":
+            try:
+                import ctypes
+
+                ctypes.windll.user32.BringWindowToTop(root.winfo_id())
+                ctypes.windll.user32.SetForegroundWindow(root.winfo_id())
+            except (AttributeError, OSError):
+                pass
         selected = filedialog.askdirectory(
-            title="选择要导入的 Cell Vision .cvreview 审核数据包"
+            parent=root,
+            title="选择要导入的 Cell Vision .cvreview 审核数据包",
+            mustexist=True,
         )
     finally:
         root.destroy()
