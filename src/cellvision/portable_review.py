@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -20,6 +21,21 @@ _APPLICATION_ENTRIES = (
     "requirements-production.txt",
     "RELEASE_GIT_COMMIT.txt",
 )
+
+
+def _promote_staging_directory(staging: Path, target: Path) -> None:
+    """Rename a completed workspace, tolerating short Windows scanner locks."""
+
+    last_error: PermissionError | None = None
+    for attempt in range(20):
+        try:
+            staging.replace(target)
+            return
+        except PermissionError as exc:
+            last_error = exc
+            time.sleep(min(0.25 + attempt * 0.1, 1.0))
+    assert last_error is not None
+    raise last_error
 
 
 def _files(root: Path) -> Iterable[Path]:
@@ -140,7 +156,7 @@ def prepare_portable_review_workspace(
             json.dumps(metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-        staging.replace(target)
+        _promote_staging_directory(staging, target)
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise

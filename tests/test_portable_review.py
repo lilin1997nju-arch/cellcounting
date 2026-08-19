@@ -1,7 +1,10 @@
 import json
 from pathlib import Path
 
-from cellvision.portable_review import prepare_portable_review_workspace
+from cellvision.portable_review import (
+    _promote_staging_directory,
+    prepare_portable_review_workspace,
+)
 from scripts.rebase_portable_review import rebase
 
 
@@ -63,3 +66,26 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
     config_text = (workspace / "project" / "configs" / "plate.yaml").read_text(encoding="utf-8")
     assert str(workspace / "project") in config_text
     assert str(data_root) in config_text
+
+
+def test_promote_staging_directory_retries_short_windows_lock(tmp_path: Path, monkeypatch):
+    staging = tmp_path / "staging"
+    target = tmp_path / "target"
+    staging.mkdir()
+    original_replace = Path.replace
+    attempts = 0
+
+    def flaky_replace(path: Path, destination: Path):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise PermissionError("scanner still holds a file")
+        return original_replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", flaky_replace)
+    monkeypatch.setattr("cellvision.portable_review.time.sleep", lambda _: None)
+
+    _promote_staging_directory(staging, target)
+
+    assert attempts == 3
+    assert target.is_dir()
