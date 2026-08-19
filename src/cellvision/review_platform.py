@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import socket
@@ -46,7 +45,7 @@ def _read_registry() -> dict[str, Any]:
 def register_review_package(package_root: str | Path) -> tuple[Path, dict[str, Any]]:
     root = Path(package_root).expanduser().resolve()
     metadata_path = root / DATA_PACKAGE_MANIFEST
-    metadata_digest = hashlib.sha256(metadata_path.read_bytes()).hexdigest() if metadata_path.is_file() else ""
+    metadata_stat = metadata_path.stat() if metadata_path.is_file() else None
     registry = _read_registry()
     packages = registry.get("packages") if isinstance(registry.get("packages"), list) else []
     # Opening a review package is latency-sensitive and the package can be
@@ -58,7 +57,8 @@ def register_review_package(package_root: str | Path) -> tuple[Path, dict[str, A
         "project_id": str(metadata["project_id"]),
         "project_name": str(metadata.get("project_name") or metadata["project_id"]),
         "package_path": str(root),
-        "manifest_sha256": metadata_digest,
+        "manifest_bytes": int(metadata_stat.st_size) if metadata_stat is not None else 0,
+        "manifest_modified_ns": int(metadata_stat.st_mtime_ns) if metadata_stat is not None else 0,
         "hashes_verified": False,
         "validated_at": datetime.now(timezone.utc).isoformat(),
         "last_opened_at": datetime.now(timezone.utc).isoformat(),

@@ -164,6 +164,7 @@ def test_installed_review_platform_registers_package_and_tracks_identity(tmp_pat
     assert registry["packages"][0]["package_id"] == metadata["package_id"]
     assert registry["packages"][0]["package_path"] == str(package)
     assert registry["packages"][0]["hashes_verified"] is False
+    assert "manifest_sha256" not in registry["packages"][0]
 
     from cellvision.project_server import create_project_app
 
