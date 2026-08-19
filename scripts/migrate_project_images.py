@@ -32,8 +32,6 @@ def _rewrite_plate_paths(root: Path, replacements: dict[str, str]) -> int:
     for path in root.rglob("*"):
         if not path.is_file() or path.suffix.casefold() not in {".csv", ".json", ".yaml", ".yml"}:
             continue
-        if "cache" in path.parts:
-            continue
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -45,6 +43,35 @@ def _rewrite_plate_paths(root: Path, replacements: dict[str, str]) -> int:
             path.write_text(updated, encoding="utf-8")
             changed += 1
     return changed
+
+
+def repair_project_paths_from_inventory(project_root: str | Path) -> dict[str, int]:
+    """Rebase any remaining active CSV/JSON cache references from inventory."""
+
+    root = Path(project_root).expanduser().resolve()
+    manifest = json.loads((root / "project.json").read_text(encoding="utf-8"))
+    plates = {
+        str(plate.get("slug") or ""): Path(str(plate["artifact_root"])).expanduser().resolve()
+        for plate in manifest.get("plates", [])
+        if isinstance(plate, dict) and plate.get("artifact_root")
+    }
+    repaired: dict[str, int] = {}
+    for inventory_path in (root / "data" / "manifests").glob("*-images.csv"):
+        inventory = pd.read_csv(inventory_path, low_memory=False)
+        if inventory.empty or "board_slug" not in inventory.columns:
+            continue
+        board_slug = str(inventory.iloc[0]["board_slug"])
+        artifact_root = plates.get(board_slug)
+        if artifact_root is None:
+            continue
+        replacements: dict[str, str] = {}
+        for row in inventory.to_dict(orient="records"):
+            source_path = Path(str(row.get("source_path") or ""))
+            project_path = root / str(row.get("project_path") or "")
+            if source_path.name and project_path.name:
+                replacements[str(source_path.parent)] = str(project_path.parent.resolve())
+        repaired[board_slug] = _rewrite_plate_paths(artifact_root, replacements)
+    return repaired
 
 
 def migrate(manifest_path: str | Path) -> dict[str, Any]:
@@ -156,11 +183,13 @@ def migrate(manifest_path: str | Path) -> dict[str, Any]:
         "plates": migrated_plates,
     }
     manifest_file.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    repaired = repair_project_paths_from_inventory(project_root)
     return {
         "project": str(manifest_file),
         "plate_count": len(migrated_plates),
         "copied_bytes": sum(item["copied_bytes"] for item in migrated_plates),
         "plates": migrated_plates,
+        "repaired_active_path_files": repaired,
     }
 
 
