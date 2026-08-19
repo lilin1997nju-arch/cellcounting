@@ -30,6 +30,19 @@ function Invoke-Checked {
     }
 }
 
+function Get-RelativeReleasePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+    $rootPrefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    if (-not $fullPath.StartsWith($rootPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "Release file is outside the release root: $fullPath"
+    }
+    return $fullPath.Substring($rootPrefix.Length)
+}
+
 $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 $git = (Get-Command git -ErrorAction Stop).Source
 $dirty = @(& $git -C $repository status --porcelain)
@@ -149,7 +162,7 @@ try {
         Where-Object { $_.Name -ne "SHA256SUMS.txt" } |
         Sort-Object FullName |
         ForEach-Object {
-            $relative = [IO.Path]::GetRelativePath($releaseRoot, $_.FullName).Replace("\", "/")
+            $relative = (Get-RelativeReleasePath -Root $releaseRoot -Path $_.FullName).Replace("\", "/")
             "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $relative"
         }
     [IO.File]::WriteAllLines((Join-Path $releaseRoot "SHA256SUMS.txt"), $hashLines, (New-Object Text.UTF8Encoding($false)))
