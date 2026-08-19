@@ -5,6 +5,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+function ConvertTo-ProcessArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
 $bundleRoot = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot "Application") -PathType Container) {
     [IO.Path]::GetFullPath($PSScriptRoot)
 } else {
@@ -46,7 +51,8 @@ if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
         "/quiet", "InstallAllUsers=0", "PrependPath=0", "Include_launcher=0",
         "Include_test=0", "Include_doc=0", "Include_pip=1", "TargetDir=$pythonRoot"
     )
-    $process = Start-Process -FilePath $installer.FullName -ArgumentList $arguments -Wait -PassThru -WindowStyle Hidden
+    $quotedArguments = @($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value ([string]$_) })
+    $process = Start-Process -FilePath $installer.FullName -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) { throw "Python installer failed: $($process.ExitCode)" }
 }
 

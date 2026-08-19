@@ -5,6 +5,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+function ConvertTo-ProcessArgument {
+    param([Parameter(Mandatory = $true)][string]$Value)
+    if ($Value -notmatch '[\s"]') { return $Value }
+    return '"' + $Value.Replace('"', '\"') + '"'
+}
 $installRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $python = Join-Path $installRoot ".venv-review-platform\Scripts\python.exe"
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
@@ -16,7 +21,8 @@ $arguments = @("-m", "cellvision.review_platform", "--port", [string]$Port)
 if (-not [string]::IsNullOrWhiteSpace($Package)) {
     $arguments += @("--package", [IO.Path]::GetFullPath($Package))
 }
-$process = Start-Process -FilePath $python -ArgumentList $arguments -WorkingDirectory $installRoot `
+$quotedArguments = @($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value ([string]$_) })
+$process = Start-Process -FilePath $python -ArgumentList $quotedArguments -WorkingDirectory $installRoot `
     -RedirectStandardOutput (Join-Path $logs "platform.stdout.log") `
     -RedirectStandardError (Join-Path $logs "platform.stderr.log") `
     -WindowStyle Hidden -PassThru
