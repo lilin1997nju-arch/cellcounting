@@ -47,7 +47,14 @@ _PROJECT_EXCLUDED_DIRECTORIES = {
     ".venv-production",
     ".venv-review",
 }
-_PROJECT_EXCLUDED_SUFFIXES = {".pt", ".pth", ".onnx"}
+_PROJECT_EXCLUDED_SUFFIXES = {
+    ".pt",
+    ".pth",
+    ".onnx",
+    "-cf.tif",
+    "-cells.csv",
+    "metricsummary.csv",
+}
 _PORTABLE_WHEEL_EXCLUDED_PREFIXES = (
     "torch-",
     "torchvision-",
@@ -80,7 +87,7 @@ def _files(
             continue
         if relative_parts & excluded_directories:
             continue
-        if path.suffix.casefold() in excluded_suffixes:
+        if any(path.name.casefold().endswith(value) for value in excluded_suffixes):
             continue
         if portable_wheels_only and path.name.casefold().startswith(
             _PORTABLE_WHEEL_EXCLUDED_PREFIXES

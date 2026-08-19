@@ -3,11 +3,33 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 from pathlib import Path
 
 
 TEXT_SUFFIXES = {".json", ".yaml", ".yml", ".csv"}
+
+
+def _scrub_compute_only_image_paths(project_root: Path) -> None:
+    for path in project_root.rglob("images.csv"):
+        if path.parent.name != "manifests":
+            continue
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        changed = False
+        for row in rows:
+            for column in ("cf_image_path", "cells_csv_path", "metrics_csv_path"):
+                if column in row and row[column]:
+                    row[column] = ""
+                    changed = True
+        if changed:
+            with path.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
 
 
 def rebase(package_root: Path) -> Path:
@@ -40,6 +62,7 @@ def rebase(package_root: Path) -> Path:
         if updated != text:
             path.write_text(updated, encoding="utf-8")
     manifest_path = project_root / "project.json"
+    _scrub_compute_only_image_paths(project_root)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest["portable_review"] = True
     manifest["root"] = str(project_root)

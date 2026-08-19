@@ -17,6 +17,7 @@ def test_portable_review_workspace_is_created_inside_project_exports_and_rebased
     (project_root / "configs").mkdir(parents=True)
     (project_root / "data" / "images").mkdir(parents=True)
     (project_root / "data" / "images" / "A2.tif").write_bytes(b"raw")
+    (project_root / "data" / "images" / "A2-cf.tif").write_bytes(b"compute")
     (project_root / "cache").mkdir()
     (project_root / "cache" / "render.jpg").write_bytes(b"cache")
     manifest = project_root / "project.json"
@@ -65,6 +66,7 @@ def test_portable_review_workspace_is_created_inside_project_exports_and_rebased
     assert (workspace / "platform" / "windows-x64" / "wheelhouse" / "dependency.whl").is_file()
     assert not (workspace / "platform" / "windows-x64" / "wheelhouse" / "torch-2.11.0-cp312-win_amd64.whl").exists()
     assert not (workspace / "project" / "cache" / "render.jpg").exists()
+    assert not (workspace / "project" / "data" / "images" / "A2-cf.tif").exists()
     assert (workspace / "Start-Offline-Review.cmd").is_file()
     assert summary["reused"] is False
     assert progress[-1][0] == progress[-1][1]
