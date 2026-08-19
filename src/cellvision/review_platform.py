@@ -49,23 +49,17 @@ def register_review_package(package_root: str | Path) -> tuple[Path, dict[str, A
     metadata_digest = hashlib.sha256(metadata_path.read_bytes()).hexdigest() if metadata_path.is_file() else ""
     registry = _read_registry()
     packages = registry.get("packages") if isinstance(registry.get("packages"), list) else []
-    existing = next(
-        (
-            item
-            for item in packages
-            if isinstance(item, dict)
-            and str(item.get("package_path") or "") == str(root)
-            and str(item.get("manifest_sha256") or "") == metadata_digest
-        ),
-        None,
-    )
-    metadata = validate_review_data_package(root, verify_hashes=existing is None)
+    # Opening a review package is latency-sensitive and the package can be
+    # larger than a gigabyte.  Validate the manifest and required file sizes,
+    # but do not re-read every image solely to recompute export-time hashes.
+    metadata = validate_review_data_package(root, verify_hashes=False)
     record = {
         "package_id": str(metadata["package_id"]),
         "project_id": str(metadata["project_id"]),
         "project_name": str(metadata.get("project_name") or metadata["project_id"]),
         "package_path": str(root),
         "manifest_sha256": metadata_digest,
+        "hashes_verified": False,
         "validated_at": datetime.now(timezone.utc).isoformat(),
         "last_opened_at": datetime.now(timezone.utc).isoformat(),
     }

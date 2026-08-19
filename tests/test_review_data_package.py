@@ -5,6 +5,7 @@ import pandas as pd
 import yaml
 from PIL import Image
 
+from cellvision import review_data_package
 from cellvision.config import load_config
 from cellvision.review_data_package import (
     DATA_PACKAGE_FORMAT,
@@ -86,8 +87,13 @@ def _project(tmp_path: Path) -> tuple[Path, dict]:
     return manifest, {"task_id": "task-1", "name": "Task 1", "status": "completed"}
 
 
-def test_review_data_package_is_relative_verified_and_environment_free(tmp_path: Path):
+def test_review_data_package_is_relative_verified_and_environment_free(tmp_path: Path, monkeypatch):
     manifest, task = _project(tmp_path)
+    monkeypatch.setattr(
+        review_data_package,
+        "_sha256",
+        lambda _path: (_ for _ in ()).throw(AssertionError("export must not hash files")),
+    )
     package, summary = prepare_review_data_package(
         manifest, task, git_commit="abc123"
     )
@@ -97,7 +103,15 @@ def test_review_data_package_is_relative_verified_and_environment_free(tmp_path:
     assert metadata["format"] == DATA_PACKAGE_FORMAT
     assert metadata["environment_included"] is False
     assert metadata["models_included"] is False
+    assert metadata["integrity_mode"] == "size-and-presence"
+    assert "content_sha256" not in metadata
+    assert all("sha256" not in item for item in metadata["files"])
     assert summary["package_id"] == metadata["package_id"]
+    reused_package, reused_summary = prepare_review_data_package(
+        manifest, task, git_commit="abc123"
+    )
+    assert reused_package == package
+    assert reused_summary["reused"] is True
     assert (package / "project" / "data" / "images" / "board-1" / "T0" / "C2.tif").is_file()
     assert not (package / "project" / "data" / "images" / "board-1" / "T0" / "C2-cf.tif").exists()
     assert not (package / "project" / "cache").exists()
@@ -138,6 +152,10 @@ def test_installed_review_platform_registers_package_and_tracks_identity(tmp_pat
     manifest, task = _project(tmp_path)
     package, _ = prepare_review_data_package(manifest, task, git_commit="abc123")
     monkeypatch.setenv("CELLVISION_REVIEW_HOME", str(tmp_path / "review-home"))
+    image = package / "project" / "data" / "images" / "board-1" / "T0" / "C2.tif"
+    changed = bytearray(image.read_bytes())
+    changed[-1] ^= 1
+    image.write_bytes(changed)
 
     entrypoint, metadata = register_review_package(package)
 
@@ -145,6 +163,7 @@ def test_installed_review_platform_registers_package_and_tracks_identity(tmp_pat
     registry = json.loads((tmp_path / "review-home" / "registry.json").read_text(encoding="utf-8"))
     assert registry["packages"][0]["package_id"] == metadata["package_id"]
     assert registry["packages"][0]["package_path"] == str(package)
+    assert registry["packages"][0]["hashes_verified"] is False
 
     from cellvision.project_server import create_project_app
 

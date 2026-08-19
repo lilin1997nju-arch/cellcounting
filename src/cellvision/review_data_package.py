@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -75,16 +76,21 @@ def _files(root: Path) -> Iterable[Path]:
 
 def project_export_signature(project_root: str | Path, git_commit: str) -> str:
     root = Path(project_root).expanduser().resolve()
-    rows = []
+    file_count = 0
+    total_bytes = 0
+    latest_mtime_ns = 0
+    mtime_total = 0
     for path in _files(root):
+        if path.relative_to(root).as_posix() == "task_queue.json":
+            continue
         stat = path.stat()
-        rows.append((path.relative_to(root).as_posix(), int(stat.st_size), int(stat.st_mtime_ns)))
-    encoded = json.dumps(
-        {"git_commit": git_commit, "files": rows},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+        file_count += 1
+        total_bytes += int(stat.st_size)
+        latest_mtime_ns = max(latest_mtime_ns, int(stat.st_mtime_ns))
+        mtime_total += int(stat.st_mtime_ns)
+    # This is a fast source-state marker, not a content hash.  It deliberately
+    # avoids opening TIFF files during export freshness checks.
+    return f"v2-stat:{git_commit}:{file_count}:{total_bytes}:{latest_mtime_ns}:{mtime_total}"
 
 
 def _promote(staging: Path, target: Path) -> None:
@@ -236,7 +242,7 @@ def _inventory(package_root: Path) -> tuple[list[dict[str, Any]], int]:
         rows.append({
             "path": relative,
             "bytes": size,
-            "sha256": _sha256(path),
+            "modified_ns": int(path.stat().st_mtime_ns),
             "mutable": mutable,
         })
     return rows, total
@@ -245,7 +251,7 @@ def _inventory(package_root: Path) -> tuple[list[dict[str, Any]], int]:
 def validate_review_data_package(
     package_root: str | Path,
     *,
-    verify_hashes: bool = True,
+    verify_hashes: bool = False,
 ) -> dict[str, Any]:
     root = Path(package_root).expanduser().resolve()
     manifest_path = root / DATA_PACKAGE_MANIFEST
@@ -270,7 +276,8 @@ def validate_review_data_package(
         mutable = bool(item.get("mutable"))
         if not mutable and int(path.stat().st_size) != int(item.get("bytes", -1)):
             raise ValueError(f".cvreview 文件大小不符：{relative.as_posix()}")
-        if verify_hashes and not mutable and _sha256(path) != str(item.get("sha256") or ""):
+        expected_hash = str(item.get("sha256") or "")
+        if verify_hashes and expected_hash and not mutable and _sha256(path) != expected_hash:
             raise ValueError(f".cvreview 文件校验失败：{relative.as_posix()}")
     return manifest
 
@@ -287,27 +294,36 @@ def prepare_review_data_package(
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     project_id = str(manifest.get("project_id") or project_root.name)
     export_signature = project_export_signature(project_root, git_commit)
-    package_id = hashlib.sha256(
-        f"{DATA_PACKAGE_FORMAT}|{project_id}|{task.get('task_id', '')}|{git_commit}|{export_signature}".encode()
-    ).hexdigest()
     exports = project_root / "exports"
     exports.mkdir(parents=True, exist_ok=True)
-    target = exports / f"{project_id}-{package_id[:12]}.cvreview"
-    metadata_path = target / DATA_PACKAGE_MANIFEST
-    if metadata_path.is_file():
-        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if existing.get("package_id") == package_id:
+    for existing_target in exports.glob(f"{project_id}-*.cvreview"):
+        existing_metadata = existing_target / DATA_PACKAGE_MANIFEST
+        if not existing_metadata.is_file():
+            continue
+        try:
+            existing = json.loads(existing_metadata.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            existing.get("format") == DATA_PACKAGE_FORMAT
+            and existing.get("export_signature") == export_signature
+            and existing.get("production_git_commit") == git_commit
+        ):
             if progress_callback:
                 progress_callback(1, 1, "审核数据包已经是最新版本")
-            return target, {
+            return existing_target, {
                 "format": DATA_PACKAGE_FORMAT,
-                "package_id": package_id,
-                "package_path": str(target),
+                "package_id": str(existing.get("package_id") or ""),
+                "package_path": str(existing_target),
                 "git_commit": git_commit,
                 "export_signature": export_signature,
                 "copied_bytes": int(existing.get("total_bytes", 0)),
+                "file_count": int(existing.get("file_count", 0)),
                 "reused": True,
             }
+
+    package_id = uuid.uuid4().hex
+    target = exports / f"{project_id}-{package_id[:12]}.cvreview"
 
     staging = exports / f".{target.name}.building"
     if staging.exists():
@@ -330,15 +346,12 @@ def prepare_review_data_package(
         snapshot = staging / "project"
         _normalize_snapshot(snapshot, project_root)
         files, normalized_total = _inventory(staging)
-        content_sha256 = hashlib.sha256(
-            json.dumps(files, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
         metadata = {
             "format": DATA_PACKAGE_FORMAT,
             "version": DATA_PACKAGE_VERSION,
             "package_id": package_id,
-            "content_sha256": content_sha256,
             "export_signature": export_signature,
+            "integrity_mode": "size-and-presence",
             "project_id": project_id,
             "project_name": str(manifest.get("project_name") or project_id),
             "task_id": str(task.get("task_id") or manifest.get("task_id") or ""),
@@ -366,7 +379,6 @@ def prepare_review_data_package(
     return target, {
         "format": DATA_PACKAGE_FORMAT,
         "package_id": package_id,
-        "content_sha256": content_sha256,
         "package_path": str(target),
         "git_commit": git_commit,
         "export_signature": export_signature,
