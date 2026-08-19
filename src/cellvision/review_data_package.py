@@ -188,29 +188,35 @@ def _normalize_csv(source: Path, destination: Path, project_root: Path) -> None:
         with destination.open("r", encoding="utf-8-sig", newline="") as stream:
             reader = csv.DictReader(stream)
             fieldnames = list(reader.fieldnames or [])
+            path_columns = {
+                column
+                for column in fieldnames
+                if (
+                    "path" in column.casefold()
+                    or column.casefold() in {"root", "directory", "dir"}
+                    or column.casefold().endswith(("_root", "_directory", "_dir"))
+                )
+            }
+            if not path_columns:
+                return
             rows = list(reader)
     except (UnicodeDecodeError, csv.Error):
         return
     if not fieldnames:
         return
-    path_columns = {
-        column
-        for column in fieldnames
-        if (
-            "path" in column.casefold()
-            or column.casefold() in {"root", "directory", "dir"}
-            or column.casefold().endswith(("_root", "_directory", "_dir"))
-        )
-    }
-    if not path_columns:
-        return
     changed = False
+    portable_cache: dict[str, str] = {}
     for row in rows:
         for column in path_columns:
             value = row.get(column)
             if not value:
                 continue
-            portable = _portable_path(value, source_file=source, project_root=project_root)
+            portable = portable_cache.get(value)
+            if portable is None:
+                portable = _portable_path(
+                    value, source_file=source, project_root=project_root
+                )
+                portable_cache[value] = portable
             if portable != value:
                 row[column] = portable
                 changed = True
