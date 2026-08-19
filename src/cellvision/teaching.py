@@ -9,10 +9,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
 from PIL import Image
-from torch import nn
-from torchvision.models import ResNet18_Weights, resnet18
 
 from .config import artifact_path, is_validation_holdout, load_config
 from .dense_candidates import add_wall_neighbor_counts
@@ -131,6 +128,10 @@ def _feature_paths(config: dict[str, Any]) -> tuple[Path, Path, Path]:
 def ensure_teaching_features(
     config: dict[str, Any], *, force: bool = False
 ) -> tuple[pd.DataFrame, np.ndarray]:
+    import torch
+    from torch import nn
+    from torchvision.models import ResNet18_Weights, resnet18
+
     cache_path, metadata_path, environment_path = _feature_paths(config)
     candidates = teaching_candidate_pool(config).reset_index(drop=True)
     reusable_features: dict[str, np.ndarray] = {}
@@ -539,6 +540,9 @@ def _joint_morphology_training_examples(
 def train_teaching_classifier(
     config: dict[str, Any], database: str | Path
 ) -> dict[str, Any]:
+    import torch
+    from torch import nn
+
     ensure_training_allowed()
     metadata, features = ensure_teaching_features(config)
     targets, training_features = _joint_morphology_training_examples(

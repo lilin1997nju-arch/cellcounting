@@ -9,8 +9,6 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import torch
-from torch import nn
 
 from .config import artifact_path
 from .hierarchy import suppress_nested_single_candidates
@@ -803,6 +801,9 @@ def _multiplicity_targets_for_source(
 def train_multiplicity_classifier(
     config: dict[str, Any], database: str | Path
 ) -> dict[str, Any]:
+    import torch
+    from torch import nn
+
     ensure_training_allowed()
     metadata, features = ensure_teaching_features(config)
     target_parts: list[pd.DataFrame] = []

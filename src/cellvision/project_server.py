@@ -56,16 +56,18 @@ from .review_summary import (
 )
 from .session_index import parse_sessions_index, summarize_session_groups
 from .task_queue import TaskQueueStore, task_id
-from .runtime import remove_development_routes
-from .v2_mask_review import (
-    create_model_comparison_round,
-    list_mask_review_rounds,
-    mask_comparison_options,
-    mask_review_candidate,
-    mask_review_candidates,
-    mask_review_summary,
-    save_mask_review,
-)
+from .runtime import production_mode_enabled, remove_development_routes
+
+if not production_mode_enabled():
+    from .v2_mask_review import (
+        create_model_comparison_round,
+        list_mask_review_rounds,
+        mask_comparison_options,
+        mask_review_candidate,
+        mask_review_candidates,
+        mask_review_summary,
+        save_mask_review,
+    )
 
 
 def _safe(value: Any) -> Any:

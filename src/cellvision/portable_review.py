@@ -19,6 +19,7 @@ _APPLICATION_ENTRIES = (
     "deploy/offline_review",
     "pyproject.toml",
     "requirements-production.txt",
+    "requirements-portable-review.txt",
     "RELEASE_GIT_COMMIT.txt",
 )
 
@@ -38,33 +39,72 @@ def _promote_staging_directory(staging: Path, target: Path) -> None:
     raise last_error
 
 
-def _files(root: Path) -> Iterable[Path]:
+_PROJECT_EXCLUDED_DIRECTORIES = {
+    "exports",
+    "cache",
+    "models",
+    "checkpoints",
+    ".venv-production",
+    ".venv-review",
+}
+_PROJECT_EXCLUDED_SUFFIXES = {".pt", ".pth", ".onnx"}
+_PORTABLE_WHEEL_EXCLUDED_PREFIXES = (
+    "torch-",
+    "torchvision-",
+    "sympy-",
+    "mpmath-",
+    "fsspec-",
+    "filelock-",
+)
+
+
+def _files(
+    root: Path,
+    *,
+    excluded_directories: set[str] | None = None,
+    excluded_suffixes: set[str] | None = None,
+    portable_wheels_only: bool = False,
+) -> Iterable[Path]:
     if root.is_file():
         yield root
         return
     if not root.is_dir():
         return
+    excluded_directories = excluded_directories or set()
+    excluded_suffixes = excluded_suffixes or set()
     for path in root.rglob("*"):
         if not path.is_file():
             continue
+        relative_parts = set(path.relative_to(root).parts[:-1])
         if "__pycache__" in path.parts or path.suffix in {".pyc", ".pyo"}:
             continue
-        if ".venv-production" in path.parts or ".venv-review" in path.parts:
+        if relative_parts & excluded_directories:
+            continue
+        if path.suffix.casefold() in excluded_suffixes:
+            continue
+        if portable_wheels_only and path.name.casefold().startswith(
+            _PORTABLE_WHEEL_EXCLUDED_PREFIXES
+        ):
             continue
         yield path
 
 
 def _copy_sources(
-    sources: list[tuple[Path, Path]],
+    sources: list[tuple[Path, Path, set[str], set[str], bool]],
     *,
     progress_callback: ProgressCallback | None,
 ) -> tuple[int, int]:
     entries: list[tuple[Path, Path, int]] = []
-    for source, destination in sources:
+    for source, destination, excluded_directories, excluded_suffixes, wheels_only in sources:
         if source.is_file():
             entries.append((source, destination, int(source.stat().st_size)))
             continue
-        for file in _files(source):
+        for file in _files(
+            source,
+            excluded_directories=excluded_directories,
+            excluded_suffixes=excluded_suffixes,
+            portable_wheels_only=wheels_only,
+        ):
             entries.append((file, destination / file.relative_to(source), int(file.stat().st_size)))
     total = sum(size for _, _, size in entries)
     copied = 0
@@ -85,18 +125,18 @@ def prepare_portable_review_workspace(
     release_root: str | Path | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[Path, dict[str, Any]]:
-    """Create a full normal-UI review workspace inside the task data folder."""
+    """Create a self-contained normal-UI review export from one Project."""
 
     manifest_file = Path(manifest_path).expanduser().resolve()
     manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
     application = Path(application_root).expanduser().resolve()
     release = Path(release_root).expanduser().resolve() if release_root else application.parent
-    data_root_value = task.get("path") or manifest.get("root")
-    if not data_root_value:
-        raise ValueError("任务没有可用的数据目录")
-    data_root = Path(str(data_root_value)).expanduser().resolve()
-    if not data_root.is_dir():
-        raise FileNotFoundError(data_root)
+    project_root = manifest_file.parent
+    image_storage = manifest.get("image_storage")
+    if isinstance(image_storage, dict) and image_storage.get("mode") == "project_owned_after_endpoint_gate":
+        image_root = Path(str(image_storage.get("root") or project_root / "data" / "images"))
+        if not image_root.is_dir():
+            raise FileNotFoundError(f"Project 自有图像目录不存在：{image_root}")
     wheelhouse = release / "wheelhouse"
     runtime = release / "runtime"
     if not wheelhouse.is_dir() or not runtime.is_dir():
@@ -105,7 +145,10 @@ def prepare_portable_review_workspace(
     commit_file = application / "RELEASE_GIT_COMMIT.txt"
     commit = commit_file.read_text(encoding="utf-8").strip() if commit_file.is_file() else "development"
     suffix = commit[:10] if commit else "development"
-    target = data_root / f"CellVisionReview-{suffix}"
+    platform_id = "windows-x64"
+    exports_root = project_root / "exports"
+    exports_root.mkdir(parents=True, exist_ok=True)
+    target = exports_root / f"CellVisionReview-{suffix}-{platform_id}"
     metadata_path = target / "PACKAGE.json"
     if metadata_path.is_file():
         existing = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -119,20 +162,38 @@ def prepare_portable_review_workspace(
                 progress_callback(1, 1, "完整审核目录已经准备好")
             return target, summary
 
-    staging = data_root / f".{target.name}.building"
+    staging = exports_root / f".{target.name}.building"
     if staging.exists():
         raise FileExistsError(f"已有未完成的审核目录准备任务：{staging}")
     staging.mkdir(parents=True)
     try:
-        sources: list[tuple[Path, Path]] = [
-            (manifest_file.parent, staging / "project"),
-            (wheelhouse, staging / "wheelhouse"),
-            (runtime, staging / "runtime"),
+        sources: list[tuple[Path, Path, set[str], set[str], bool]] = [
+            (
+                project_root,
+                staging / "project",
+                _PROJECT_EXCLUDED_DIRECTORIES,
+                _PROJECT_EXCLUDED_SUFFIXES,
+                False,
+            ),
+            (
+                wheelhouse,
+                staging / "platform" / platform_id / "wheelhouse",
+                set(),
+                set(),
+                True,
+            ),
+            (
+                runtime,
+                staging / "platform" / platform_id / "runtime",
+                set(),
+                set(),
+                False,
+            ),
         ]
         for relative in _APPLICATION_ENTRIES:
             source = application / relative
             if source.exists():
-                sources.append((source, staging / "application" / relative))
+                sources.append((source, staging / "application" / relative, set(), set(), False))
         copied, total = _copy_sources(sources, progress_callback=progress_callback)
 
         launcher_root = staging / "application" / "deploy" / "offline_review"
@@ -141,16 +202,21 @@ def prepare_portable_review_workspace(
         metadata = {
             "format": "cellvision-portable-normal-review",
             "version": 1,
+            "layout_version": 2,
             "task_id": str(task.get("task_id") or ""),
             "task_name": str(task.get("name") or manifest.get("project_name") or ""),
             "project_id": str(manifest.get("project_id") or manifest_file.parent.name),
             "git_commit": commit,
-            "source_data_root": str(Path(str(manifest.get("root") or data_root)).expanduser().resolve()),
-            "source_project_root": str(manifest_file.parent),
+            "source_data_root": str(project_root),
+            "source_project_root": str(project_root),
+            "platform_layers": [platform_id],
+            "default_platform": platform_id,
+            "model_runtime_included": False,
+            "project_cache_included": False,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "copied_bytes": copied,
             "total_bytes": total,
-            "instructions": "复制整个任务数据文件夹；在审核电脑双击 CellVisionReview-*\\Start-Offline-Review.cmd。",
+            "instructions": "复制整个 CellVisionReview-* 目录；在 Windows x64 审核电脑双击 Start-Offline-Review.cmd。",
         }
         (staging / "PACKAGE.json").write_text(
             json.dumps(metadata, ensure_ascii=False, indent=2),

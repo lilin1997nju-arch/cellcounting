@@ -9,21 +9,26 @@ from cellvision.portable_review import (
 from scripts.rebase_portable_review import rebase
 
 
-def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_path: Path):
+def test_portable_review_workspace_is_created_inside_project_exports_and_rebased(tmp_path: Path):
     data_root = tmp_path / "task-data"
     data_root.mkdir()
     (data_root / "raw.tif").write_bytes(b"raw")
     project_root = tmp_path / "project"
     (project_root / "configs").mkdir(parents=True)
+    (project_root / "data" / "images").mkdir(parents=True)
+    (project_root / "data" / "images" / "A2.tif").write_bytes(b"raw")
+    (project_root / "cache").mkdir()
+    (project_root / "cache" / "render.jpg").write_bytes(b"cache")
     manifest = project_root / "project.json"
     manifest.write_text(json.dumps({
         "project_id": "demo-project",
         "project_name": "Demo",
-        "root": str(data_root),
+        "root": str(project_root),
+        "image_storage": {"mode": "project_owned_after_endpoint_gate", "root": str(project_root / "data" / "images")},
         "plates": [{"config": str(project_root / "configs" / "plate.yaml")}],
     }), encoding="utf-8")
     (project_root / "configs" / "plate.yaml").write_text(
-        f"data_root: {data_root}\nartifact_root: {project_root}\n",
+        f"data_root: {project_root / 'data'}\nartifact_root: {project_root}\n",
         encoding="utf-8",
     )
 
@@ -34,12 +39,14 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
     (application / "review-ui" / "auto-review.js").write_text("// review", encoding="utf-8")
     (application / "pyproject.toml").write_text("[project]\nname='demo'", encoding="utf-8")
     (application / "requirements-production.txt").write_text("", encoding="utf-8")
+    (application / "requirements-portable-review.txt").write_text("", encoding="utf-8")
     (application / "RELEASE_GIT_COMMIT.txt").write_text("abcdef1234567890\n", encoding="utf-8")
     (application / "deploy" / "offline_review" / "Start-Offline-Review.cmd").write_text("start", encoding="utf-8")
     (application / "deploy" / "offline_review" / "start_offline_review.ps1").write_text("start", encoding="utf-8")
     release = application.parent
     (release / "wheelhouse").mkdir()
     (release / "wheelhouse" / "dependency.whl").write_bytes(b"wheel")
+    (release / "wheelhouse" / "torch-2.11.0-cp312-win_amd64.whl").write_bytes(b"large")
     (release / "runtime").mkdir()
     (release / "runtime" / "python-installer.exe").write_bytes(b"python")
     progress: list[tuple[int, int, str]] = []
@@ -52,10 +59,12 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
         progress_callback=lambda current, total, message: progress.append((current, total, message)),
     )
 
-    assert workspace == data_root / "CellVisionReview-abcdef1234"
+    assert workspace == project_root / "exports" / "CellVisionReview-abcdef1234-windows-x64"
     assert (workspace / "project" / "project.json").is_file()
     assert (workspace / "application" / "review-ui" / "auto-review.js").is_file()
-    assert (workspace / "wheelhouse" / "dependency.whl").is_file()
+    assert (workspace / "platform" / "windows-x64" / "wheelhouse" / "dependency.whl").is_file()
+    assert not (workspace / "platform" / "windows-x64" / "wheelhouse" / "torch-2.11.0-cp312-win_amd64.whl").exists()
+    assert not (workspace / "project" / "cache" / "render.jpg").exists()
     assert (workspace / "Start-Offline-Review.cmd").is_file()
     assert summary["reused"] is False
     assert progress[-1][0] == progress[-1][1]
@@ -63,10 +72,10 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
     rebased_manifest = rebase(workspace)
     rebased = json.loads(rebased_manifest.read_text(encoding="utf-8"))
     assert rebased["portable_review"] is True
-    assert Path(rebased["root"]) == data_root
+    assert Path(rebased["root"]) == workspace / "project"
     config_text = (workspace / "project" / "configs" / "plate.yaml").read_text(encoding="utf-8")
     assert str(workspace / "project") in config_text
-    assert str(data_root) in config_text
+    assert str(workspace / "project") in config_text
 
     moved_data_root = tmp_path / "copied task data"
     moved_workspace = moved_data_root / workspace.name
@@ -76,7 +85,7 @@ def test_portable_review_workspace_is_created_inside_task_data_and_rebased(tmp_p
         moved_workspace / "project" / "configs" / "plate.yaml"
     ).read_text(encoding="utf-8")
     assert str(moved_workspace / "project") in moved_config
-    assert str(moved_data_root) in moved_config
+    assert str(moved_workspace / "project") in moved_config
     assert str(workspace) not in moved_config
 
 

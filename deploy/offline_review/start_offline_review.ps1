@@ -14,8 +14,9 @@ $reviewRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $application = Join-Path $reviewRoot "application"
 $projectManifest = Join-Path $reviewRoot "project\project.json"
 $package = Join-Path $reviewRoot "PACKAGE.json"
-$wheelhouse = Join-Path $reviewRoot "wheelhouse"
-$runtimeBundle = Join-Path $reviewRoot "runtime"
+$platformRoot = Join-Path $reviewRoot "platform\windows-x64"
+$wheelhouse = Join-Path $platformRoot "wheelhouse"
+$runtimeBundle = Join-Path $platformRoot "runtime"
 foreach ($required in @($application, $projectManifest, $package, $wheelhouse, $runtimeBundle)) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Offline review workspace is incomplete: $required" }
 }
@@ -45,10 +46,8 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     if ($LASTEXITCODE -ne 0) { throw "Unable to create the review environment." }
     & $venvPython -m pip install --no-index --find-links $wheelhouse --upgrade pip setuptools wheel
     if ($LASTEXITCODE -ne 0) { throw "Unable to install base Python tooling." }
-    & $venvPython -m pip install --no-index --find-links $wheelhouse -r (Join-Path $application "requirements-production.txt")
+    & $venvPython -m pip install --no-index --find-links $wheelhouse -r (Join-Path $application "requirements-portable-review.txt")
     if ($LASTEXITCODE -ne 0) { throw "Unable to install review dependencies." }
-    & $venvPython -m pip install --no-index --find-links $wheelhouse torch torchvision
-    if ($LASTEXITCODE -ne 0) { throw "Unable to install the image runtime." }
     & $venvPython -m pip install --no-index --find-links $wheelhouse --no-build-isolation --no-deps -e $application
     if ($LASTEXITCODE -ne 0) { throw "Unable to install Cell Vision review code." }
 }
@@ -74,8 +73,8 @@ if ($listeners.Count -gt 0) {
     $logRoot = Join-Path $reviewRoot "logs"
     New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
     $arguments = @(
-        "-m", "cellvision", "review-project", "--manifest", $projectManifest,
-        "--host", "127.0.0.1", "--port", [string]$Port, "--no-worker"
+        "-m", "cellvision.portable_server", "--manifest", $projectManifest,
+        "--host", "127.0.0.1", "--port", [string]$Port
     )
     $quotedArguments = @($arguments | ForEach-Object { ConvertTo-StartProcessArgument -Value ([string]$_) })
     $process = Start-Process -FilePath $venvPython -ArgumentList $quotedArguments -WorkingDirectory $application `
