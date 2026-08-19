@@ -1,0 +1,3 @@
+# Machine-wide Windows service host. Installed into the dedicated bundled
+# Python runtime, not into a domain user's profile.
+pywin32==312

@@ -66,8 +66,10 @@ function Get-AssetContract {
     )
     $productionRequirements = Join-Path $ApplicationRoot "requirements-production.txt"
     $reviewRequirements = Join-Path $ApplicationRoot "requirements-portable-review.txt"
+    $serviceRequirements = Join-Path $ApplicationRoot "requirements-windows-service.txt"
     if (-not (Test-Path -LiteralPath $productionRequirements -PathType Leaf)) { return "" }
     if (-not (Test-Path -LiteralPath $reviewRequirements -PathType Leaf)) { return "" }
+    if (-not (Test-Path -LiteralPath $serviceRequirements -PathType Leaf)) { return "" }
     $contract = @(
         "python=$RequestedPython",
         "platform=win_amd64-cp312",
@@ -76,7 +78,8 @@ function Get-AssetContract {
         "torchvision=0.26.0",
         "bootstrap=pip,setuptools,wheel,filelock,typing-extensions,sympy,networkx,Jinja2,fsspec,mpmath",
         (Get-Content -LiteralPath $productionRequirements -Raw),
-        (Get-Content -LiteralPath $reviewRequirements -Raw)
+        (Get-Content -LiteralPath $reviewRequirements -Raw),
+        (Get-Content -LiteralPath $serviceRequirements -Raw)
     ) -join "`n---`n"
     return Get-TextSha256 -Value $contract
 }
@@ -118,6 +121,8 @@ $currentAssetContract = Get-AssetContract `
     -RequestedPython $PythonVersion `
     -RequestedVariant $TorchVariant
 $assetSource = $null
+$fallbackAssetSource = $null
+$assetNeedsRefresh = $false
 if (-not $NoAssetReuse) {
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($ReuseAssetsFrom)) {
@@ -148,14 +153,21 @@ if (-not $NoAssetReuse) {
         if ([string]$candidateMetadata.torch_variant -ne $TorchVariant) { continue }
         if ([string]$candidateMetadata.torch_version -ne "2.11.0") { continue }
         if ([string]$candidateMetadata.torchvision_version -ne "0.26.0") { continue }
+        if (@(Get-ChildItem -LiteralPath $candidateWheelhouse -File).Count -eq 0) { continue }
         $candidateContract = Get-AssetContract `
             -ApplicationRoot $candidateApplication `
             -RequestedPython $PythonVersion `
             -RequestedVariant $TorchVariant
-        if ([string]::IsNullOrWhiteSpace($candidateContract) -or $candidateContract -ne $currentAssetContract) { continue }
-        if (@(Get-ChildItem -LiteralPath $candidateWheelhouse -File).Count -eq 0) { continue }
-        $assetSource = $candidate
-        break
+        if (-not [string]::IsNullOrWhiteSpace($candidateContract) -and $candidateContract -eq $currentAssetContract) {
+            $assetSource = $candidate
+            $assetNeedsRefresh = $false
+            break
+        }
+        if ($null -eq $fallbackAssetSource) { $fallbackAssetSource = $candidate }
+    }
+    if ($null -eq $assetSource -and $null -ne $fallbackAssetSource) {
+        $assetSource = $fallbackAssetSource
+        $assetNeedsRefresh = $true
     }
 }
 
@@ -194,6 +206,7 @@ try {
 
     Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\install_offline.ps1") -Destination (Join-Path $releaseRoot "install_offline.ps1")
     Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\Install-CellVision.cmd") -Destination (Join-Path $releaseRoot "Install-CellVision.cmd")
+    Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\launch_installer.ps1") -Destination (Join-Path $releaseRoot "launch_installer.ps1")
     Copy-Item -LiteralPath (Join-Path $repository "deploy\windows\install_ui.ps1") -Destination (Join-Path $releaseRoot "install_ui.ps1")
 
     $pythonInstaller = Join-Path $runtime "python-$PythonVersion-amd64.exe"
@@ -201,6 +214,20 @@ try {
         Write-Host "Reusing offline runtime assets from: $assetSource" -ForegroundColor Cyan
         Copy-Item -Path (Join-Path $assetSource "runtime\*") -Destination $runtime -Recurse -Force
         Copy-Item -Path (Join-Path $assetSource "wheelhouse\*") -Destination $wheelhouse -Recurse -Force
+        if ($assetNeedsRefresh) {
+            Write-Host "Refreshing only missing or changed wheels ..." -ForegroundColor Cyan
+            $targetArgs = @(
+                "-m", "pip", "download", "--dest", $wheelhouse,
+                "--only-binary=:all:", "--platform", "win_amd64", "--python-version", "312",
+                "--implementation", "cp", "--abi", "cp312"
+            )
+            Invoke-Checked $BuilderPython ($targetArgs + @(
+                "-r", (Join-Path $repository "requirements-production.txt"),
+                "-r", (Join-Path $repository "requirements-portable-review.txt"),
+                "-r", (Join-Path $repository "requirements-windows-service.txt"),
+                "pip", "setuptools", "wheel", "filelock", "typing-extensions", "sympy", "networkx", "Jinja2", "fsspec", "mpmath"
+            ))
+        }
     } else {
         $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
         Write-Host "Downloading Python $PythonVersion installer ..." -ForegroundColor Cyan
@@ -214,6 +241,8 @@ try {
         Write-Host "Downloading production dependency wheelhouse ..." -ForegroundColor Cyan
         Invoke-Checked $BuilderPython ($targetArgs + @(
             "-r", (Join-Path $repository "requirements-production.txt"),
+            "-r", (Join-Path $repository "requirements-portable-review.txt"),
+            "-r", (Join-Path $repository "requirements-windows-service.txt"),
             "pip", "setuptools", "wheel", "filelock", "typing-extensions", "sympy", "networkx", "Jinja2", "fsspec", "mpmath"
         ))
         $torchIndex = "https://download.pytorch.org/whl/$TorchVariant"

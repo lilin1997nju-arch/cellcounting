@@ -34,16 +34,16 @@ function Get-ExistingParent {
 
 $packageRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $isProduction = $Mode -eq "production"
-$productName = if ($isProduction) { "Cell Vision 生产平台" } else { "Cell Vision 审核平台" }
+$productName = if ($isProduction) { "Cell Vision 生产平台（所有用户）" } else { "Cell Vision 审核平台" }
 $installerName = if ($isProduction) { "install_offline.ps1" } else { "install_review_platform.ps1" }
 $installerPath = Join-Path $packageRoot $installerName
 $defaultInstallRoot = if ($isProduction) {
-    Join-Path $env:LOCALAPPDATA "CellVision"
+    if (Test-Path -LiteralPath "D:\" -PathType Container) { "D:\CellVision" } else { Join-Path $env:ProgramFiles "CellVision" }
 } else {
     Join-Path $env:LOCALAPPDATA "CellVisionReviewPlatform"
 }
 
-if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
+if (-not $SmokeTest -and -not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     [Windows.Forms.MessageBox]::Show(
         "安装文件不完整。请先对发布 ZIP 执行'全部解压'，然后从解压后的文件夹运行安装程序。`n`n缺少：$installerName",
         "$productName 安装失败",
@@ -72,7 +72,7 @@ $form.Controls.Add($title)
 
 $description = New-Object Windows.Forms.Label
 $description.Text = if ($isProduction) {
-    "请选择应用安装目录。模型、运行环境和程序文件会安装到该目录；任务数据仍保存在独立的数据目录。"
+    "此安装将为本机所有用户配置共享程序和开机计算服务，需要管理员权限。建议选择所有域账号可读取的共享磁盘。"
 } else {
     "请选择审核工具安装目录。.cvreview 审核数据可以存放在电脑的任意位置，不会复制到安装目录。"
 }

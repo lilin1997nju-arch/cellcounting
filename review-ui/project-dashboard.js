@@ -20,6 +20,35 @@ const esc = value => String(value ?? "").replace(/[&<>\"]/g, character => ({
 
 const count = value => Number(value || 0);
 
+function desktopBridgeConfig() {
+  const params = new URLSearchParams(location.search);
+  const queryPort = params.get("desktop_bridge_port");
+  const queryToken = params.get("desktop_bridge_token");
+  if (queryPort && queryToken) {
+    sessionStorage.setItem("cellvision.desktopBridgePort", queryPort);
+    sessionStorage.setItem("cellvision.desktopBridgeToken", queryToken);
+  }
+  const port = sessionStorage.getItem("cellvision.desktopBridgePort") || "";
+  const token = sessionStorage.getItem("cellvision.desktopBridgeToken") || "";
+  return /^\d+$/.test(port) && token ? { port, token } : null;
+}
+
+async function browseProjectFolder() {
+  const bridge = desktopBridgeConfig();
+  if (bridge) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${bridge.port}/api/browse-folder`, {
+        method: "POST",
+        headers: { "X-CellVision-Bridge-Token": bridge.token },
+      });
+      if (response.ok) return response.json();
+    } catch (_) {
+      // Fall back for current-user installations without the desktop bridge.
+    }
+  }
+  return api("/api/project/browse-folder", { method: "POST" });
+}
+
 const taskStatusNames = {
   queued: { label: "排队中（未开始）", className: "queued" },
   running: { label: "执行中", className: "running" },
@@ -584,7 +613,7 @@ $("taskName").addEventListener("input", () => { $("taskName").dataset.edited = "
 $("browseButton").addEventListener("click", async () => {
   $("analysisResult").textContent = "正在打开文件夹选择器…";
   try {
-    const result = await api("/api/project/browse-folder", { method: "POST" });
+    const result = await browseProjectFolder();
     if (result.path) {
       $("folderPath").value = result.path;
       $("analysisResult").textContent = "已选择文件夹，请点击解析数据。";

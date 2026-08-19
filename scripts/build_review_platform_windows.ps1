@@ -37,7 +37,7 @@ try {
     Copy-Item -LiteralPath (Join-Path $source "runtime") -Destination (Join-Path $target "runtime") -Recurse
     $wheelhouse = Join-Path $target "wheelhouse"
     New-Item -ItemType Directory -Force -Path $wheelhouse | Out-Null
-    $excluded = @("torch-", "torchvision-", "sympy-", "mpmath-", "fsspec-", "filelock-")
+    $excluded = @("torch-", "torchvision-", "sympy-", "mpmath-", "fsspec-", "filelock-", "pywin32-")
     Get-ChildItem -LiteralPath (Join-Path $source "wheelhouse") -File | ForEach-Object {
         $lower = $_.Name.ToLowerInvariant()
         $skip = $false

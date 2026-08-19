@@ -54,6 +54,7 @@ from .review_data_package import (
 from .review_server import _visible_v2_review_instances, create_app, initialize_database
 from .review_summary import (
     latest_prediction_path,
+    read_cached_summary,
     read_summary,
     summary_path,
     summary_signature,
@@ -171,7 +172,14 @@ def _review_summary_for_plate(plate: dict[str, Any]) -> dict[str, Any] | None:
         else root / "gated" / "plate_overview.csv"
     )
     signature = summary_signature(root, report_path=report_path)
-    return read_summary(summary_path(root), signature)
+    persisted_path = summary_path(root)
+    fresh = read_summary(persisted_path, signature)
+    if fresh is not None:
+        return fresh
+    stale = read_cached_summary(persisted_path)
+    if stale is None:
+        return None
+    return {**stale, "stale": True}
 
 
 def _review_progress_from_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -2917,6 +2925,11 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
     def browse_folder() -> dict[str, str]:
         """Open a Windows folder picker from an explicit user action."""
 
+        if os.environ.get("CELLVISION_MACHINE_SERVICE") == "1":
+            return {
+                "path": "",
+                "error": "当前账号的桌面桥接未运行；请从共享安装目录双击 Start-CellVision.cmd，或直接输入共享数据路径。",
+            }
         if os.name != "nt":
             return {"path": ""}
         focus_helper = r"""

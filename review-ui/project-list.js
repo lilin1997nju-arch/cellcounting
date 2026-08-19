@@ -33,6 +33,35 @@ async function api(url, options) {
   return response.json();
 }
 
+function desktopBridgeConfig() {
+  const params = new URLSearchParams(location.search);
+  const queryPort = params.get("desktop_bridge_port");
+  const queryToken = params.get("desktop_bridge_token");
+  if (queryPort && queryToken) {
+    sessionStorage.setItem("cellvision.desktopBridgePort", queryPort);
+    sessionStorage.setItem("cellvision.desktopBridgeToken", queryToken);
+  }
+  const port = sessionStorage.getItem("cellvision.desktopBridgePort") || "";
+  const token = sessionStorage.getItem("cellvision.desktopBridgeToken") || "";
+  return /^\d+$/.test(port) && token ? { port, token } : null;
+}
+
+async function browseProjectFolder() {
+  const bridge = desktopBridgeConfig();
+  if (bridge) {
+    try {
+      const response = await fetch(`http://127.0.0.1:${bridge.port}/api/browse-folder`, {
+        method: "POST",
+        headers: { "X-CellVision-Bridge-Token": bridge.token },
+      });
+      if (response.ok) return response.json();
+    } catch (_) {
+      // Current-user installations and manually entered paths remain supported.
+    }
+  }
+  return api("/api/project/browse-folder", { method: "POST" });
+}
+
 async function configurePlatformMode() {
   if (platformModeChecked) return;
   platformModeChecked = true;
@@ -563,7 +592,7 @@ $("newTaskButton").addEventListener("click", async () => {
 $("browseButton").addEventListener("click", async () => {
   $("analysisResult").textContent = "正在打开文件夹选择器…";
   try {
-    const result = await api("/api/project/browse-folder", { method: "POST" });
+    const result = await browseProjectFolder();
     if (result.path) {
       $("folderPath").value = result.path;
       // Selecting a folder is the user's explicit confirmation; start the

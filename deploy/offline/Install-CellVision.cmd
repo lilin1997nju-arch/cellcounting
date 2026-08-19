@@ -1,7 +1,7 @@
 @echo off
 setlocal
 title Cell Vision Offline Installer
-powershell.exe -STA -NoProfile -ExecutionPolicy Bypass -File "%~dp0install_ui.ps1" -Mode production
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0launch_installer.ps1"
 set EXIT_CODE=%ERRORLEVEL%
 if not "%EXIT_CODE%"=="0" (
   echo.
