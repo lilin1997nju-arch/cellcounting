@@ -10,6 +10,41 @@ function ConvertTo-ProcessArgument {
     if ($Value -notmatch '[\s"]') { return $Value }
     return '"' + $Value.Replace('"', '\"') + '"'
 }
+function Test-Python312 {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+    try {
+        $version = (& $Path -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>$null)
+        return ($LASTEXITCODE -eq 0 -and ([string]$version).Trim() -eq "3.12")
+    } catch {
+        return $false
+    }
+}
+function Find-Python312 {
+    param([string]$Preferred = "")
+    $candidates = [Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($Preferred)) { $candidates.Add($Preferred) }
+    foreach ($registryPath in @(
+        "Registry::HKEY_CURRENT_USER\Software\Python\PythonCore\3.12\InstallPath",
+        "Registry::HKEY_LOCAL_MACHINE\Software\Python\PythonCore\3.12\InstallPath",
+        "Registry::HKEY_LOCAL_MACHINE\Software\WOW6432Node\Python\PythonCore\3.12\InstallPath"
+    )) {
+        if (Test-Path -LiteralPath $registryPath) {
+            $registeredRoot = (Get-Item -LiteralPath $registryPath).GetValue("")
+            if (-not [string]::IsNullOrWhiteSpace($registeredRoot)) {
+                $candidates.Add((Join-Path $registeredRoot "python.exe"))
+            }
+        }
+    }
+    $command = Get-Command python.exe -ErrorAction SilentlyContinue
+    if ($null -ne $command -and -not [string]::IsNullOrWhiteSpace($command.Source)) {
+        $candidates.Add($command.Source)
+    }
+    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+        if (Test-Python312 -Path $candidate) { return [IO.Path]::GetFullPath($candidate) }
+    }
+    return $null
+}
 $bundleRoot = if (Test-Path -LiteralPath (Join-Path $PSScriptRoot "Application") -PathType Container) {
     [IO.Path]::GetFullPath($PSScriptRoot)
 } else {
@@ -42,8 +77,9 @@ foreach ($pair in @(
 }
 
 $pythonRoot = Join-Path $InstallRoot "Python312"
-$basePython = Join-Path $pythonRoot "python.exe"
-if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
+$preferredPython = Join-Path $pythonRoot "python.exe"
+$basePython = Find-Python312 -Preferred $preferredPython
+if ([string]::IsNullOrWhiteSpace($basePython)) {
     $installer = Get-ChildItem -LiteralPath $runtime -Filter "python-3.12.*-amd64.exe" -File | Select-Object -First 1
     if ($null -eq $installer) { throw "Bundled Python 3.12 installer is missing." }
     Write-Host "Installing the lightweight review runtime ..." -ForegroundColor Cyan
@@ -54,6 +90,10 @@ if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
     $quotedArguments = @($arguments | ForEach-Object { ConvertTo-ProcessArgument -Value ([string]$_) })
     $process = Start-Process -FilePath $installer.FullName -ArgumentList $quotedArguments -Wait -PassThru -WindowStyle Hidden
     if ($process.ExitCode -ne 0) { throw "Python installer failed: $($process.ExitCode)" }
+    $basePython = Find-Python312 -Preferred $preferredPython
+    if ([string]::IsNullOrWhiteSpace($basePython)) {
+        throw "Python 3.12 installation completed but python.exe could not be located."
+    }
 }
 
 $venvRoot = Join-Path $InstallRoot ".venv-review-platform"

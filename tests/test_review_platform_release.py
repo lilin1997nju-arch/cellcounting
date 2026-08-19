@@ -11,6 +11,8 @@ def test_windows_review_platform_installs_only_review_runtime():
 
     assert "requirements-portable-review.txt" in installer
     assert "torch torchvision" not in installer
+    assert "Find-Python312" in installer
+    assert "Python 3.12 installation completed but python.exe could not be located." in installer
     assert '"torch-", "torchvision-"' in builder
     assert "cellvision.review_platform" in opener
     assert "ConvertTo-ProcessArgument" in opener
