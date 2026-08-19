@@ -182,8 +182,11 @@ SourceFiles0=$(ConvertTo-SedValue -Value ($workingRoot.TrimEnd('\') + '\'))
 "@
     [IO.File]::WriteAllText($sedPath, $sed.TrimStart(), [Text.Encoding]::Unicode)
 
-    & $iexpress /N $sedPath
-    if ($LASTEXITCODE -ne 0) { throw "IExpress failed with exit code $LASTEXITCODE." }
+    $iexpressProcess = Start-Process -FilePath $iexpress `
+        -ArgumentList @("/N", $sedPath) -Wait -PassThru -WindowStyle Hidden
+    if ($iexpressProcess.ExitCode -ne 0) {
+        throw "IExpress failed with exit code $($iexpressProcess.ExitCode)."
+    }
     if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) {
         throw "IExpress completed without creating the installer: $exePath"
     }
