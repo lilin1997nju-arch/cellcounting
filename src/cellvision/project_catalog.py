@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from .review_summary import read_summary, summary_path, summary_signature
+from .review_summary import read_cached_summary, read_summary, summary_path, summary_signature
 
 
 SCHEMA_VERSION = 2
@@ -288,7 +288,13 @@ def _fresh_review_summary(paths: dict[str, Path | None]) -> dict[str, Any] | Non
         database_path=paths.get("database"),
         report_path=paths.get("report_csv"),
     )
-    return read_summary(summary_file, signature)
+    fresh = read_summary(summary_file, signature)
+    if fresh is not None:
+        return fresh
+    stale = read_cached_summary(summary_file)
+    if stale is None:
+        return None
+    return {**stale, "stale": True}
 
 
 def _category_counts(value: Any) -> dict[str, int]:

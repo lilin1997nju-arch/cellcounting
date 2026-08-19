@@ -384,6 +384,7 @@ def create_app(
         ui_screening_status_label=ui_screening_status_label,
         ui_status_aliases=ui_status_aliases,
     )
+    app.state.quick_review_service = quick_review_service
 
 
     app.mount(
@@ -460,4 +461,12 @@ def create_app(
     remove_development_routes(app)
 
     return app
+
+
+def rebuild_quick_review_summary(config: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild one plate's persisted hub summary without serving its UI."""
+
+    app = create_app(config)
+    service = app.state.quick_review_service
+    return service.quick_review_summary(force=True)
 

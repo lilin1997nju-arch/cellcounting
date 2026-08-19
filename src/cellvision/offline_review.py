@@ -390,20 +390,6 @@ def import_offline_review_results(
         raise ValueError("审核结果与当前任务不匹配")
     if str(payload.get("project_id") or "") != str(manifest.get("project_id") or manifest_file.parent.name):
         raise ValueError("审核结果与当前项目不匹配")
-    expected_summary = (
-        task.get("offline_export", {}).get("summary", {})
-        if isinstance(task.get("offline_export"), dict)
-        else {}
-    )
-    if isinstance(expected_summary, dict) and expected_summary.get("format") == DATA_PACKAGE_FORMAT:
-        identity = payload.get("data_package")
-        if not isinstance(identity, dict):
-            raise ValueError("审核结果缺少 .cvreview 数据包身份")
-        if str(identity.get("package_id") or "") != str(expected_summary.get("package_id") or ""):
-            raise ValueError("审核结果来自另一份 .cvreview 数据包")
-        expected_content = str(expected_summary.get("content_sha256") or "")
-        if expected_content and str(identity.get("content_sha256") or "") != expected_content:
-            raise ValueError("审核结果的数据包校验标识不匹配")
     reviewer = str(payload.get("reviewer") or "offline_reviewer").strip() or "offline_reviewer"
     plate_lookup = {
         str(item.get("slug") or item.get("board_id") or ""): item
@@ -413,6 +399,7 @@ def import_offline_review_results(
     updated_wells = 0
     added_objects = 0
     skipped_incomplete_wells = 0
+    preserved_empty_plates = 0
     refreshed_plates = 0
     refresh_warnings: list[str] = []
     for result_plate in payload.get("plates", []):
@@ -424,12 +411,6 @@ def import_offline_review_results(
             raise ValueError(f"审核结果包含未知板子：{slug}")
         paths = _plate_paths(plate, manifest_file)
         database = initialize_database(paths["database"])
-        source = latest_prediction_path(paths["artifact_root"])
-        if source is None:
-            raise ValueError(f"板子 {slug} 没有可用预测结果")
-        predictions = pd.read_csv(source, low_memory=False)
-        prediction_lookup = predictions.set_index(predictions["candidate_id"].astype(str), drop=False)
-        round_id = str(predictions.iloc[0].get("integrated_round_id") or result_plate.get("round_id") or "offline-import")
         completed_wells = {
             str(item.get("well") or "").upper()
             for item in result_plate.get("wells", [])
@@ -439,7 +420,42 @@ def import_offline_review_results(
             1 for item in result_plate.get("wells", [])
             if isinstance(item, dict) and not bool(item.get("completed"))
         )
+        if not completed_wells:
+            ensure_integrated_review_table(database)
+            ensure_well_screening_review_table(database)
+            with sqlite3.connect(database) as connection:
+                has_existing_reviews = any((
+                    connection.execute(
+                        "SELECT 1 FROM integrated_training_reviews LIMIT 1"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT 1 FROM quick_missed_objects LIMIT 1"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT 1 FROM well_screening_reviews LIMIT 1"
+                    ).fetchone(),
+                ))
+            if has_existing_reviews:
+                preserved_empty_plates += 1
+            continue
+        source = latest_prediction_path(paths["artifact_root"])
+        if source is None:
+            raise ValueError(f"板子 {slug} 没有可用预测结果")
+        predictions = pd.read_csv(source, low_memory=False)
+        prediction_lookup = predictions.set_index(predictions["candidate_id"].astype(str), drop=False)
+        round_id = str(predictions.iloc[0].get("integrated_round_id") or result_plate.get("round_id") or "offline-import")
         review_items: list[dict[str, Any]] = []
+        manual_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
+        completed_well_items: list[tuple[str, str]] = []
+        for well_item in result_plate.get("wells", []):
+            if not isinstance(well_item, dict) or not bool(well_item.get("completed")):
+                continue
+            decision = str(well_item.get("screening_decision") or "pending")
+            if decision not in {"approved", "rejected", "pending"}:
+                raise ValueError(f"孔结论状态无效：{decision}")
+            completed_well_items.append(
+                (str(well_item.get("well") or "").upper(), decision)
+            )
         image_manifest = pd.read_csv(paths["images_manifest"])
         for item in result_plate.get("objects", []):
             if not isinstance(item, dict):
@@ -459,32 +475,7 @@ def import_offline_review_results(
                 ]
                 if selected.empty:
                     raise ValueError(f"补漏对象对应图像不存在：{slug}/{well}/{timepoint}")
-                image_row = selected.iloc[0]
-                temporary_id = candidate_id or f"offline:{well}:{timepoint}:{added_objects + 1}"
-                object_type = "cell" if reviewed in {"single", "touching_doublet", "cluster_3plus"} else "debris" if reviewed == "debris" else "irrelevant" if reviewed == "invalid" else "uncertain"
-                annotation_id = save_annotation(database, {
-                    "sequence_id": str(image_row.get("experiment_id") or "offline"),
-                    "plate_id": str(image_row.get("plate_id") or slug),
-                    "well": well, "timepoint": timepoint,
-                    "object_id": temporary_id, "canonical_target_id": temporary_id,
-                    "track_id": temporary_id, "parent_track_id": None,
-                    "x_px": float(item.get("x_px", 0)), "y_px": float(item.get("y_px", 0)),
-                    "object_type": object_type,
-                    "viability": "unknown" if object_type == "cell" else "not_applicable",
-                    "division_state": "unknown", "duplicate_of": None,
-                    "reviewer": reviewer, "confidence": 1.0, "notes": "offline_review_missed",
-                })
-                candidate_id = f"{well}:{timepoint}:manual:{annotation_id}"
-                with sqlite3.connect(database) as connection:
-                    connection.execute(
-                        "INSERT OR REPLACE INTO quick_missed_objects "
-                        "(round_id, annotation_id, candidate_id, well, timepoint, x_px, y_px, diameter_px, reviewed_label, reviewer, updated_at) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (round_id, annotation_id, candidate_id, well, timepoint, float(item.get("x_px", 0)),
-                         float(item.get("y_px", 0)), float(item.get("diameter_px", 18)), reviewed, reviewer,
-                         datetime.now(timezone.utc).isoformat()),
-                    )
-                added_objects += 1
+                manual_items.append((item, selected.iloc[0].to_dict(), reviewed))
                 continue
             if candidate_id not in prediction_lookup.index:
                 raise ValueError(f"板子 {slug} 中找不到对象：{candidate_id}")
@@ -495,23 +486,69 @@ def import_offline_review_results(
             if predicted not in LABELS:
                 predicted = "invalid" if predicted == "invalid" else "uncertain"
             review_items.append({"candidate_id": candidate_id, "predicted_label": predicted, "reviewed_label": reviewed})
-        if review_items:
-            updated_objects += save_integrated_reviews(database, round_id, review_items, reviewer)
+
+        ensure_integrated_review_table(database)
         ensure_well_screening_review_table(database)
         with sqlite3.connect(database) as connection:
-            for well_item in result_plate.get("wells", []):
-                if not isinstance(well_item, dict):
-                    continue
-                if not bool(well_item.get("completed")):
-                    continue
-                decision = str(well_item.get("screening_decision") or "pending")
-                if decision not in {"approved", "rejected", "pending"}:
-                    raise ValueError(f"孔结论状态无效：{decision}")
+            annotation_ids = [
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT annotation_id FROM quick_missed_objects WHERE round_id = ?",
+                    (round_id,),
+                ).fetchall()
+            ]
+            connection.execute(
+                "DELETE FROM quick_missed_objects WHERE round_id = ?", (round_id,)
+            )
+            if annotation_ids:
+                placeholders = ", ".join("?" for _ in annotation_ids)
+                connection.execute(
+                    f"DELETE FROM annotations WHERE annotation_id IN ({placeholders})",
+                    annotation_ids,
+                )
+            connection.execute(
+                "DELETE FROM integrated_training_reviews WHERE round_id = ?",
+                (round_id,),
+            )
+            connection.execute("DELETE FROM well_screening_reviews")
+
+        if review_items:
+            updated_objects += save_integrated_reviews(database, round_id, review_items, reviewer)
+        for item, image_row, reviewed in manual_items:
+            well = str(item.get("well") or "").upper()
+            timepoint = str(item.get("timepoint") or "").upper()
+            temporary_id = str(item.get("candidate_id") or "") or f"offline:{well}:{timepoint}:{added_objects + 1}"
+            object_type = "cell" if reviewed in {"single", "touching_doublet", "cluster_3plus"} else "debris" if reviewed == "debris" else "irrelevant" if reviewed == "invalid" else "uncertain"
+            annotation_id = save_annotation(database, {
+                "sequence_id": str(image_row.get("experiment_id") or "offline"),
+                "plate_id": str(image_row.get("plate_id") or slug),
+                "well": well, "timepoint": timepoint,
+                "object_id": temporary_id, "canonical_target_id": temporary_id,
+                "track_id": temporary_id, "parent_track_id": None,
+                "x_px": float(item.get("x_px", 0)), "y_px": float(item.get("y_px", 0)),
+                "object_type": object_type,
+                "viability": "unknown" if object_type == "cell" else "not_applicable",
+                "division_state": "unknown", "duplicate_of": None,
+                "reviewer": reviewer, "confidence": 1.0, "notes": "offline_review_missed",
+            })
+            candidate_id = f"{well}:{timepoint}:manual:{annotation_id}"
+            with sqlite3.connect(database) as connection:
+                connection.execute(
+                    "INSERT OR REPLACE INTO quick_missed_objects "
+                    "(round_id, annotation_id, candidate_id, well, timepoint, x_px, y_px, diameter_px, reviewed_label, reviewer, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (round_id, annotation_id, candidate_id, well, timepoint, float(item.get("x_px", 0)),
+                     float(item.get("y_px", 0)), float(item.get("diameter_px", 18)), reviewed, reviewer,
+                     datetime.now(timezone.utc).isoformat()),
+                )
+            added_objects += 1
+        with sqlite3.connect(database) as connection:
+            for well, decision in completed_well_items:
                 connection.execute(
                     "INSERT INTO well_screening_reviews(well, decision, reviewer, notes, updated_at) "
                     "VALUES (?, ?, ?, ?, ?) ON CONFLICT(well) DO UPDATE SET "
                     "decision=excluded.decision, reviewer=excluded.reviewer, notes=excluded.notes, updated_at=excluded.updated_at",
-                    (str(well_item.get("well") or "").upper(), decision, reviewer, "offline_review_import", datetime.now(timezone.utc).isoformat()),
+                    (well, decision, reviewer, "offline_review_import", datetime.now(timezone.utc).isoformat()),
                 )
                 updated_wells += 1
         config_value = str(plate.get("config") or "")
@@ -541,8 +578,18 @@ def import_offline_review_results(
                         day14_growth_overrides={str(well).upper(): str(decision) for well, decision in late_rows},
                         endpoint_day_label=str(settings.get("endpoint_day_label", "Day14")),
                     )
+                from .review_server import rebuild_quick_review_summary
+
+                rebuild_quick_review_summary(config)
                 refreshed_plates += 1
-            except (OSError, ValueError, KeyError, sqlite3.Error) as exc:
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                TypeError,
+                sqlite3.Error,
+                pd.errors.ParserError,
+            ) as exc:
                 refresh_warnings.append(f"{slug}: {exc}")
     return {
         "status": "imported",
@@ -550,6 +597,7 @@ def import_offline_review_results(
         "added_objects": added_objects,
         "updated_wells": updated_wells,
         "skipped_incomplete_wells": skipped_incomplete_wells,
+        "preserved_empty_plates": preserved_empty_plates,
         "refreshed_plates": refreshed_plates,
         "refresh_warnings": refresh_warnings,
         "reviewer": reviewer,

@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from pathlib import Path
 from zipfile import ZipFile
 
@@ -12,7 +13,6 @@ from cellvision.offline_review import (
     import_offline_review_results,
 )
 from cellvision.review_storage import initialize_database
-from cellvision.review_data_package import DATA_PACKAGE_FORMAT
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, dict]:
@@ -83,7 +83,6 @@ def test_offline_import_validates_identity_and_saves_decisions(tmp_path: Path):
     assert result["updated_wells"] == 1
 
     artifact = Path(json.loads(manifest.read_text(encoding="utf-8"))["plates"][0]["artifact_root"])
-    import sqlite3
     with sqlite3.connect(artifact / "annotations" / "annotations.db") as connection:
         assert connection.execute(
             "SELECT reviewed_label FROM integrated_training_reviews WHERE candidate_id='C2:T0:1'"
@@ -99,6 +98,172 @@ def test_offline_import_validates_identity_and_saves_decisions(tmp_path: Path):
         assert "任务不匹配" in str(exc)
     else:
         raise AssertionError("mismatched task must be rejected")
+
+    bad = dict(payload, project_id="another-project")
+    try:
+        import_offline_review_results(manifest, task, bad)
+    except ValueError as exc:
+        assert "项目不匹配" in str(exc)
+    else:
+        raise AssertionError("mismatched project must be rejected")
+
+
+def test_nonempty_later_import_replaces_the_plate_review_state(tmp_path: Path):
+    manifest, task = _fixture(tmp_path)
+    payload = {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "First reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [{
+                "candidate_id": "C2:T0:1",
+                "reviewed_label": "touching_doublet",
+                "is_new": False,
+            }],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "approved",
+                "completed": True,
+            }],
+        }],
+    }
+    import_offline_review_results(manifest, task, payload)
+
+    artifact = Path(json.loads(manifest.read_text(encoding="utf-8"))["plates"][0]["artifact_root"])
+    database = artifact / "annotations" / "annotations.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO integrated_training_reviews "
+            "(round_id, candidate_id, predicted_label, reviewed_label, decision, reviewer, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("round-1", "stale-candidate", "single", "debris", "corrected", "Old reviewer", "old"),
+        )
+        connection.execute(
+            "INSERT INTO well_screening_reviews(well, decision, reviewer, notes, updated_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("D3", "rejected", "Old reviewer", "old", "old"),
+        )
+
+    payload["reviewer"] = "Second reviewer"
+    payload["plates"][0]["objects"][0]["reviewed_label"] = "debris"
+    payload["plates"][0]["wells"][0]["screening_decision"] = "rejected"
+    import_offline_review_results(manifest, task, payload)
+
+    with sqlite3.connect(database) as connection:
+        object_rows = connection.execute(
+            "SELECT candidate_id, reviewed_label, reviewer "
+            "FROM integrated_training_reviews WHERE round_id = 'round-1'"
+        ).fetchall()
+        well_rows = connection.execute(
+            "SELECT well, decision, reviewer FROM well_screening_reviews"
+        ).fetchall()
+    assert object_rows == [("C2:T0:1", "debris", "Second reviewer")]
+    assert well_rows == [("C2", "rejected", "Second reviewer")]
+
+
+def test_empty_later_plate_preserves_existing_partial_review(tmp_path: Path):
+    manifest, task = _fixture(tmp_path)
+    reviewed_payload = {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "Production reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [{
+                "candidate_id": "C2:T0:1",
+                "reviewed_label": "touching_doublet",
+                "is_new": False,
+            }],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "approved",
+                "completed": True,
+            }],
+        }],
+    }
+    import_offline_review_results(manifest, task, reviewed_payload)
+
+    empty_payload = {
+        **reviewed_payload,
+        "reviewer": "Offline reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "pending",
+                "completed": False,
+            }],
+        }],
+    }
+    result = import_offline_review_results(manifest, task, empty_payload)
+
+    artifact = Path(json.loads(manifest.read_text(encoding="utf-8"))["plates"][0]["artifact_root"])
+    with sqlite3.connect(artifact / "annotations" / "annotations.db") as connection:
+        object_row = connection.execute(
+            "SELECT reviewed_label, reviewer FROM integrated_training_reviews "
+            "WHERE round_id = 'round-1' AND candidate_id = 'C2:T0:1'"
+        ).fetchone()
+        well_row = connection.execute(
+            "SELECT decision, reviewer FROM well_screening_reviews WHERE well = 'C2'"
+        ).fetchone()
+    assert object_row == ("touching_doublet", "Production reviewer")
+    assert well_row == ("approved", "Production reviewer")
+    assert result["preserved_empty_plates"] == 1
+
+
+def test_offline_import_rebuilds_the_changed_plate_summary(tmp_path: Path, monkeypatch):
+    import cellvision.offline_review as offline_review_module
+    import cellvision.review_server as review_server_module
+
+    manifest, task = _fixture(tmp_path)
+    manifest_value = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_value["plates"][0]["config"] = "plate.yaml"
+    manifest.write_text(json.dumps(manifest_value), encoding="utf-8")
+    fake_config = {"paths": {}, "gated_report": {}}
+    rebuilt: list[dict] = []
+    monkeypatch.setattr(offline_review_module, "load_config", lambda _path: fake_config)
+    monkeypatch.setattr(offline_review_module, "build_well_screening", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        review_server_module,
+        "rebuild_quick_review_summary",
+        lambda config: rebuilt.append(config) or {"status": "ready"},
+    )
+    payload = {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "Reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [{
+                "candidate_id": "C2:T0:1",
+                "reviewed_label": "single",
+                "is_new": False,
+            }],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "approved",
+                "completed": True,
+            }],
+        }],
+    }
+
+    result = import_offline_review_results(manifest, task, payload)
+
+    assert rebuilt == [fake_config]
+    assert result["refreshed_plates"] == 1
+    assert result["refresh_warnings"] == []
 
 
 def test_normal_review_results_can_be_exported_for_production_import(tmp_path: Path):
@@ -137,12 +302,12 @@ def test_normal_review_results_can_be_exported_for_production_import(tmp_path: P
     assert well == {"well": "C2", "screening_decision": "approved", "completed": True}
 
 
-def test_new_data_package_result_must_match_exported_package_identity(tmp_path: Path):
+def test_offline_result_accepts_an_older_export_of_the_same_task_and_project(tmp_path: Path):
     manifest, task = _fixture(tmp_path)
     task["offline_export"] = {
         "summary": {
-            "format": DATA_PACKAGE_FORMAT,
-            "package_id": "package-1",
+            "format": "cellvision-review-data",
+            "package_id": "latest-package",
             "content_sha256": "content-1",
         }
     }
@@ -153,15 +318,17 @@ def test_new_data_package_result_must_match_exported_package_identity(tmp_path: 
         "project_id": "project-1",
         "reviewer": "Reviewer",
         "data_package": {
-            "format": DATA_PACKAGE_FORMAT,
-            "package_id": "another-package",
-            "content_sha256": "content-1",
+            "format": "cellvision-review-data",
+            "package_id": "older-package",
+            "content_sha256": "older-content",
         },
         "plates": [],
     }
-    try:
-        import_offline_review_results(manifest, task, payload)
-    except ValueError as exc:
-        assert "另一份 .cvreview" in str(exc)
-    else:
-        raise AssertionError("mismatched .cvreview identity must be rejected")
+    result = import_offline_review_results(manifest, task, payload)
+
+    assert result["updated_objects"] == 0
+    assert result["updated_wells"] == 0
+
+    payload.pop("data_package")
+    result = import_offline_review_results(manifest, task, payload)
+    assert result["updated_objects"] == 0

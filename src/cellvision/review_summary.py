@@ -78,8 +78,8 @@ def summary_signature(
     }
 
 
-def read_summary(path: str | Path, signature: dict[str, Any]) -> dict[str, Any] | None:
-    """Read a summary only when it was generated for the current inputs."""
+def read_cached_summary(path: str | Path) -> dict[str, Any] | None:
+    """Read the last structurally valid summary, even when its inputs changed."""
 
     summary_file = Path(path)
     try:
@@ -89,6 +89,15 @@ def read_summary(path: str | Path, signature: dict[str, Any]) -> dict[str, Any] 
     if not isinstance(payload, dict):
         return None
     if payload.get("version") != SUMMARY_VERSION:
+        return None
+    return payload
+
+
+def read_summary(path: str | Path, signature: dict[str, Any]) -> dict[str, Any] | None:
+    """Read a summary only when it was generated for the current inputs."""
+
+    payload = read_cached_summary(path)
+    if payload is None:
         return None
     if payload.get("signature") != signature:
         return None

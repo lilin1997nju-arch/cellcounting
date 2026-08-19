@@ -6,6 +6,7 @@ import os
 from cellvision.review_summary import (
     SUMMARY_VERSION,
     latest_prediction_path,
+    read_cached_summary,
     read_summary,
     summary_path,
     summary_signature,
@@ -45,3 +46,4 @@ def test_summary_round_trip_requires_matching_signature(tmp_path):
     assert read_summary(path, signature) == payload
     changed = dict(signature, prediction_mtime_ns=(signature["prediction_mtime_ns"] or 0) + 1)
     assert read_summary(path, changed) is None
+    assert read_cached_summary(path) == payload

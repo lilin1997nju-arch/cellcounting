@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from run_day14_gated_plate import run as run_plate
+from cellvision.config import load_config
+from cellvision.review_server import rebuild_quick_review_summary
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,6 +65,20 @@ def main() -> None:
                     source_artifacts=str(resolve(args.source_artifacts)),
                 )
             )
+            try:
+                rebuild_quick_review_summary(load_config(config))
+            except Exception as summary_error:
+                print(
+                    json.dumps(
+                        {
+                            "event": "review_summary_warning",
+                            "board_id": board_id,
+                            "error": f"{type(summary_error).__name__}: {summary_error}",
+                        },
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
             elapsed = round(time.perf_counter() - started, 3)
             plate["status"] = "completed"
             plate["finished_at"] = datetime.now(timezone.utc).isoformat()
