@@ -64,6 +64,20 @@ def test_task_queue_worker_claims_only_explicitly_started_task(tmp_path: Path):
     assert store.claim_started("worker-2") is None
 
 
+def test_task_queue_can_claim_a_specific_started_task(tmp_path: Path):
+    store = TaskQueueStore(tmp_path / "tasks.json")
+    store.add({"task_id": "task-1"})
+    store.add({"task_id": "task-2"})
+    store.start("task-1")
+    store.start("task-2")
+
+    claimed = store.claim_started("worker-1", task_id="task-2")
+
+    assert claimed is not None
+    assert claimed["task_id"] == "task-2"
+    assert store.get("task-1")["progress_stage"] == "starting"
+
+
 def test_task_queue_preserves_board_progress_and_runtime(tmp_path: Path):
     store = TaskQueueStore(tmp_path / "tasks.json")
     store.add({"task_id": "task-1", "group_count": 1})

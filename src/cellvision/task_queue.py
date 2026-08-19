@@ -197,7 +197,11 @@ class TaskQueueStore:
                 return dict(task)
         return None
 
-    def claim_started(self, worker_id: str) -> dict[str, Any] | None:
+    def claim_started(
+        self,
+        worker_id: str,
+        task_id: str | None = None,
+    ) -> dict[str, Any] | None:
         """Claim one task that the user explicitly started.
 
         The browser's start button intentionally changes ``queued`` to
@@ -210,6 +214,8 @@ class TaskQueueStore:
         with _lock_for(self.path):
             tasks = self.read()
             for task in tasks:
+                if task_id is not None and str(task.get("task_id")) != str(task_id):
+                    continue
                 if str(task.get("status", "queued")) != "running":
                     continue
                 if str(task.get("progress_stage", "")) != "starting":

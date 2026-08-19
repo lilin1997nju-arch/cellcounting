@@ -122,6 +122,7 @@ class ProjectTaskWorker:
         self,
         store: TaskQueueStore,
         *,
+        queue_root: str | Path | None = None,
         runtime: ComputeRuntime | None = None,
         requested_device: str | None = None,
         worker_id: str | None = None,
@@ -130,6 +131,12 @@ class ProjectTaskWorker:
         executor: Callable[[dict[str, Any]], dict[str, Any] | None] | None = None,
     ):
         self.store = store
+        self._default_store = store
+        self.queue_root = (
+            Path(queue_root).expanduser().resolve()
+            if queue_root is not None
+            else None
+        )
         self.runtime = runtime or detect_compute_runtime(requested_device)
         self.worker_id = worker_id or f"{self.runtime.worker_kind}-worker-{os.getpid()}"
         self.runtime_path = (
@@ -157,13 +164,69 @@ class ProjectTaskWorker:
     ) -> "ProjectTaskWorker":
         manifest = _resolve(manifest_path)
         queue_path = manifest.parent / "task_queue.json"
+        queue_root = manifest.parent.parent
         return cls(
             TaskQueueStore(queue_path),
+            queue_root=queue_root,
             requested_device=requested_device,
             worker_id=worker_id,
-            runtime_path=queue_path.parent / "worker_runtime.json",
+            runtime_path=queue_root / "worker_runtime.json",
             catalog_path=catalog_path_for_manifest(manifest),
         )
+
+    def _queue_stores(self) -> list[TaskQueueStore]:
+        """Return every live project queue visible to this worker."""
+
+        paths = {self._default_store.path}
+        if self.queue_root is not None and self.queue_root.is_dir():
+            paths.update(
+                manifest.parent / "task_queue.json"
+                for manifest in self.queue_root.glob("*/project.json")
+                if manifest.is_file()
+            )
+        ordered_paths = sorted(paths, key=lambda value: value.as_posix().casefold())
+        return [TaskQueueStore(path) for path in ordered_paths]
+
+    @staticmethod
+    def _started_sort_key(
+        task: dict[str, Any],
+        store: TaskQueueStore,
+    ) -> tuple[str, str, str]:
+        started_at = str(
+            task.get("started_at")
+            or task.get("updated_at")
+            or task.get("created_at")
+            or "9999-12-31T23:59:59+00:00"
+        )
+        return (
+            started_at,
+            str(task.get("task_id", "")),
+            store.path.as_posix().casefold(),
+        )
+
+    def _claim_started_task(self) -> tuple[TaskQueueStore, dict[str, Any]] | None:
+        """Claim the oldest explicitly-started task across all project queues."""
+
+        candidates: list[tuple[dict[str, Any], TaskQueueStore]] = []
+        for store in self._queue_stores():
+            for task in store.list():
+                if str(task.get("status", "queued")) != "running":
+                    continue
+                if str(task.get("progress_stage", "")) != "starting":
+                    continue
+                if str(task.get("worker_id", "")) not in {"", "manual"}:
+                    continue
+                candidates.append((task, store))
+
+        candidates.sort(key=lambda item: self._started_sort_key(item[0], item[1]))
+        for candidate, store in candidates:
+            claimed = store.claim_started(
+                self.worker_id,
+                task_id=str(candidate.get("task_id", "")),
+            )
+            if claimed is not None:
+                return store, claimed
+        return None
 
     def _write_runtime(
         self,
@@ -239,10 +302,22 @@ class ProjectTaskWorker:
     def run_once(self) -> dict[str, Any] | None:
         """Claim and execute one explicitly-started task."""
 
-        task = self.store.claim_started(self.worker_id)
-        if task is None:
+        claimed = self._claim_started_task()
+        if claimed is None:
             self._write_runtime("idle")
             return None
+
+        store, task = claimed
+        previous_store = self.store
+        self.store = store
+
+        try:
+            return self._run_claimed_task(task)
+        finally:
+            self.store = previous_store
+
+    def _run_claimed_task(self, task: dict[str, Any]) -> dict[str, Any] | None:
+        """Execute a task after its owning queue has been selected."""
 
         task_id = str(task["task_id"])
         self._sync_catalog_task(task)

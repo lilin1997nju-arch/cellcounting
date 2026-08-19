@@ -2559,7 +2559,15 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         """Expose the adaptive worker's last hardware/status snapshot."""
 
         selected_manifest = manifest_for_project(project_id)
-        runtime_path = _queue_path(selected_manifest).parent / "worker_runtime.json"
+        shared_runtime_path = (
+            catalog_path_for_manifest(selected_manifest).parent / "worker_runtime.json"
+        )
+        legacy_runtime_path = _queue_path(selected_manifest).parent / "worker_runtime.json"
+        runtime_path = (
+            shared_runtime_path
+            if shared_runtime_path.exists()
+            else legacy_runtime_path
+        )
         if not runtime_path.exists():
             return {
                 "status": "offline",
