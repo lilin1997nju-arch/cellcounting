@@ -12,6 +12,7 @@ from cellvision.offline_review import (
     import_offline_review_results,
 )
 from cellvision.review_storage import initialize_database
+from cellvision.review_data_package import DATA_PACKAGE_FORMAT
 
 
 def _fixture(tmp_path: Path) -> tuple[Path, dict]:
@@ -134,3 +135,33 @@ def test_normal_review_results_can_be_exported_for_production_import(tmp_path: P
     assert reviewed["reviewed_label"] == "touching_doublet"
     well = next(item for item in plate["wells"] if item["well"] == "C2")
     assert well == {"well": "C2", "screening_decision": "approved", "completed": True}
+
+
+def test_new_data_package_result_must_match_exported_package_identity(tmp_path: Path):
+    manifest, task = _fixture(tmp_path)
+    task["offline_export"] = {
+        "summary": {
+            "format": DATA_PACKAGE_FORMAT,
+            "package_id": "package-1",
+            "content_sha256": "content-1",
+        }
+    }
+    payload = {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "Reviewer",
+        "data_package": {
+            "format": DATA_PACKAGE_FORMAT,
+            "package_id": "another-package",
+            "content_sha256": "content-1",
+        },
+        "plates": [],
+    }
+    try:
+        import_offline_review_results(manifest, task, payload)
+    except ValueError as exc:
+        assert "另一份 .cvreview" in str(exc)
+    else:
+        raise AssertionError("mismatched .cvreview identity must be rejected")

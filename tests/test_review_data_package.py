@@ -11,6 +11,7 @@ from cellvision.review_data_package import (
     prepare_review_data_package,
     validate_review_data_package,
 )
+from cellvision.review_platform import register_review_package
 
 
 def _project(tmp_path: Path) -> tuple[Path, dict]:
@@ -131,3 +132,28 @@ def test_review_data_package_detects_tampering(tmp_path: Path):
         assert "大小不符" in str(exc) or "校验失败" in str(exc)
     else:
         raise AssertionError("tampered package must be rejected")
+
+
+def test_installed_review_platform_registers_package_and_tracks_identity(tmp_path: Path, monkeypatch):
+    manifest, task = _project(tmp_path)
+    package, _ = prepare_review_data_package(manifest, task, git_commit="abc123")
+    monkeypatch.setenv("CELLVISION_REVIEW_HOME", str(tmp_path / "review-home"))
+
+    entrypoint, metadata = register_review_package(package)
+
+    assert entrypoint == package / "project" / "project.json"
+    registry = json.loads((tmp_path / "review-home" / "registry.json").read_text(encoding="utf-8"))
+    assert registry["packages"][0]["package_id"] == metadata["package_id"]
+    assert registry["packages"][0]["package_path"] == str(package)
+
+    from cellvision.project_server import create_project_app
+
+    app = create_project_app(entrypoint)
+    project_endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", "") == "/api/project"
+    )
+    project = project_endpoint(project_id="project-1")
+    assert project["project_id"] == "project-1"
+    assert project["portable_review"] is True

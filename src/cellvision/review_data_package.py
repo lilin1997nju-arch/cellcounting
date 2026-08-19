@@ -225,10 +225,19 @@ def _inventory(package_root: Path) -> tuple[list[dict[str, Any]], int]:
             continue
         size = int(path.stat().st_size)
         total += size
+        relative = path.relative_to(package_root).as_posix()
+        mutable = (
+            relative == "project/task_queue.json"
+            or "/annotations/" in relative
+            or "/gated/" in relative
+            or "/predictions/" in relative
+            or relative.endswith("/review_summary.json")
+        )
         rows.append({
-            "path": path.relative_to(package_root).as_posix(),
+            "path": relative,
             "bytes": size,
             "sha256": _sha256(path),
+            "mutable": mutable,
         })
     return rows, total
 
@@ -256,9 +265,12 @@ def validate_review_data_package(
         if relative.is_absolute() or ".." in relative.parts:
             raise ValueError(".cvreview 文件清单包含越界路径")
         path = root / relative
-        if not path.is_file() or int(path.stat().st_size) != int(item.get("bytes", -1)):
-            raise ValueError(f".cvreview 文件缺失或大小不符：{relative.as_posix()}")
-        if verify_hashes and _sha256(path) != str(item.get("sha256") or ""):
+        if not path.is_file():
+            raise ValueError(f".cvreview 文件缺失：{relative.as_posix()}")
+        mutable = bool(item.get("mutable"))
+        if not mutable and int(path.stat().st_size) != int(item.get("bytes", -1)):
+            raise ValueError(f".cvreview 文件大小不符：{relative.as_posix()}")
+        if verify_hashes and not mutable and _sha256(path) != str(item.get("sha256") or ""):
             raise ValueError(f".cvreview 文件校验失败：{relative.as_posix()}")
     return manifest
 
