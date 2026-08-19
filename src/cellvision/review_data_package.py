@@ -193,9 +193,21 @@ def _normalize_csv(source: Path, destination: Path, project_root: Path) -> None:
         return
     if not fieldnames:
         return
+    path_columns = {
+        column
+        for column in fieldnames
+        if (
+            "path" in column.casefold()
+            or column.casefold() in {"root", "directory", "dir"}
+            or column.casefold().endswith(("_root", "_directory", "_dir"))
+        )
+    }
+    if not path_columns:
+        return
     changed = False
     for row in rows:
-        for column, value in row.items():
+        for column in path_columns:
+            value = row.get(column)
             if not value:
                 continue
             portable = _portable_path(value, source_file=source, project_root=project_root)
@@ -344,6 +356,8 @@ def prepare_review_data_package(
                 progress_callback(copied, total, f"正在导出审核数据：{source.name}")
 
         snapshot = staging / "project"
+        if progress_callback:
+            progress_callback(total, total, "正在整理审核包内的相对路径")
         _normalize_snapshot(snapshot, project_root)
         files, normalized_total = _inventory(staging)
         metadata = {
