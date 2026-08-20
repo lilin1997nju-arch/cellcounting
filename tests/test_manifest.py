@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from cellvision.manifest import all_wells, normalize_well, stable_sequence_id
+from cellvision.manifest import _find_session, all_wells, normalize_well, stable_sequence_id
 
 
 def test_well_parsing():
@@ -25,6 +25,15 @@ def test_sequence_id_is_stable():
     assert first == second
 
 
+def test_filtered_session_without_a1_is_still_discovered(tmp_path: Path):
+    session = tmp_path / "T0"
+    session.mkdir()
+    (session / "A2.tif").write_bytes(b"raw")
+    (session / "A2-cf.tif").write_bytes(b"mask")
+
+    assert _find_session(session) == session
+
+
 def test_existing_split_has_no_well_leakage():
     split_dir = Path("artifacts/splits")
     if not split_dir.exists():
@@ -35,4 +44,3 @@ def test_existing_split_has_no_well_leakage():
     assert not (sets[0] & sets[1])
     assert not (sets[0] & sets[2])
     assert not (sets[1] & sets[2])
-

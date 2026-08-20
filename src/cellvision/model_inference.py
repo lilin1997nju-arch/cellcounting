@@ -21,6 +21,7 @@ def _weighted_knn(
     *,
     neighbours: int,
     scale: float,
+    reference_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     output = np.zeros((len(query), class_count), dtype=np.float32)
     if not len(reference):
@@ -32,6 +33,8 @@ def _weighted_knn(
         indices = np.argpartition(similarities, -k, axis=1)[:, -k:]
         selected = np.take_along_axis(similarities, indices, axis=1)
         weights = np.exp(np.clip((selected - 0.45) * scale, -8, 8))
+        if reference_weights is not None and len(reference_weights) == len(reference):
+            weights *= reference_weights[indices]
         local = np.zeros((len(batch), class_count), dtype=np.float32)
         for class_index in range(class_count):
             local[:, class_index] = (
@@ -123,9 +126,12 @@ def predict_multiplicity_checkpoint(
     linear = _linear_probabilities(model, features, device)
     reference = checkpoint["training_features"].cpu().numpy().astype(np.float32)
     targets = checkpoint["target_classes"].cpu().numpy().astype(np.int64)
+    reference_weights = checkpoint.get("training_sample_weights")
+    if reference_weights is not None:
+        reference_weights = reference_weights.cpu().numpy().astype(np.float32)
     neighbours = _weighted_knn(
         features, reference, targets, len(MULTIPLICITY_CLASSES),
-        neighbours=5, scale=9.0,
+        neighbours=5, scale=9.0, reference_weights=reference_weights,
     )
     blend = float(checkpoint.get("knn_blend", 0.45))
     probabilities = (1.0 - blend) * linear + blend * neighbours

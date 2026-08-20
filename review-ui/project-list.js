@@ -199,7 +199,8 @@ function taskActions(task) {
     buttons.push(`<button class="task-action secondary" type="button" data-task-action="cancel" data-task-id="${esc(task.task_id)}">取消</button>`);
   }
   if (status !== "completed" && status !== "running") {
-    buttons.push(`<button class="task-action danger" type="button" data-task-action="delete" data-task-id="${esc(task.task_id)}">删除</button>`);
+    const deleteLabel = status === "error" || status === "cancelled" ? "取消队列并清理" : "删除任务";
+    buttons.push(`<button class="task-action danger" type="button" data-task-action="delete" data-task-id="${esc(task.task_id)}">${deleteLabel}</button>`);
   }
   return buttons.length ? `<div class="task-actions">${buttons.join("")}</div>` : "";
 }
@@ -228,16 +229,17 @@ async function handleTaskAction(event) {
   const taskId = button.dataset.taskId;
   if (!action || !taskId || button.disabled) return;
   if (action === "cancel" && !window.confirm("确定取消这个任务吗？")) return;
-  if (action === "delete" && !window.confirm("只会删除任务记录，不会删除原始数据。确定删除吗？")) return;
+  if (action === "delete" && !window.confirm("将移除任务记录，并清理该任务在 Cell Vision Workspace\\Projects 中生成的项目文件；您选择的原始数据文件夹不会被删除。确定继续吗？")) return;
   button.disabled = true;
   try {
     const method = action === "delete" ? "DELETE" : "POST";
     const endpoint = action === "delete"
       ? `/api/project/tasks/${encodeURIComponent(taskId)}`
       : `/api/project/tasks/${encodeURIComponent(taskId)}/${action}`;
-    await api(endpoint, { method });
-    toast(action === "start" ? "任务已开始，等待执行器接管" : action === "cancel" ? "任务已取消" : "任务已删除");
-    await loadTasks();
+    const result = await api(endpoint, { method });
+    toast(action === "start" ? "任务已开始，等待执行器接管" : action === "cancel" ? "任务已取消" : result.cleaned_project ? "任务及对应项目文件已清理" : "任务已删除");
+    if (action === "delete") await load();
+    else await loadTasks();
   } catch (error) {
     toast(`任务操作失败：${error.message}`);
   } finally {

@@ -15,6 +15,7 @@ import html
 import io
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -340,6 +341,11 @@ def _review_progress_for_plate(plate: dict[str, Any]) -> dict[str, Any]:
 
 def _project_detection_dates(value: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return the first/last acquisition dates at day precision."""
+
+    explicit_start = str(value.get("detection_start_date") or "").strip() or None
+    explicit_end = str(value.get("detection_end_date") or "").strip() or None
+    if explicit_start or explicit_end:
+        return explicit_start or explicit_end, explicit_end or explicit_start
 
     candidates: list[Path] = []
     source = value.get("source_sessions_csv")
@@ -1676,6 +1682,31 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             if other_store.delete(task_id_value) is not None:
                 removed = True
         return removed
+
+    def disposable_task_project(task: dict[str, Any]) -> Path | None:
+        """Return an isolated generated project directory safe to remove."""
+
+        manifest_value = str(task.get("project_manifest") or "").strip()
+        if not manifest_value:
+            return None
+        task_manifest = _resolve(manifest_value)
+        projects_root = manifest_file.parent.parent.resolve()
+        project_dir = task_manifest.parent.resolve()
+        if (
+            task_manifest.name.casefold() != "project.json"
+            or project_dir == manifest_file.parent.resolve()
+            or project_dir.parent != projects_root
+        ):
+            return None
+        value = _read_manifest(task_manifest) if task_manifest.exists() else None
+        if value is not None:
+            manifest_task_id = str(value.get("task_id") or "")
+            manifest_project_id = str(value.get("project_id") or project_dir.name)
+            if manifest_task_id and manifest_task_id != str(task.get("task_id") or ""):
+                return None
+            if str(task.get("project_id") or manifest_project_id) != manifest_project_id:
+                return None
+        return project_dir
 
     def tasks_for_project(project_id: str | None = None) -> list[dict[str, Any]]:
         """Read one project's queue, or a de-duplicated hub-wide view."""
@@ -3131,6 +3162,21 @@ public static class CellVisionWindowFocus
             if str(row.get("day_label", "")).casefold() == endpoint_label.casefold()
             and row.get("timepoint_label")
         })
+        selected_dates = sorted({
+            str(
+                row.get("acquisition_date")
+                or row.get("acquisition_datetime")
+                or ""
+            )[:10]
+            for row in selected_sessions
+            if len(str(
+                row.get("acquisition_date")
+                or row.get("acquisition_datetime")
+                or ""
+            )) >= 10
+        })
+        detection_start_date = selected_dates[0] if selected_dates else None
+        detection_end_date = selected_dates[-1] if selected_dates else None
         now = datetime.now(timezone.utc).isoformat()
         new_task_id = task_id()
         project_id = _slug(project_name) or new_task_id
@@ -3182,6 +3228,8 @@ public static class CellVisionWindowFocus
                     "no_growth_images_retained": False,
                 },
                 "generated_at": now,
+                "detection_start_date": detection_start_date,
+                "detection_end_date": detection_end_date,
                 "task_id": new_task_id,
                 "status": "queued",
                 "selected_timepoint_labels": selected,
@@ -3281,7 +3329,9 @@ public static class CellVisionWindowFocus
             raise HTTPException(status_code=409, detail="completed tasks cannot be deleted")
         if status == "running":
             raise HTTPException(status_code=409, detail="cancel the running task before deleting it")
-        mark_task_plan_deleted(current)
+        cleanup_dir = disposable_task_project(current)
+        if cleanup_dir is None:
+            mark_task_plan_deleted(current)
         deleted = store.get(task_id)
         if deleted is None:
             raise HTTPException(status_code=404, detail="task not found")
@@ -3291,9 +3341,28 @@ public static class CellVisionWindowFocus
         remove_task_from_all_queues(task_id)
         try:
             catalog.delete_task(task_id)
+            if cleanup_dir is not None:
+                catalog.mark_project_deleted(
+                    str(current.get("project_id") or cleanup_dir.name)
+                )
         except (OSError, sqlite3.Error, ValueError, TypeError):
             pass
-        return {"status": "deleted", "task": deleted}
+        cleaned_project = False
+        if cleanup_dir is not None and cleanup_dir.is_dir():
+            try:
+                shutil.rmtree(cleanup_dir)
+                cleaned_project = True
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"任务记录已移除，但项目目录清理失败：{exc}",
+                ) from exc
+        return {
+            "status": "deleted",
+            "task": deleted,
+            "cleaned_project": cleaned_project,
+            "cleaned_project_path": str(cleanup_dir) if cleaned_project else "",
+        }
 
     remove_development_routes(app)
     return app

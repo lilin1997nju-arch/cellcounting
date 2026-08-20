@@ -475,7 +475,7 @@ def test_deleting_a_task_from_a_legacy_queue_removes_its_project_queue_copy(
         "name": "Legacy copy",
         "project_id": "child",
         "project_manifest": str(child_manifest),
-        "status": "cancelled",
+        "status": "error",
     }
     (main_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
     (child_dir / "task_queue.json").write_text(json.dumps([task]), encoding="utf-8")
@@ -492,7 +492,9 @@ def test_deleting_a_task_from_a_legacy_queue_removes_its_project_queue_copy(
         and "DELETE" in getattr(route, "methods", set())
     )
     assert [item["task_id"] for item in tasks_endpoint()] == ["task-legacy-copy"]
-    assert delete_endpoint("task-legacy-copy")["status"] == "deleted"
+    deleted = delete_endpoint("task-legacy-copy")
+    assert deleted["status"] == "deleted"
+    assert deleted["cleaned_project"] is True
     assert tasks_endpoint() == []
     assert json.loads((main_dir / "task_queue.json").read_text(encoding="utf-8")) == []
-    assert json.loads((child_dir / "task_queue.json").read_text(encoding="utf-8")) == []
+    assert not child_dir.exists()

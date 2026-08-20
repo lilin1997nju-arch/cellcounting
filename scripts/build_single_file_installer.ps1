@@ -89,9 +89,19 @@ $extractRoot = Join-Path ([IO.Path]::GetTempPath()) ("CellVisionInstaller-" + [g
 New-Item -ItemType Directory -Path $extractRoot | Out-Null
 try {
     Expand-Archive -LiteralPath $payload -DestinationPath $extractRoot
-    $launchers = @(Get-ChildItem -LiteralPath $extractRoot -Filter "__LAUNCHER__" -File -Recurse)
+    $launchers = @()
+    $directLauncher = Join-Path $extractRoot "__LAUNCHER__"
+    if (Test-Path -LiteralPath $directLauncher -PathType Leaf) {
+        $launchers += Get-Item -LiteralPath $directLauncher
+    }
+    foreach ($packageRoot in Get-ChildItem -LiteralPath $extractRoot -Directory) {
+        $candidate = Join-Path $packageRoot.FullName "__LAUNCHER__"
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $launchers += Get-Item -LiteralPath $candidate
+        }
+    }
     if ($launchers.Count -ne 1) {
-        throw "Embedded package must contain exactly one __LAUNCHER__; found $($launchers.Count)."
+        throw "Embedded package must contain exactly one top-level __LAUNCHER__; found $($launchers.Count)."
     }
     Push-Location $launchers[0].DirectoryName
     try {

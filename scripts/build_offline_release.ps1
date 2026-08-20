@@ -4,12 +4,12 @@
 
 .DESCRIPTION
     Run this script on a connected Windows build PC. It archives the exact
-    committed Git tree, copies the three production checkpoints, downloads a
-    Python 3.12 installer and a complete Windows wheelhouse, then emits one ZIP.
-    When a compatible previous release exists, its runtime and wheelhouse are
-    reused so application-only changes do not contact the network.
-    The target PC only needs Windows and enough disk space; installation never
-    contacts the network.
+    committed Git tree, copies the three production checkpoints, and prepares
+    a relocatable Python runtime without Windows MSI. The emitted folder keeps
+    Application and Workspace under one root. When a compatible previous
+    release exists, its prepared runtime is reused so application-only changes
+    do not contact the network. The target PC only copies the folder and runs
+    the one-time machine-service configuration command.
 #>
 
 [CmdletBinding()]
@@ -123,6 +123,7 @@ $currentAssetContract = Get-AssetContract `
 $assetSource = $null
 $fallbackAssetSource = $null
 $assetNeedsRefresh = $false
+$reusePortableRuntime = $false
 if (-not $NoAssetReuse) {
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($ReuseAssetsFrom)) {
@@ -139,11 +140,11 @@ if (-not $NoAssetReuse) {
         $candidateRelease = Join-Path $candidate "RELEASE.json"
         $candidateApplication = Join-Path $candidate "Application"
         $candidateWheelhouse = Join-Path $candidate "wheelhouse"
-        $candidateInstaller = Join-Path $candidate "runtime\python-$PythonVersion-amd64.exe"
+        if (-not (Test-Path -LiteralPath $candidateWheelhouse -PathType Container)) {
+            $candidateWheelhouse = Join-Path $candidateApplication "wheelhouse"
+        }
+        $candidatePortablePython = Join-Path $candidateApplication "Python312\python.exe"
         if (-not (Test-Path -LiteralPath $candidateRelease -PathType Leaf)) { continue }
-        if (-not (Test-Path -LiteralPath $candidateWheelhouse -PathType Container)) { continue }
-        if (-not (Test-Path -LiteralPath $candidateInstaller -PathType Leaf)) { continue }
-        if ((Get-Item -LiteralPath $candidateInstaller).Length -le 0) { continue }
         try {
             $candidateMetadata = Get-Content -LiteralPath $candidateRelease -Raw | ConvertFrom-Json
         } catch {
@@ -153,17 +154,31 @@ if (-not $NoAssetReuse) {
         if ([string]$candidateMetadata.torch_variant -ne $TorchVariant) { continue }
         if ([string]$candidateMetadata.torch_version -ne "2.11.0") { continue }
         if ([string]$candidateMetadata.torchvision_version -ne "0.26.0") { continue }
-        if (@(Get-ChildItem -LiteralPath $candidateWheelhouse -File).Count -eq 0) { continue }
         $candidateContract = Get-AssetContract `
             -ApplicationRoot $candidateApplication `
             -RequestedPython $PythonVersion `
             -RequestedVariant $TorchVariant
         if (-not [string]::IsNullOrWhiteSpace($candidateContract) -and $candidateContract -eq $currentAssetContract) {
-            $assetSource = $candidate
-            $assetNeedsRefresh = $false
-            break
+            if (Test-Path -LiteralPath $candidatePortablePython -PathType Leaf) {
+                $assetSource = $candidate
+                $reusePortableRuntime = $true
+                $assetNeedsRefresh = $false
+                break
+            }
+            if (
+                (Test-Path -LiteralPath $candidateWheelhouse -PathType Container) -and
+                @(Get-ChildItem -LiteralPath $candidateWheelhouse -File).Count -gt 0
+            ) {
+                $assetSource = $candidate
+                $assetNeedsRefresh = $false
+                break
+            }
         }
-        if ($null -eq $fallbackAssetSource) { $fallbackAssetSource = $candidate }
+        if (
+            $null -eq $fallbackAssetSource -and
+            (Test-Path -LiteralPath $candidateWheelhouse -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $candidateWheelhouse -File).Count -gt 0
+        ) { $fallbackAssetSource = $candidate }
     }
     if ($null -eq $assetSource -and $null -ne $fallbackAssetSource) {
         $assetSource = $fallbackAssetSource
@@ -173,9 +188,9 @@ if (-not $NoAssetReuse) {
 
 $application = Join-Path $releaseRoot "Application"
 $wheelhouse = Join-Path $releaseRoot "wheelhouse"
-$runtime = Join-Path $releaseRoot "runtime"
-$modelBundle = Join-Path $releaseRoot "ModelBundle"
-foreach ($directory in @($application, $wheelhouse, $runtime, $modelBundle)) {
+$modelBundle = Join-Path $application "ModelBundle"
+$workspace = Join-Path $releaseRoot "Workspace"
+foreach ($directory in @($application, $wheelhouse, $modelBundle, $workspace)) {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
@@ -204,16 +219,33 @@ try {
         Copy-Item -LiteralPath $model.Source -Destination $destination
     }
 
-    Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\install_offline.ps1") -Destination (Join-Path $releaseRoot "install_offline.ps1")
-    Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\Install-CellVision.cmd") -Destination (Join-Path $releaseRoot "Install-CellVision.cmd")
-    Copy-Item -LiteralPath (Join-Path $repository "deploy\offline\launch_installer.ps1") -Destination (Join-Path $releaseRoot "launch_installer.ps1")
-    Copy-Item -LiteralPath (Join-Path $repository "deploy\windows\install_ui.ps1") -Destination (Join-Path $releaseRoot "install_ui.ps1")
+    foreach ($name in @(
+        "Configure-CellVision-Service.cmd",
+        "Disable-CellVision-Autostart.cmd",
+        "configure_service.ps1",
+        "configure_service_launcher.ps1",
+        "disable_service_autostart.ps1",
+        "Open-CellVision.cmd"
+    )) {
+        Copy-Item -LiteralPath (Join-Path $repository "deploy\portable\$name") -Destination (Join-Path $releaseRoot $name)
+    }
+    foreach ($name in @("Projects", "Database", "Logs", "Inbox", "Cache")) {
+        New-Item -ItemType Directory -Force -Path (Join-Path $workspace $name) | Out-Null
+    }
+    Copy-Item -LiteralPath (Join-Path $repository "deploy\portable\Workspace-README.txt") `
+        -Destination (Join-Path $workspace "README.txt")
 
-    $pythonInstaller = Join-Path $runtime "python-$PythonVersion-amd64.exe"
-    if ($null -ne $assetSource) {
-        Write-Host "Reusing offline runtime assets from: $assetSource" -ForegroundColor Cyan
-        Copy-Item -Path (Join-Path $assetSource "runtime\*") -Destination $runtime -Recurse -Force
-        Copy-Item -Path (Join-Path $assetSource "wheelhouse\*") -Destination $wheelhouse -Recurse -Force
+    if ($reusePortableRuntime) {
+        Write-Host "Reusing prepared portable runtime from: $assetSource" -ForegroundColor Cyan
+        Copy-Item -LiteralPath (Join-Path $assetSource "Application\Python312") `
+            -Destination (Join-Path $application "Python312") -Recurse
+    } elseif ($null -ne $assetSource) {
+        Write-Host "Reusing offline wheel assets from: $assetSource" -ForegroundColor Cyan
+        $sourceWheelhouse = Join-Path $assetSource "wheelhouse"
+        if (-not (Test-Path -LiteralPath $sourceWheelhouse -PathType Container)) {
+            $sourceWheelhouse = Join-Path $assetSource "Application\wheelhouse"
+        }
+        Copy-Item -Path (Join-Path $sourceWheelhouse "*") -Destination $wheelhouse -Recurse -Force
         if ($assetNeedsRefresh) {
             Write-Host "Refreshing only missing or changed wheels ..." -ForegroundColor Cyan
             $targetArgs = @(
@@ -229,10 +261,6 @@ try {
             ))
         }
     } else {
-        $pythonUrl = "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe"
-        Write-Host "Downloading Python $PythonVersion installer ..." -ForegroundColor Cyan
-        Invoke-WebRequest -Uri $pythonUrl -OutFile $pythonInstaller -UseBasicParsing
-
         $targetArgs = @(
             "-m", "pip", "download", "--dest", $wheelhouse,
             "--only-binary=:all:", "--platform", "win_amd64", "--python-version", "312",
@@ -252,6 +280,12 @@ try {
             "torch==2.11.0", "torchvision==0.26.0"
         ))
     }
+    if (-not $reusePortableRuntime) {
+        & (Join-Path $repository "scripts\prepare_portable_production_runtime.ps1") `
+            -ApplicationRoot $application -Wheelhouse $wheelhouse -PythonVersion $PythonVersion
+        if ($LASTEXITCODE -ne 0) { throw "Unable to prepare the portable production runtime." }
+    }
+    if (Test-Path -LiteralPath $wheelhouse) { Remove-Item -LiteralPath $wheelhouse -Recurse -Force }
 
     $modelMetadata = foreach ($model in $models) {
         $packaged = Join-Path $modelBundle $model.Destination
@@ -263,10 +297,13 @@ try {
     }
     $release = [ordered]@{
         product = "Cell Vision"
-        release_format = 1
+        release_format = 2
         git_commit = $commit
         git_short_commit = $shortCommit
         git_clean = $true
+        deployment_mode = "portable-folder"
+        application_directory = "Application"
+        workspace_directory = "Workspace"
         built_at = (Get-Date).ToUniversalTime().ToString("o")
         python_version = $PythonVersion
         torch_version = "2.11.0"

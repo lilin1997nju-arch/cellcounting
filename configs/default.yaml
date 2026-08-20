@@ -225,6 +225,10 @@ temporal_completion:
 
 multiplicity:
   epochs: 260
+  # Human-corrected single <-> touching-doublet swaps are the most informative
+  # boundary cases. Give them extra influence in both the MLP loss and the
+  # checkpoint's nearest-neighbour reference vote.
+  corrected_single_doublet_weight: 4.0
   # Selected on the frozen A12-22 validation audit to recover reviewed
   # touching-cell classes without accepting low-confidence morphology calls.
   automatic_threshold: 0.425
@@ -256,6 +260,9 @@ debris_tracking:
 
 dense_detection:
   reuse_unchanged_stage: true
+  # CPU-only production processes independent raw images concurrently, while
+  # preserving deterministic input-order candidate materialization.
+  cpu_image_workers: 4
   maximum_peaks_per_image: 320
   minimum_peak_distance_px: 7
   # Candidate generation is recall-first inside the well. The physical wall is

@@ -78,7 +78,10 @@ $envPath = Join-Path $InstallRoot ".env.production"
 Import-ProductionEnv -Path $envPath
 
 $env:CELLVISION_PRODUCTION = "1"
-$python = Join-Path $InstallRoot ".venv-production\Scripts\python.exe"
+$python = $env:CELLVISION_PYTHON
+if ([string]::IsNullOrWhiteSpace($python)) {
+    $python = Join-Path $InstallRoot ".venv-production\Scripts\python.exe"
+}
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Production Python was not found: $python. Run setup_production.ps1 first."
 }

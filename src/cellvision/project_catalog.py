@@ -9,6 +9,7 @@ and their report files.
 
 from __future__ import annotations
 
+import csv
 import json
 import os
 import sqlite3
@@ -307,6 +308,57 @@ def _project_id(value: dict[str, Any], path: Path) -> str:
     return str(value.get("project_id") or path.parent.name)
 
 
+def _is_system_placeholder(value: dict[str, Any]) -> bool:
+    """Identify the internal startup manifest that is not a user project."""
+
+    if bool(value.get("system_placeholder")):
+        return True
+    return (
+        str(value.get("project_id") or "").casefold() == "active"
+        and str(value.get("project_name") or "").casefold() == "cell vision production"
+        and not value.get("task_id")
+        and not value.get("plates")
+    )
+
+
+def _manifest_detection_dates(
+    value: dict[str, Any], manifest_path: Path
+) -> tuple[str | None, str | None]:
+    start = str(value.get("detection_start_date") or "").strip() or None
+    end = str(value.get("detection_end_date") or "").strip() or None
+    if start or end:
+        return start or end, end or start
+
+    dates: list[str] = []
+    for row in value.get("sessions", []):
+        if not isinstance(row, dict):
+            continue
+        raw = str(row.get("acquisition_date") or row.get("acquisition_datetime") or "")
+        if len(raw) >= 10:
+            dates.append(raw[:10])
+
+    source = _resolve_reference(value.get("source_sessions_csv"), manifest_path.parent)
+    if source is not None and source.is_file():
+        try:
+            with source.open("r", encoding="utf-8-sig", newline="") as stream:
+                for row in csv.DictReader(stream):
+                    if str(row.get("excluded") or "").strip().casefold() in {
+                        "1", "true", "yes", "y"
+                    }:
+                        continue
+                    raw = str(
+                        row.get("acquisition_date")
+                        or row.get("acquisition_datetime")
+                        or ""
+                    )
+                    if len(raw) >= 10:
+                        dates.append(raw[:10])
+        except (OSError, csv.Error):
+            pass
+    normalized = sorted(item for item in dates if len(item) == 10)
+    return (normalized[0], normalized[-1]) if normalized else (None, None)
+
+
 def _project_card_from_row(data: dict[str, Any]) -> dict[str, Any]:
     """Build a project card from a joined projects+summaries row."""
 
@@ -314,6 +366,9 @@ def _project_card_from_row(data: dict[str, Any]) -> dict[str, Any]:
         categories = json.loads(data.get("category_counts_json") or "{}")
     except json.JSONDecodeError:
         categories = {}
+    manifest_path = Path(str(data["manifest_path"])).expanduser().resolve()
+    manifest = _read_json(manifest_path) or {}
+    detection_start, detection_end = _manifest_detection_dates(manifest, manifest_path)
     return {
         "project_id": data["project_id"],
         "project_name": data["project_name"],
@@ -325,8 +380,8 @@ def _project_card_from_row(data: dict[str, Any]) -> dict[str, Any]:
         "reviewed_plate_count": int(data.get("reviewed_plate_count") or 0),
         "category_counts": categories,
         "single_cell_origin_well_count": int(categories.get("single_cell_origin", 0) or 0),
-        "detection_start_date": None,
-        "detection_end_date": None,
+        "detection_start_date": detection_start,
+        "detection_end_date": detection_end,
         "created_by": data.get("created_by") or "",
         "generated_at": data.get("created_at"),
         "updated_at": data.get("calculated_at") or data.get("updated_at"),
@@ -406,6 +461,15 @@ class ProjectCatalog:
         path = Path(manifest_path).expanduser().resolve()
         value = _read_json(path)
         if value is None:
+            return None
+        if _is_system_placeholder(value):
+            now = _now()
+            with self._connect() as connection:
+                connection.execute(
+                    "UPDATE projects SET status='deleted', deleted_at=?, updated_at=? "
+                    "WHERE manifest_path=? OR project_id=?",
+                    (now, now, str(path), _project_id(value, path)),
+                )
             return None
         project_id = _project_id(value, path)
         signature = self._manifest_signature(path, value)

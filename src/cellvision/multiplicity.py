@@ -720,13 +720,15 @@ def _multiplicity_targets_for_source(
 ) -> pd.DataFrame:
     labels = read_multiplicity_labels(database)
     targets = labels[labels["label"].isin(MULTIPLICITY_CLASSES)].copy()
+    targets["sample_weight"] = 1.0
     # Corrections made on the integrated audit page are higher-value labels
     # because the reviewer has seen the model's proposed class first.
     ensure_integrated_review_table(database)
     with sqlite3.connect(database) as connection:
         integrated = pd.read_sql_query(
             """
-            SELECT candidate_id, reviewed_label AS label, updated_at
+            SELECT candidate_id, predicted_label, reviewed_label AS label,
+                   decision, updated_at
             FROM integrated_training_reviews
             WHERE reviewed_label IN (
               'single', 'touching_doublet', 'cluster_3plus'
@@ -745,8 +747,29 @@ def _multiplicity_targets_for_source(
             )
         ]
         integrated["source"] = "integrated_review"
+        hard_example_weight = float(
+            config.get("multiplicity", {}).get(
+                "corrected_single_doublet_weight", 1.0
+            )
+        )
+        single_doublet = {"single", "touching_doublet"}
+        integrated["sample_weight"] = np.where(
+            integrated["decision"].astype(str).eq("corrected")
+            & integrated["predicted_label"].astype(str).isin(single_doublet)
+            & integrated["label"].astype(str).isin(single_doublet)
+            & integrated["predicted_label"].astype(str).ne(
+                integrated["label"].astype(str)
+            ),
+            hard_example_weight,
+            1.0,
+        )
         targets = pd.concat(
-            [targets, integrated[["candidate_id", "label", "source"]]],
+            [
+                targets,
+                integrated[
+                    ["candidate_id", "label", "source", "sample_weight"]
+                ],
+            ],
             ignore_index=True,
         )
     if targets.empty:
@@ -872,6 +895,9 @@ def train_multiplicity_classifier(
             2.5,
         )
     ).to_numpy(np.float32)
+    hard_example_weights = pd.to_numeric(
+        targets.get("sample_weight", 1.0), errors="coerce"
+    ).fillna(1.0).clip(lower=1.0).to_numpy(np.float32)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     seed = int(config.get("teaching", {}).get("seed", 20260730)) + 17
@@ -886,7 +912,9 @@ def train_multiplicity_classifier(
         nn.Linear(48, len(MULTIPLICITY_CLASSES)),
     ).to(device)
     x, y = x.to(device), y.to(device)
-    source_weight_tensor = torch.from_numpy(source_weights).to(device)
+    sample_weight_tensor = torch.from_numpy(
+        source_weights * hard_example_weights
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0015, weight_decay=0.08)
     weight_tensor = torch.tensor(
         class_weights, dtype=torch.float32, device=device
@@ -903,7 +931,7 @@ def train_multiplicity_classifier(
             label_smoothing=0.05,
             reduction="none",
         )
-        loss = (losses * source_weight_tensor).sum() / source_weight_tensor.sum()
+        loss = (losses * sample_weight_tensor).sum() / sample_weight_tensor.sum()
         loss.backward()
         optimizer.step()
 
@@ -932,6 +960,7 @@ def train_multiplicity_classifier(
     neighbour_weights = np.exp(
         np.clip((neighbour_similarities - 0.45) * 9.0, -8, 8)
     )
+    neighbour_weights *= hard_example_weights[neighbour_indices]
     target_classes = targets["class_index"].to_numpy(np.int64)
     neighbour_probabilities = np.zeros_like(linear_probabilities)
     for class_index in range(len(MULTIPLICITY_CLASSES)):
@@ -954,12 +983,26 @@ def train_multiplicity_classifier(
     predictions["multiplicity_uncertainty"] = (
         1.0 - predictions["multiplicity_confidence"]
     )
-    prediction_path = artifact_path(
-        config, "predictions", "multiplicity_predictions.csv"
+    output_directory_value = config.get("multiplicity", {}).get(
+        "output_directory"
+    )
+    output_directory = (
+        Path(str(output_directory_value)).expanduser().resolve()
+        if output_directory_value
+        else None
+    )
+    if output_directory is not None:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    prediction_path = (
+        output_directory / "multiplicity_predictions.csv"
+        if output_directory is not None
+        else artifact_path(config, "predictions", "multiplicity_predictions.csv")
     )
     predictions.to_csv(prediction_path, index=False, encoding="utf-8")
-    checkpoint_path = artifact_path(
-        config, "models", "multiplicity_classifier.pt"
+    checkpoint_path = (
+        output_directory / "multiplicity_classifier.pt"
+        if output_directory is not None
+        else artifact_path(config, "models", "multiplicity_classifier.pt")
     )
     torch.save(
         {
@@ -972,6 +1015,9 @@ def train_multiplicity_classifier(
             ),
             "target_classes": torch.from_numpy(
                 target_classes.astype(np.int64)
+            ),
+            "training_sample_weights": torch.from_numpy(
+                hard_example_weights.astype(np.float32)
             ),
             "knn_blend": 0.45,
         },
@@ -1001,14 +1047,23 @@ def train_multiplicity_classifier(
             )
         },
         "training_accuracy": fit_accuracy,
+        "hard_example_weight": float(
+            config.get("multiplicity", {}).get(
+                "corrected_single_doublet_weight", 1.0
+            )
+        ),
+        "hard_example_count": int((hard_example_weights > 1.0).sum()),
         "prediction_count": int(len(predictions)),
         "checkpoint": str(checkpoint_path),
         "predictions": str(prediction_path),
         "metric_scope": "training fit only; continued review required",
     }
-    artifact_path(
-        config, "models", "multiplicity_classifier.json"
-    ).write_text(
+    report_path = (
+        output_directory / "multiplicity_classifier.json"
+        if output_directory is not None
+        else artifact_path(config, "models", "multiplicity_classifier.json")
+    )
+    report_path.write_text(
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return report

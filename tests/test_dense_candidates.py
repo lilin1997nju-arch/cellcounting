@@ -1,11 +1,38 @@
+import threading
+import time
+
 import numpy as np
 
 import cellvision.dense_candidates as dense_candidates
 from cellvision.dense_candidates import (
     _polar_wall_residual_peaks,
+    _ordered_thread_map,
     _select_response_backend,
     _zone_peak_indices,
 )
+
+
+def test_ordered_thread_map_runs_concurrently_and_preserves_input_order() -> None:
+    lock = threading.Lock()
+    active = 0
+    maximum_active = 0
+
+    def work(value: int) -> int:
+        nonlocal active, maximum_active
+        with lock:
+            active += 1
+            maximum_active = max(maximum_active, active)
+        time.sleep(0.01 * (4 - value))
+        with lock:
+            active -= 1
+        return value * 10
+
+    assert list(_ordered_thread_map(work, [1, 2, 3], max_workers=3)) == [
+        10,
+        20,
+        30,
+    ]
+    assert maximum_active >= 2
 
 
 def test_multiscale_backend_auto_uses_cuda_when_available(monkeypatch) -> None:

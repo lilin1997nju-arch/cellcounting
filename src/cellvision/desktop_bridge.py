@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import secrets
@@ -37,6 +38,49 @@ def _bridge_home() -> Path:
 
 
 def _choose_folder() -> str:
+    if os.name == "nt":
+        script = r'''Add-Type -AssemblyName System.Windows.Forms
+$form = New-Object Windows.Forms.Form
+$form.StartPosition = "CenterScreen"
+$form.Size = New-Object Drawing.Size(1, 1)
+$form.ShowInTaskbar = $false
+$form.TopMost = $true
+$dialog = New-Object Windows.Forms.FolderBrowserDialog
+$dialog.Description = "选择包含 sessions.idx 的数据文件夹"
+$dialog.ShowNewFolderButton = $false
+try {
+    $form.Show()
+    $form.Activate()
+    $form.BringToFront()
+    if ($dialog.ShowDialog($form) -eq [Windows.Forms.DialogResult]::OK) {
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8
+        Write-Output $dialog.SelectedPath
+    }
+} finally {
+    $dialog.Dispose()
+    $form.Dispose()
+}'''
+        encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+        result = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)),
+            check=False,
+        )
+        selected = result.stdout.strip().splitlines()
+        return str(Path(selected[-1]).resolve()) if result.returncode == 0 and selected else ""
+
     import tkinter as tk
     from tkinter import filedialog
 

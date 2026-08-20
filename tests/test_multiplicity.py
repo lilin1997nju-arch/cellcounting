@@ -5,6 +5,7 @@ import pandas as pd
 from cellvision.multiplicity import (
     carry_forward_integrated_reviews,
     _filter_unconfirmed_wall_queue_candidates,
+    _multiplicity_targets_for_source,
     multiplicity_stats,
     read_multiplicity_labels,
     save_categorized_review_labels,
@@ -174,6 +175,49 @@ def test_integrated_review_records_approval_and_correction(tmp_path):
         "H6:T1:cf:154": "approved",
         "C5:T2:cf:60": "corrected",
     }
+
+
+def test_corrected_single_doublet_swap_gets_extra_training_weight(tmp_path):
+    database = tmp_path / "annotations.db"
+    save_integrated_reviews(
+        database,
+        "round-test",
+        [
+            {
+                "candidate_id": "swap",
+                "predicted_label": "single",
+                "reviewed_label": "touching_doublet",
+            },
+            {
+                "candidate_id": "approved",
+                "predicted_label": "single",
+                "reviewed_label": "single",
+            },
+        ],
+        "tester",
+    )
+    metadata = pd.DataFrame(
+        [
+            {
+                "candidate_id": candidate_id,
+                "well": "A1",
+                "timepoint": "T1",
+                "x_px": x_px,
+                "y_px": 20.0,
+                "diameter_px": 12.0,
+            }
+            for candidate_id, x_px in (("swap", 10.0), ("approved", 50.0))
+        ]
+    )
+
+    targets = _multiplicity_targets_for_source(
+        {"multiplicity": {"corrected_single_doublet_weight": 4.0}},
+        database,
+        metadata,
+    ).set_index("candidate_id")
+
+    assert targets.loc["swap", "sample_weight"] == 4.0
+    assert targets.loc["approved", "sample_weight"] == 1.0
 
 
 def test_integrated_reviews_carry_forward_for_stable_candidates(tmp_path):

@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import time
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator, TypeVar
 
 import numpy as np
 import pandas as pd
@@ -25,6 +28,47 @@ from .stage_cache import stage_fingerprint
 
 
 _CUDA_STATUS: tuple[bool, str] | None = None
+_T = TypeVar("_T")
+_R = TypeVar("_R")
+
+
+def _ordered_thread_map(
+    function: Callable[[_T], _R],
+    items: Iterable[_T],
+    *,
+    max_workers: int,
+) -> Iterator[_R]:
+    """Run a bounded number of jobs while yielding results in input order.
+
+    ``Executor.map`` may allow completed image arrays to accumulate behind one
+    slow image.  Dense candidate precomputation holds several full-resolution
+    arrays per job, so keep at most one pending job per worker and release each
+    result before submitting another one.
+    """
+
+    worker_count = max(1, int(max_workers))
+    if worker_count == 1:
+        for item in items:
+            yield function(item)
+        return
+
+    iterator = iter(items)
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="cellvision-dense",
+    ) as executor:
+        pending: deque[Future[_R]] = deque()
+        for _ in range(worker_count):
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                break
+        while pending:
+            yield pending.popleft().result()
+            try:
+                pending.append(executor.submit(function, next(iterator)))
+            except StopIteration:
+                pass
 
 
 def _cuda_status() -> tuple[bool, str]:
@@ -822,51 +866,35 @@ def augment_candidates_with_dense_raw_proposals(
             rebuild_timepoints
         )
     ]
-    wall_geometry_rows: list[dict[str, Any]] = []
-    wall_geometry_lookup: dict[tuple[str, str], float] = {}
-    candidate_stage_wall_excluded = 0
-    wall_rescue_peaks_tested = 0
-    wall_rescue_arc_rejected = 0
-    wall_residual_peak_count = 0
-    for image_index, image in enumerate(
-        peak_images.itertuples(index=False), start=1
-    ):
-        key = (str(image.well), str(image.timepoint))
-        section_started = time.perf_counter()
+    peak_image_rows = list(peak_images.itertuples(index=False))
+    configured_cpu_workers = int(
+        settings.get(
+            "cpu_image_workers",
+            min(4, max(1, int(os.cpu_count() or 1) // 4)),
+        )
+    )
+    cpu_image_workers = (
+        max(1, min(configured_cpu_workers, len(peak_image_rows)))
+        if response_backend == "cpu" and peak_image_rows
+        else 1
+    )
+
+    def precompute_cpu_image(image: Any) -> dict[str, Any]:
+        image_timings: dict[str, float] = {}
+        image_started = time.perf_counter()
         with Image.open(image.raw_image_path) as opened:
             raw_full = np.asarray(opened.convert("L"), dtype=np.float32)
-        record_timing("raw_image_loading", section_started)
+        image_timings["raw_image_loading"] = time.perf_counter() - image_started
         full_height, full_width = raw_full.shape
-        section_started = time.perf_counter()
+        image_started = time.perf_counter()
         wall_inner_fraction = (
             detect_dynamic_wall_inner_fraction(raw_full, settings)
             if wall_mask_enabled
             else 0.47
         )
-        record_timing("dynamic_wall_detection", section_started)
-        wall_geometry_lookup[key] = wall_inner_fraction
-        wall_geometry_rows.append(
-            {
-                "well": key[0],
-                "timepoint": key[1],
-                "wall_inner_fraction": wall_inner_fraction,
-                "buffer_start_fraction": max(
-                    0.0, wall_inner_fraction - wall_buffer_width
-                ),
-            }
+        image_timings["dynamic_wall_detection"] = (
+            time.perf_counter() - image_started
         )
-        local_existing_frame = candidates[
-            (candidates["well"] == image.well)
-            & (candidates["timepoint"] == image.timepoint)
-        ]
-        local_existing_frame = local_existing_frame[
-            local_existing_frame["radial_fraction"].astype(float)
-            < wall_inner_fraction
-        ]
-        local_existing = local_existing_frame[["x_px", "y_px"]].to_numpy(float)
-        # Human points do not suppress an independent automatic response.  The
-        # occupied set contains only CF proposals that survive the wall gate.
-        occupied_tree = cKDTree(local_existing) if len(local_existing) else None
         well_radius = min(full_width, full_height) * wall_inner_fraction
         center_x, center_y = full_width / 2, full_height / 2
         filter_margin = max(
@@ -891,36 +919,157 @@ def augment_candidates_with_dense_raw_proposals(
         )
         raw = raw_full[roi_y0:roi_y1, roi_x0:roi_x1]
         fine_started = time.perf_counter()
-        try:
-            response, maxima, fine_info = _fine_response_and_maxima(
-                raw,
-                settings,
-                backend=response_backend,
-                minimum_distance=minimum_distance,
+        response, maxima, fine_info = _fine_response_and_maxima(
+            raw,
+            settings,
+            backend="cpu",
+            minimum_distance=minimum_distance,
+        )
+        return {
+            "image": image,
+            "raw_full": raw_full,
+            "full_height": full_height,
+            "full_width": full_width,
+            "wall_inner_fraction": wall_inner_fraction,
+            "center_x": center_x,
+            "center_y": center_y,
+            "roi_x0": roi_x0,
+            "roi_y0": roi_y0,
+            "response": response,
+            "maxima": maxima,
+            "fine_info": fine_info,
+            "fine_wall_elapsed": time.perf_counter() - fine_started,
+            "timings": image_timings,
+        }
+
+    parallel_precomputed: Iterator[dict[str, Any]] | None = None
+    if cpu_image_workers > 1:
+        parallel_precomputed = _ordered_thread_map(
+            precompute_cpu_image,
+            peak_image_rows,
+            max_workers=cpu_image_workers,
+        )
+    wall_geometry_rows: list[dict[str, Any]] = []
+    wall_geometry_lookup: dict[tuple[str, str], float] = {}
+    candidate_stage_wall_excluded = 0
+    wall_rescue_peaks_tested = 0
+    wall_rescue_arc_rejected = 0
+    wall_residual_peak_count = 0
+    for image_index, image in enumerate(peak_image_rows, start=1):
+        key = (str(image.well), str(image.timepoint))
+        if parallel_precomputed is not None:
+            precomputed = next(parallel_precomputed)
+            if precomputed["image"] is not image:
+                raise RuntimeError("Dense image precomputation order changed")
+            raw_full = precomputed["raw_full"]
+            full_height = int(precomputed["full_height"])
+            full_width = int(precomputed["full_width"])
+            wall_inner_fraction = float(precomputed["wall_inner_fraction"])
+            center_x = float(precomputed["center_x"])
+            center_y = float(precomputed["center_y"])
+            roi_x0 = int(precomputed["roi_x0"])
+            roi_y0 = int(precomputed["roi_y0"])
+            response = precomputed["response"]
+            maxima = precomputed["maxima"]
+            fine_info = precomputed["fine_info"]
+            fine_wall_elapsed = float(precomputed["fine_wall_elapsed"])
+            for timing_name, timing_value in precomputed["timings"].items():
+                timings[timing_name] = timings.get(timing_name, 0.0) + float(
+                    timing_value
+                )
+        else:
+            section_started = time.perf_counter()
+            with Image.open(image.raw_image_path) as opened:
+                raw_full = np.asarray(opened.convert("L"), dtype=np.float32)
+            record_timing("raw_image_loading", section_started)
+            full_height, full_width = raw_full.shape
+            section_started = time.perf_counter()
+            wall_inner_fraction = (
+                detect_dynamic_wall_inner_fraction(raw_full, settings)
+                if wall_mask_enabled
+                else 0.47
             )
-        except Exception as exc:
-            if response_backend != "cuda":
-                raise
-            # A CUDA driver, context, or memory failure should not abort a
-            # long plate run.  Disable CUDA for the remainder of this stage
-            # and recompute the current ROI with the deterministic CPU path.
-            cuda_runtime_fallback_count += 1
-            cuda_runtime_fallback_detail = (
-                f"{type(exc).__name__}: {exc}"
+            record_timing("dynamic_wall_detection", section_started)
+        wall_geometry_lookup[key] = wall_inner_fraction
+        wall_geometry_rows.append(
+            {
+                "well": key[0],
+                "timepoint": key[1],
+                "wall_inner_fraction": wall_inner_fraction,
+                "buffer_start_fraction": max(
+                    0.0, wall_inner_fraction - wall_buffer_width
+                ),
+            }
+        )
+        local_existing_frame = candidates[
+            (candidates["well"] == image.well)
+            & (candidates["timepoint"] == image.timepoint)
+        ]
+        local_existing_frame = local_existing_frame[
+            local_existing_frame["radial_fraction"].astype(float)
+            < wall_inner_fraction
+        ]
+        local_existing = local_existing_frame[["x_px", "y_px"]].to_numpy(float)
+        # Human points do not suppress an independent automatic response.  The
+        # occupied set contains only CF proposals that survive the wall gate.
+        occupied_tree = cKDTree(local_existing) if len(local_existing) else None
+        if parallel_precomputed is None:
+            well_radius = min(full_width, full_height) * wall_inner_fraction
+            center_x, center_y = full_width / 2, full_height / 2
+            filter_margin = max(
+                36,
+                int(
+                    np.ceil(
+                        float(settings.get("wall_rescue_width_fraction", 0.03))
+                        * min(full_width, full_height)
+                    )
+                )
+                + 16,
             )
-            _CUDA_STATUS = (False, "runtime_failure_cpu_fallback")
-            response_backend = "cpu"
-            response_backend_detail = (
-                "cuda_runtime_failure_cpu_fallback:"
-                f"{type(exc).__name__}"
+            roi_x0 = max(
+                0, int(np.floor(center_x - well_radius)) - filter_margin
             )
-            response, maxima, fine_info = _fine_response_and_maxima(
-                raw,
-                settings,
-                backend="cpu",
-                minimum_distance=minimum_distance,
+            roi_y0 = max(
+                0, int(np.floor(center_y - well_radius)) - filter_margin
             )
-        fine_wall_elapsed = time.perf_counter() - fine_started
+            roi_x1 = min(
+                full_width,
+                int(np.ceil(center_x + well_radius)) + filter_margin,
+            )
+            roi_y1 = min(
+                full_height,
+                int(np.ceil(center_y + well_radius)) + filter_margin,
+            )
+            raw = raw_full[roi_y0:roi_y1, roi_x0:roi_x1]
+            fine_started = time.perf_counter()
+            try:
+                response, maxima, fine_info = _fine_response_and_maxima(
+                    raw,
+                    settings,
+                    backend=response_backend,
+                    minimum_distance=minimum_distance,
+                )
+            except Exception as exc:
+                if response_backend != "cuda":
+                    raise
+                # A CUDA driver, context, or memory failure should not abort a
+                # long plate run.  Disable CUDA for the remainder of this stage
+                # and recompute the current ROI with the deterministic CPU path.
+                cuda_runtime_fallback_count += 1
+                cuda_runtime_fallback_detail = f"{type(exc).__name__}: {exc}"
+                _CUDA_STATUS = (False, "runtime_failure_cpu_fallback")
+                response_backend = "cpu"
+                response_backend_detail = (
+                    "cuda_runtime_failure_cpu_fallback:"
+                    f"{type(exc).__name__}"
+                )
+                response, maxima, fine_info = _fine_response_and_maxima(
+                    raw,
+                    settings,
+                    backend="cpu",
+                    minimum_distance=minimum_distance,
+                )
+            fine_wall_elapsed = time.perf_counter() - fine_started
         # The helper reports the response and local-maxima portions separately.
         fine_response_seconds += float(fine_info.get("fine_response_seconds", 0.0))
         fine_local_maxima_seconds += float(
@@ -1311,6 +1460,7 @@ def augment_candidates_with_dense_raw_proposals(
         "cache_hit": False,
         "response_backend": response_backend,
         "response_backend_detail": response_backend_detail,
+        "cpu_image_workers": cpu_image_workers,
         "cuda_runtime_fallback_count": cuda_runtime_fallback_count,
         "cuda_runtime_fallback_detail": cuda_runtime_fallback_detail,
         "fine_response_seconds": round(fine_response_seconds, 3),

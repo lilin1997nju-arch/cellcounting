@@ -43,7 +43,10 @@ def load_production_environment(root: Path) -> dict[str, str]:
 
 
 def production_command(root: Path, values: dict[str, str]) -> list[str]:
-    python = root / ".venv-production" / "Scripts" / "python.exe"
+    configured_python = values.get("CELLVISION_PYTHON", "").strip()
+    python = Path(configured_python) if configured_python else (
+        root / ".venv-production" / "Scripts" / "python.exe"
+    )
     manifest = values.get("CELLVISION_MANIFEST", "")
     if not python.is_file():
         raise RuntimeError(f"Production Python is missing: {python}")

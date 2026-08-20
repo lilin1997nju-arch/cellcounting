@@ -20,6 +20,10 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     }
 }
 $InstallRoot = [IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($InstallRoot))
+$installVolumeRoot = [IO.Path]::GetPathRoot($InstallRoot)
+if ([string]::Equals($InstallRoot, $installVolumeRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw "The installation directory cannot be a drive root. Choose a folder such as $installVolumeRoot`CellVision."
+}
 $releasePath = Join-Path $packageRoot "RELEASE.json"
 $hashPath = Join-Path $packageRoot "SHA256SUMS.txt"
 foreach ($required in @($releasePath, $hashPath, (Join-Path $packageRoot "Application"), (Join-Path $packageRoot "ModelBundle"), (Join-Path $packageRoot "wheelhouse"))) {
@@ -55,7 +59,12 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $installParent = Split-Path -Parent $InstallRoot
-New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+if ([string]::IsNullOrWhiteSpace($installParent)) {
+    throw "Unable to determine the parent directory of the installation path: $InstallRoot"
+}
+if (-not (Test-Path -LiteralPath $installParent -PathType Container)) {
+    New-Item -ItemType Directory -Force -Path $installParent | Out-Null
+}
 $existingService = Get-Service -Name "CellVisionProduction" -ErrorAction SilentlyContinue
 if ($null -ne $existingService) {
     Write-Host "Stopping the existing Cell Vision production service ..." -ForegroundColor DarkYellow
@@ -100,18 +109,40 @@ try {
 
 $runtimeRoot = Join-Path $InstallRoot "Python312"
 $python = Join-Path $runtimeRoot "python.exe"
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
+function Test-BundledPythonRuntime {
+    param([Parameter(Mandatory = $true)][string]$PythonPath)
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) { return $false }
+    & $PythonPath -c "import encodings, pip, ssl, sys; raise SystemExit(0 if sys.version_info[:2] == (3, 12) else 1)" *> $null
+    return $LASTEXITCODE -eq 0
+}
+
+if (-not (Test-BundledPythonRuntime -PythonPath $python)) {
+    if (Test-Path -LiteralPath $runtimeRoot) {
+        Write-Host "Removing an incomplete bundled Python runtime ..." -ForegroundColor DarkYellow
+        Remove-Item -LiteralPath $runtimeRoot -Recurse -Force
+    }
     $installer = Get-ChildItem -LiteralPath (Join-Path $packageRoot "runtime") -Filter "python-3.12.*-amd64.exe" -File | Select-Object -First 1
     if ($null -eq $installer) { throw "Bundled Python 3.12 installer is missing." }
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $runtimeRoot) | Out-Null
+    $installerLogRoot = Join-Path $env:ProgramData "CellVision\InstallerLogs"
+    New-Item -ItemType Directory -Force -Path $installerLogRoot | Out-Null
+    $pythonInstallerLog = Join-Path $installerLogRoot ("python-runtime-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
     Write-Host "Installing bundled Python runtime ..." -ForegroundColor Cyan
-    $process = Start-Process -FilePath $installer.FullName -ArgumentList @(
+    $installerArguments = @(
         "/quiet", "InstallAllUsers=1", "PrependPath=0", "Include_launcher=0",
-        "Include_test=0", "Include_doc=0", "Include_pip=1", "TargetDir=$runtimeRoot"
-    ) -Wait -PassThru -WindowStyle Hidden
-    if ($process.ExitCode -ne 0) { throw "Python installer failed with exit code $($process.ExitCode)." }
+        "Include_test=0", "Include_doc=0", "Include_dev=0", "Include_tcltk=0",
+        "Include_symbols=0", "Include_debug=0", "Include_pip=1",
+        "TargetDir=$runtimeRoot", "/log", $pythonInstallerLog
+    )
+    & $installer.FullName @installerArguments
+    $pythonInstallerExitCode = $LASTEXITCODE
+    if ($pythonInstallerExitCode -ne 0) {
+        throw "Python installer failed with exit code $pythonInstallerExitCode. Log: $pythonInstallerLog"
+    }
 }
-if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw "Bundled Python runtime was not installed: $python" }
+if (-not (Test-BundledPythonRuntime -PythonPath $python)) {
+    throw "Bundled Python runtime is incomplete after installation: $python"
+}
 
 $serviceRequirements = Join-Path $InstallRoot "requirements-windows-service.txt"
 if (-not (Test-Path -LiteralPath $serviceRequirements -PathType Leaf)) {

@@ -189,6 +189,14 @@ $installButton.Add_Click({
         $script:selectedInstallRoot = [IO.Path]::GetFullPath(
             [Environment]::ExpandEnvironmentVariables($pathText.Text.Trim())
         )
+        $selectedVolumeRoot = [IO.Path]::GetPathRoot($script:selectedInstallRoot)
+        if ([string]::Equals(
+            $script:selectedInstallRoot,
+            $selectedVolumeRoot,
+            [StringComparison]::OrdinalIgnoreCase
+        )) {
+            throw "不能直接安装到盘符根目录。请选择其下的文件夹，例如 $selectedVolumeRoot`CellVision。"
+        }
         if (Test-Path -LiteralPath $script:selectedInstallRoot) {
             $answer = [Windows.Forms.MessageBox]::Show(
                 "安装目录已经存在。继续安装将更新该目录中的程序文件。是否继续？`n`n$script:selectedInstallRoot",

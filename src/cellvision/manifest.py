@@ -48,9 +48,19 @@ def _find_session(day_dir: Path) -> Path | None:
     # (the timestamped directory containing A1.tif), not only at a date
     # directory.  Check the supplied path itself before recursing so explicit
     # session manifests cannot be silently dropped.
-    if day_dir.is_dir() and (day_dir / "A1.tif").exists():
+    def contains_raw_well_image(path: Path) -> bool:
+        return any(
+            candidate.is_file() and WELL_RE.fullmatch(candidate.stem.upper())
+            for candidate in path.glob("*.tif")
+        )
+
+    if day_dir.is_dir() and contains_raw_well_image(day_dir):
         return day_dir
-    candidates = [path for path in day_dir.rglob("*") if path.is_dir() and (path / "A1.tif").exists()]
+    candidates = [
+        path
+        for path in day_dir.rglob("*")
+        if path.is_dir() and contains_raw_well_image(path)
+    ]
     return sorted(candidates)[0] if candidates else None
 
 

@@ -16,10 +16,20 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "git_commit" in builder
     assert "RELEASE_GIT_COMMIT.txt" in builder
     assert "SHA256SUMS.txt" in builder
-    assert "python-$PythonVersion-amd64.exe" in builder
+    assert "prepare_portable_production_runtime.ps1" in builder
+    assert 'deployment_mode = "portable-folder"' in builder
+    assert 'application_directory = "Application"' in builder
+    assert 'workspace_directory = "Workspace"' in builder
+    assert 'Join-Path $application "ModelBundle"' in builder
+    assert 'Join-Path $releaseRoot "Workspace"' in builder
+    assert '"Configure-CellVision-Service.cmd"' in builder
+    assert '"Disable-CellVision-Autostart.cmd"' in builder
+    assert '"Open-CellVision.cmd"' in builder
+    assert "python-$PythonVersion-amd64.exe" not in builder
     assert '"torch==2.11.0"' in builder
     assert '"torchvision==0.26.0"' in builder
-    assert "Reusing offline runtime assets from" in builder
+    assert "Reusing prepared portable runtime from" in builder
+    assert "Reusing offline wheel assets from" in builder
     assert "Refreshing only missing or changed wheels" in builder
     assert "$fallbackAssetSource" in builder
     assert "runtime_assets_reused_from" in builder
@@ -42,6 +52,16 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert 'GetFolderPath("CommonDesktopDirectory")' in installer
     assert 'install_production_service.ps1' in installer
     assert "InstallAllUsers=1" in installer
+    assert "Test-BundledPythonRuntime" in installer
+    assert "import encodings, pip, ssl, sys" in installer
+    assert '"Include_dev=0"' in installer
+    assert '"Include_tcltk=0"' in installer
+    assert '"Include_symbols=0"' in installer
+    assert '"Include_debug=0"' in installer
+    assert "Removing an incomplete bundled Python runtime" in installer
+    assert 'Join-Path $env:ProgramData "CellVision\\InstallerLogs"' in installer
+    assert "Test-Path -LiteralPath $installParent -PathType Container" in installer
+    assert "The installation directory cannot be a drive root" in installer
     assert "requirements-windows-service.txt" in builder
     assert "launch_installer.ps1" in launcher
     assert "-Verb RunAs" in elevation
@@ -52,6 +72,7 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "INSTALL_UI_SMOKE_OK" in install_ui
     assert '"-InstallRoot", $script:selectedInstallRoot' in install_ui
     assert '"-StartAfterInstall"' in install_ui
+    assert "不能直接安装到盘符根目录" in install_ui
 
 
 def test_single_file_windows_installer_wraps_existing_gui_release():
@@ -62,6 +83,9 @@ def test_single_file_windows_installer_wraps_existing_gui_release():
     assert 'Copy-Item -LiteralPath $archivePath -Destination (Join-Path $workingRoot "payload.zip")' in builder
     assert 'AppLaunched=cmd.exe /d /c bootstrap.cmd' in builder
     assert 'Expand-Archive -LiteralPath $payload' in builder
+    assert 'Get-ChildItem -LiteralPath $extractRoot -Directory' in builder
+    assert '-Filter "__LAUNCHER__" -File -Recurse' not in builder
+    assert 'exactly one top-level __LAUNCHER__' in builder
     assert 'SINGLE_FILE_INSTALLER_VALIDATION_OK' in builder
 
 
@@ -76,3 +100,41 @@ def test_offline_setup_uses_no_index_and_three_model_contract():
         assert "multiplicity_classifier.pt" in script
         assert "latest_instance_segmenter.pt" in script
         assert "latest_temporal_evidence.pt" not in script
+
+
+def test_portable_production_layout_keeps_application_and_workspace_together():
+    configure = (ROOT / "deploy" / "portable" / "configure_service.ps1").read_text(encoding="utf-8")
+    configure_launcher = (ROOT / "deploy" / "portable" / "configure_service_launcher.ps1").read_text(encoding="utf-8")
+    launcher = (ROOT / "deploy" / "portable" / "Open-CellVision.cmd").read_text(encoding="utf-8")
+    disable_autostart = (ROOT / "deploy" / "portable" / "disable_service_autostart.ps1").read_text(encoding="utf-8")
+    prepare = (ROOT / "scripts" / "prepare_portable_production_runtime.ps1").read_text(encoding="utf-8")
+    setup = (ROOT / "scripts" / "setup_production.ps1").read_text(encoding="utf-8")
+
+    assert 'Join-Path $deploymentRoot "Application"' in configure
+    assert 'Join-Path $deploymentRoot "Workspace"' in configure
+    assert 'Join-Path $workspaceRoot "Projects"' in configure
+    assert "*S-1-5-11:(OI)(CI)M" in configure
+    assert "/inheritance:e /grant" in configure
+    assert "/T /C" not in configure
+    assert "readiness can take up to 90 seconds" in configure
+    assert "PORTABLE_SERVICE_CONFIGURATION_VALIDATION_OK" in configure
+    assert "pywin32_postinstall" not in configure
+    assert 'Join-Path $applicationRoot "Python312\\pythonservice.exe"' in configure
+    assert 'Join-Path $env:LOCALAPPDATA "CellVisionInstallerLogs"' in configure_launcher
+    assert "Start-Transcript" in configure_launcher
+    assert "%~dp0Application\\Python312\\python.exe" in launcher
+    assert "www.nuget.org/api/v2/package/python" in prepare
+    assert "cellvision-portable.pth" in prepare
+    assert 'Join-Path $runtime "pythonservice.exe"' in prepare
+    assert 'Filter "pywintypes*.dll"' in prepare
+    assert "UseBasePythonRuntime" in setup
+    assert "SkipDependencyInstall" in setup
+    assert 'if (-not $SkipDependencyInstall -and -not $Offline' in setup
+    assert "Text.UTF8Encoding($false)" in setup
+    assert "Normalized legacy UTF-8 BOM in project manifest" in setup
+    assert 'Set-Content -LiteralPath $Manifest -Encoding UTF8' not in setup
+    assert '$env:PIP_NO_INDEX = "1"' in configure
+    assert "start= demand" in disable_autostart
+    assert 'StartMode -ne "Manual"' in disable_autostart
+    assert "was not stopped" in disable_autostart
+    assert "DISABLE_AUTOSTART_SCRIPT_VALIDATION_OK" in disable_autostart

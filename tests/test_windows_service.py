@@ -39,3 +39,17 @@ def test_machine_service_installer_sets_delayed_start_and_recovery():
     assert "sc.exe failure" in installer
     assert 'Get-Service -Name $serviceName' in installer
     assert "win32serviceutil.HandleCommandLine" in manager
+
+
+def test_service_uses_explicit_portable_python_from_environment(tmp_path: Path):
+    python = tmp_path / "Application" / "Python312" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.touch()
+    values = {
+        "CELLVISION_PYTHON": str(python),
+        "CELLVISION_MANIFEST": str(tmp_path / "Workspace" / "Projects" / "active" / "project.json"),
+    }
+
+    command = production_command(tmp_path / "Application", values)
+
+    assert command[0] == str(python)

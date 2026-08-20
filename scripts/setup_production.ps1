@@ -32,6 +32,8 @@ param(
     [switch]$AllowRemote,
     [switch]$SkipModelCheck,
     [switch]$ForceRecreate,
+    [switch]$UseBasePythonRuntime,
+    [switch]$SkipDependencyInstall,
     [switch]$StartAfterSetup
 )
 
@@ -206,26 +208,32 @@ if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) {
     throw "Base Python executable not found: $basePython"
 }
 $venvRoot = Join-Path $InstallRoot ".venv-production"
-if ($ForceRecreate -and (Test-Path -LiteralPath $venvRoot)) {
-    $resolvedVenv = [IO.Path]::GetFullPath($venvRoot)
-    $resolvedInstall = [IO.Path]::GetFullPath($InstallRoot)
-    if ($resolvedVenv -ne (Join-Path $resolvedInstall ".venv-production")) {
-        throw "Refusing to recreate an unexpected virtual-environment path: $resolvedVenv"
+if ($UseBasePythonRuntime) {
+    $script:PythonPath = $basePython
+} else {
+    if ($ForceRecreate -and (Test-Path -LiteralPath $venvRoot)) {
+        $resolvedVenv = [IO.Path]::GetFullPath($venvRoot)
+        $resolvedInstall = [IO.Path]::GetFullPath($InstallRoot)
+        if ($resolvedVenv -ne (Join-Path $resolvedInstall ".venv-production")) {
+            throw "Refusing to recreate an unexpected virtual-environment path: $resolvedVenv"
+        }
+        Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
     }
-    Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
+    if (-not (Test-Path -LiteralPath (Join-Path $venvRoot "Scripts\python.exe") -PathType Leaf)) {
+        Write-Host "Creating production virtual environment: $venvRoot" -ForegroundColor Cyan
+        & $basePython -m venv $venvRoot
+        if ($LASTEXITCODE -ne 0) { throw "Unable to create the production virtual environment." }
+    }
+    $script:PythonPath = Join-Path $venvRoot "Scripts\python.exe"
 }
-if (-not (Test-Path -LiteralPath (Join-Path $venvRoot "Scripts\python.exe") -PathType Leaf)) {
-    Write-Host "Creating production virtual environment: $venvRoot" -ForegroundColor Cyan
-    & $basePython -m venv $venvRoot
-    if ($LASTEXITCODE -ne 0) { throw "Unable to create the production virtual environment." }
-}
-$script:PythonPath = Join-Path $venvRoot "Scripts\python.exe"
 
-Write-Host "Installing base Python tooling ..." -ForegroundColor Cyan
 $pipSource = if ($Offline) { @("--no-index", "--find-links", $Wheelhouse) } else { @() }
-Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("pip", "setuptools", "wheel"))
-Write-Host "Installing production runtime dependencies ..." -ForegroundColor Cyan
-Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("-r", (Join-Path $InstallRoot "requirements-production.txt")))
+if (-not $SkipDependencyInstall) {
+    Write-Host "Installing base Python tooling ..." -ForegroundColor Cyan
+    Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("pip", "setuptools", "wheel"))
+    Write-Host "Installing production runtime dependencies ..." -ForegroundColor Cyan
+    Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("-r", (Join-Path $InstallRoot "requirements-production.txt")))
+}
 
 $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $nvidiaUsable = $false
@@ -241,7 +249,10 @@ $tryCuda = ($Device -eq "cuda") -or ($Device -eq "auto" -and $nvidiaPresent)
 $runtime = $null
 $installedWheel = "cpu"
 
-if ($Offline) {
+if ($SkipDependencyInstall) {
+    $runtime = Get-RuntimeInfo -RequestedDevice $Device
+    $installedWheel = if ([string]$runtime.torch_version -match "\+(.+)$") { $matches[1] } else { "cpu" }
+} elseif ($Offline) {
     Install-TorchWheel -IndexName "offline"
     Install-ProjectEditable
     $runtime = Get-RuntimeInfo -RequestedDevice $Device
@@ -264,7 +275,7 @@ if ($Offline) {
     }
 }
 
-if (-not $Offline -and ($null -eq $runtime -or $runtime.selected_device -ne "cuda")) {
+if (-not $SkipDependencyInstall -and -not $Offline -and ($null -eq $runtime -or $runtime.selected_device -ne "cuda")) {
     Install-TorchWheel -IndexName "cpu"
     Install-TorchSupport
     Install-ProjectEditable
@@ -290,10 +301,28 @@ if (-not (Test-Path -LiteralPath $Manifest -PathType Leaf)) {
         root = $DataRoot
         status = "ready"
         plates = @()
+        system_placeholder = $true
         created_at = (Get-Date).ToUniversalTime().ToString("o")
     }
-    $scaffold | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Manifest -Encoding UTF8
+    $scaffoldJson = $scaffold | ConvertTo-Json -Depth 8
+    [IO.File]::WriteAllText(
+        $Manifest,
+        $scaffoldJson + [Environment]::NewLine,
+        (New-Object Text.UTF8Encoding($false))
+    )
     Write-Host "Created empty project manifest: $Manifest" -ForegroundColor DarkGray
+}
+
+# Windows PowerShell 5.1 writes a UTF-8 BOM when Set-Content -Encoding UTF8 is
+# used. Python's strict JSON loader rejects that prefix, so transparently
+# normalize manifests produced by older Cell Vision setup scripts.
+$manifestBytes = [IO.File]::ReadAllBytes($Manifest)
+if ($manifestBytes.Length -ge 3 -and $manifestBytes[0] -eq 0xEF -and `
+    $manifestBytes[1] -eq 0xBB -and $manifestBytes[2] -eq 0xBF) {
+    $normalizedBytes = New-Object byte[] ($manifestBytes.Length - 3)
+    [Array]::Copy($manifestBytes, 3, $normalizedBytes, 0, $normalizedBytes.Length)
+    [IO.File]::WriteAllBytes($Manifest, $normalizedBytes)
+    Write-Host "Normalized legacy UTF-8 BOM in project manifest: $Manifest" -ForegroundColor DarkGray
 }
 
 $envPath = Join-Path $InstallRoot ".env.production"
@@ -313,6 +342,7 @@ CELLVISION_SHARED_MODEL_ROOT=$(Convert-ToEnvPath $ModelRoot)
 CELLVISION_SOURCE_ARTIFACTS=$(Convert-ToEnvPath $ModelRoot)
 CELLVISION_DB_ROOT=$(Convert-ToEnvPath $DbRoot)
 CELLVISION_LOG_ROOT=$(Convert-ToEnvPath $LogRoot)
+CELLVISION_PYTHON=$(Convert-ToEnvPath $script:PythonPath)
 CELLVISION_MANIFEST=$(Convert-ToEnvPath $Manifest)
 CELLVISION_HOST=$BindHost
 CELLVISION_PORT=$Port
@@ -325,7 +355,7 @@ CELLVISION_TORCH_WHEEL=$installedWheel
 
 Write-Host "" 
 Write-Host "Cell Vision production environment is ready." -ForegroundColor Green
-Write-Host "  Python:       $PythonPath"
+Write-Host "  Python:       $script:PythonPath"
 Write-Host "  PyTorch wheel: $installedWheel"
 Write-Host "  Runtime:      $($runtime.label)"
 Write-Host "  Models:       $ModelRoot"

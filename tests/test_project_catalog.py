@@ -131,3 +131,34 @@ def test_catalog_task_progress_is_queryable(tmp_path: Path):
             "SELECT status, current_stage, progress_percent, elapsed_seconds FROM plates WHERE plate_id='demo:plate-1'"
         ).fetchone()
     assert plate == ("running", "v2_temporal_evidence", 50.0, 12.5)
+
+
+def test_catalog_hides_system_placeholder_and_reports_detection_dates(tmp_path: Path):
+    collection = tmp_path / "projects"
+    placeholder = collection / "active" / "project.json"
+    placeholder.parent.mkdir(parents=True)
+    placeholder.write_text(json.dumps({
+        "project_id": "active",
+        "project_name": "Cell Vision Production",
+        "system_placeholder": True,
+        "plates": [],
+    }), encoding="utf-8")
+    project = collection / "real" / "project.json"
+    project.parent.mkdir(parents=True)
+    project.write_text(json.dumps({
+        "project_id": "real",
+        "project_name": "Real project",
+        "detection_start_date": "2026-06-23",
+        "detection_end_date": "2026-07-07",
+        "plates": [],
+    }), encoding="utf-8")
+    catalog = ProjectCatalog(collection / "project_catalog.sqlite")
+
+    assert catalog.sync_manifest(placeholder, force=True) is None
+    catalog.sync_manifest(project, force=True)
+    result = catalog.list_projects()
+
+    assert result["total"] == 1
+    assert [item["project_id"] for item in result["items"]] == ["real"]
+    assert result["items"][0]["detection_start_date"] == "2026-06-23"
+    assert result["items"][0]["detection_end_date"] == "2026-07-07"
