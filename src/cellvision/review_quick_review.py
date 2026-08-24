@@ -54,6 +54,53 @@ V3_TRACK_REVIEW_LABELS = {
     "unmarked",
 }
 
+CELL_UNIT_WEIGHTS = {
+    "single": 1,
+    "touching_doublet": 2,
+    "cluster_3plus": 3,
+}
+
+
+def _quick_review_filter_metrics(
+    local: pd.DataFrame,
+    screening: dict[str, Any],
+    report: dict[str, Any],
+) -> dict[str, Any]:
+    """Build the well-level values used by the pre-review filter UI."""
+
+    labels = local["final_review_label"].fillna(local["current_label"])
+    t2_mask = local["timepoint"].astype(str).str.upper().eq("T2")
+    t2_labels = labels[t2_mask]
+    calculated_cells = int(
+        sum(CELL_UNIT_WEIGHTS.get(str(label), 0) for label in t2_labels)
+    )
+    try:
+        screening_cells = float(screening.get("t2_cell_units"))
+    except (TypeError, ValueError):
+        screening_cells = float("nan")
+    day2_cell_count = (
+        calculated_cells if not np.isfinite(screening_cells) else int(round(screening_cells))
+    )
+    raw_coverage = report.get(
+        "day14_sheet_coverage_pct",
+        report.get("endpoint_sheet_coverage_pct"),
+    )
+    try:
+        endpoint_coverage = float(raw_coverage)
+    except (TypeError, ValueError):
+        endpoint_coverage = None
+    if endpoint_coverage is not None and not np.isfinite(endpoint_coverage):
+        endpoint_coverage = None
+    manual_decision = str(screening.get("review_decision", "unclassified")).lower()
+    if manual_decision not in {"approved", "pending", "rejected", "unclassified"}:
+        manual_decision = "unclassified"
+    return {
+        "endpoint_coverage_pct": endpoint_coverage,
+        "day2_cell_count": day2_cell_count,
+        "day2_debris_count": int(t2_labels.eq("debris").sum()),
+        "manual_review_decision": manual_decision,
+    }
+
 
 def build_quick_review_service(
     config: dict[str, Any],
@@ -304,6 +351,16 @@ def build_quick_review_service(
                 for row in screening_frame.itertuples(index=False)
             }
         report_lookup = gated_lookup()
+        try:
+            with sqlite3.connect(database) as connection:
+                manual_decision_lookup = {
+                    str(well).upper(): str(decision).lower()
+                    for well, decision in connection.execute(
+                        "SELECT well, decision FROM well_screening_reviews"
+                    ).fetchall()
+                }
+        except sqlite3.Error:
+            manual_decision_lookup = {}
         rows: list[dict[str, Any]] = []
         for well, local in frame.groupby("well", sort=False):
             reviewed = int(local["reviewed_label"].notna().sum())
@@ -317,12 +374,16 @@ def build_quick_review_service(
             v3_cell_to_debris = local[
                 local["v3_track_behavior"].astype(str).eq("cell_to_debris")
             ]
-            screening = screening_lookup.get(str(well).upper(), {})
+            screening = dict(screening_lookup.get(str(well).upper(), {}))
+            screening["review_decision"] = manual_decision_lookup.get(
+                str(well).upper(), "unclassified"
+            )
             report = report_lookup.get(str(well).upper(), {})
             status = ui_screening_status(
                 report,
                 str(screening.get("screening_status", "ambiguous")),
             )
+            filter_metrics = _quick_review_filter_metrics(local, screening, report)
             rows.append(
                 {
                     "well": str(well),
@@ -379,6 +440,7 @@ def build_quick_review_service(
                     "report_category_label": ui_screening_status_label(status),
                     "report_reason": report.get("undetermined_reason"),
                     "report_reason_label": report.get("undetermined_reason_label"),
+                    **filter_metrics,
                 }
             )
         if mode == "pending":
@@ -811,6 +873,17 @@ def register_quick_review_routes(
                     roi = json.loads(str(screening.get("roi_json", "{}")))
                 except json.JSONDecodeError:
                     roi = {}
+        try:
+            with sqlite3.connect(database) as connection:
+                saved_decision = connection.execute(
+                    "SELECT decision FROM well_screening_reviews WHERE well = ?",
+                    (normalized_well,),
+                ).fetchone()
+        except sqlite3.Error:
+            saved_decision = None
+        screening["review_decision"] = (
+            str(saved_decision[0]).lower() if saved_decision else "unclassified"
+        )
         report = gated_lookup().get(normalized_well, {})
         display_names = config.get("review", {}).get(
             "timepoint_display_names",
@@ -1077,6 +1150,37 @@ def register_quick_review_routes(
                     }
                 )
         search_hints: list[dict[str, Any]] = []
+        try:
+            with sqlite3.connect(database) as connection:
+                count_override_rows = connection.execute(
+                    """
+                    SELECT timepoint, cell_count
+                    FROM well_timepoint_cell_count_reviews
+                    WHERE well = ?
+                    """,
+                    (normalized_well,),
+                ).fetchall()
+        except sqlite3.Error:
+            count_override_rows = []
+        count_overrides = {
+            str(timepoint).upper(): max(0, int(cell_count))
+            for timepoint, cell_count in count_override_rows
+        }
+        cell_count_totals: dict[str, dict[str, Any]] = {}
+        final_labels = local["final_review_label"].fillna(local["current_label"])
+        for timepoint in ("T0", "T1", "T2"):
+            selected_labels = final_labels[
+                local["timepoint"].astype(str).str.upper().eq(timepoint)
+            ]
+            automatic_count = int(
+                sum(CELL_UNIT_WEIGHTS.get(str(label), 0) for label in selected_labels)
+            )
+            override = count_overrides.get(timepoint)
+            cell_count_totals[timepoint] = {
+                "automatic_count": automatic_count,
+                "cell_count": automatic_count if override is None else override,
+                "source": "automatic" if override is None else "human",
+            }
         return {
             "round_id": str(local.iloc[0]["integrated_round_id"]),
             "well": normalized_well,
@@ -1088,6 +1192,7 @@ def register_quick_review_routes(
             ),
             "v3_tracks": v3_tracks,
             "search_hints": search_hints,
+            "cell_count_totals": cell_count_totals,
             "screening": {
                 key: (None if pd.isna(value) else value)
                 for key, value in screening.items()

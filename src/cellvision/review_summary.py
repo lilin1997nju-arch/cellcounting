@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SUMMARY_VERSION = 2  # bump: review matching is now cross-round (candidate_id/track_id); v1 undercounted reviewed progress
+SUMMARY_VERSION = 3  # bump: well rows now include pre-review filter metrics and manual verdicts
 SUMMARY_FILENAME = "quick_review_summary.json"
 PREDICTION_FILENAMES = (
     "latest_integrated_predictions.csv",

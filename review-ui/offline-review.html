@@ -5,6 +5,12 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>CellVision 离线审核</title>
   <link rel="stylesheet" href="assets/offline-review.css">
+  <style>
+    .frame h3{display:flex;align-items:center;justify-content:space-between;gap:8px}
+    .cell-total{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:400;color:#52686d}
+    .cell-total strong{color:#087b70;font-size:15px}.cell-total em{font-size:9px;font-style:normal;color:#7b621e}
+    .cell-total button{padding:2px 6px;border-radius:4px;font-size:11px}.cell-total .cell-total-reset{border-style:dashed}
+  </style>
 </head>
 <body>
   <header>
@@ -27,11 +33,12 @@
       <div class="well-header">
         <div><small id="plateLabel"></small><h2 id="wellTitle">请选择孔</h2><p id="modelConclusion"></p></div>
         <div class="well-actions">
-          <label>孔审核状态
+          <label>人工判定（Q/W/E）
             <select id="screeningDecision">
-              <option value="pending">待审核</option>
-              <option value="approved">认可模型结论</option>
-              <option value="rejected">否决模型结论</option>
+              <option value="unclassified">未判定</option>
+              <option value="approved">合格</option>
+              <option value="pending">待定</option>
+              <option value="rejected">排除</option>
             </select>
           </label>
           <button id="completeButton">标记本孔完成</button>

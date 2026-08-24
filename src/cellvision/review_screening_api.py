@@ -10,8 +10,16 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException
 
 from .config import artifact_path
-from .review_payloads import LateGrowthReviewPayload, WellScreeningReviewPayload
-from .well_screening import build_well_screening, save_late_growth_review
+from .review_payloads import (
+    LateGrowthReviewPayload,
+    TimepointCellCountReviewPayload,
+    WellScreeningReviewPayload,
+)
+from .well_screening import (
+    build_well_screening,
+    ensure_well_timepoint_cell_count_review_table,
+    save_late_growth_review,
+)
 
 
 def register_screening_routes(
@@ -88,7 +96,7 @@ def register_screening_routes(
     def screening_review(
         payload: WellScreeningReviewPayload,
     ) -> dict[str, Any]:
-        if payload.decision not in {"approved", "rejected", "pending"}:
+        if payload.decision not in {"approved", "rejected", "pending", "unclassified"}:
             raise HTTPException(status_code=422, detail="Invalid screening decision")
         well = payload.well.upper()
         if well not in set(images_manifest["well"].astype(str).str.upper()):
@@ -170,6 +178,63 @@ def register_screening_routes(
                 if gated_summary is None
                 else {key: value for key, value in gated_summary.items() if key != "wells"}
             ),
+            "report": updated_report.get(well),
+        }
+
+    @app.post("/api/timepoint-cell-count-review")
+    def timepoint_cell_count_review(
+        payload: TimepointCellCountReviewPayload,
+    ) -> dict[str, Any]:
+        well = payload.well.upper()
+        timepoint = payload.timepoint.upper()
+        if timepoint not in {"T0", "T1", "T2"}:
+            raise HTTPException(status_code=422, detail="Invalid early timepoint")
+        if well not in set(images_manifest["well"].astype(str).str.upper()):
+            raise HTTPException(status_code=404, detail="well unavailable")
+        ensure_well_timepoint_cell_count_review_table(database)
+        updated = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(database) as connection:
+            if payload.cell_count is None:
+                connection.execute(
+                    "DELETE FROM well_timepoint_cell_count_reviews WHERE well = ? AND timepoint = ?",
+                    (well, timepoint),
+                )
+            else:
+                connection.execute(
+                    """
+                    INSERT INTO well_timepoint_cell_count_reviews (
+                      well, timepoint, cell_count, reviewer, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(well, timepoint) DO UPDATE SET
+                      cell_count=excluded.cell_count,
+                      reviewer=excluded.reviewer,
+                      updated_at=excluded.updated_at
+                    """,
+                    (well, timepoint, int(payload.cell_count), payload.reviewer, updated),
+                )
+        build_well_screening(config, database, selected_wells={well})
+        _, updated_report = refresh_gated_report()
+        source = artifact_path(config, "predictions", "latest_well_screening.csv")
+        frame = pd.read_csv(source)
+        selected = frame[frame["well"].astype(str).str.upper() == well]
+        screening_row = (
+            selected.replace({np.nan: None}).iloc[0].to_dict()
+            if not selected.empty
+            else None
+        )
+        sync_catalog_after_review(
+            "timepoint_cell_count_review",
+            wells={well},
+            reviewer=payload.reviewer,
+            operation="timepoint_cell_count_review_save",
+        )
+        return {
+            "status": "saved",
+            "well": well,
+            "timepoint": timepoint,
+            "cell_count": payload.cell_count,
+            "source": "automatic" if payload.cell_count is None else "human",
+            "screening": screening_row,
             "report": updated_report.get(well),
         }
 

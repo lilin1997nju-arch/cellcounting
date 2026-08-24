@@ -45,6 +45,31 @@ const labelNames = {
   invalid: "无关/误检"
 };
 labelNames.dead_cell = "V3统一死细胞";
+const manualVerdictNames = {
+  approved: "合格",
+  pending: "待定",
+  rejected: "排除",
+  unclassified: "未判定"
+};
+const entryFilterParameters = new URLSearchParams(window.location.search);
+const finiteFilter = name => {
+  const raw = entryFilterParameters.get(name);
+  if (raw === null || raw.trim() === "") return null;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0 ? value : null;
+};
+const entryFilters = {
+  coverageMin: finiteFilter("coverage_min"),
+  debrisMax: finiteFilter("debris_max"),
+  day2CellsMin: finiteFilter("day2_cells_min"),
+  day2CellsMax: finiteFilter("day2_cells_max")
+};
+const plateFilterFields = {
+  coverageMin: "plateCoverageMin",
+  debrisMax: "plateDebrisMax",
+  day2CellsMin: "plateDay2CellsMin",
+  day2CellsMax: "plateDay2CellsMax"
+};
 const cellSubtypeLabels = ["single", "touching_doublet", "cluster_3plus"];
 const labelColors = {
   single: "#27d79a",
@@ -68,7 +93,8 @@ const state = {
   v3TrackLabels: new Map(),
   wellLoadedAt: null,
   prefetchedDetails: new Map(),
-  prefetchingDetails: new Map()
+  prefetchingDetails: new Map(),
+  cellCountSaveJobs: new Map()
 };
 
 async function api(url, options) {
@@ -104,6 +130,66 @@ async function refreshUndoAction() {
 
 function pct(value) {
   return `${(Number(value || 0) * 100).toFixed(0)}%`;
+}
+
+function passesEntryFilters(item) {
+  const coverage = Number(item.endpoint_coverage_pct);
+  const debris = Number(item.day2_debris_count);
+  const cells = Number(item.day2_cell_count);
+  if (entryFilters.coverageMin !== null && (!Number.isFinite(coverage) || coverage <= entryFilters.coverageMin)) return false;
+  if (entryFilters.debrisMax !== null && (!Number.isFinite(debris) || debris >= entryFilters.debrisMax)) return false;
+  if (entryFilters.day2CellsMin !== null && (!Number.isFinite(cells) || cells < entryFilters.day2CellsMin)) return false;
+  if (entryFilters.day2CellsMax !== null && (!Number.isFinite(cells) || cells > entryFilters.day2CellsMax)) return false;
+  return true;
+}
+
+function renderEntryFilterSummary(matched, total) {
+  const conditions = [];
+  if (entryFilters.coverageMin !== null) conditions.push(`末点覆盖率 > ${entryFilters.coverageMin}%`);
+  if (entryFilters.debrisMax !== null) conditions.push(`Day2杂质 < ${entryFilters.debrisMax}`);
+  if (entryFilters.day2CellsMin !== null || entryFilters.day2CellsMax !== null) {
+    conditions.push(`Day2细胞 ${entryFilters.day2CellsMin ?? "不限"}～${entryFilters.day2CellsMax ?? "不限"}`);
+  }
+  $("entryFilterSummary").textContent = conditions.length
+    ? `本板筛选：${conditions.join("；")}（命中 ${matched}/${total} 孔）`
+    : `本板筛选：未设置（${total} 孔）`;
+}
+
+function initializePlateFilterEditor() {
+  Object.entries(plateFilterFields).forEach(([key, id]) => {
+    $(id).value = entryFilters[key] ?? "";
+  });
+}
+
+function applyPlateFilterFromEditor() {
+  const values = Object.fromEntries(Object.entries(plateFilterFields).map(([key, id]) => [
+    key,
+    $(id).value.trim() === "" ? null : Number($(id).value),
+  ]));
+  if (
+    values.day2CellsMin !== null
+    && values.day2CellsMax !== null
+    && values.day2CellsMin > values.day2CellsMax
+  ) {
+    $("plateFilterError").textContent = "Day2 细胞数下限不能大于上限。";
+    $("plateFilterError").hidden = false;
+    return;
+  }
+  Object.assign(entryFilters, values);
+  $("plateFilterError").hidden = true;
+  const url = new URL(window.location.href);
+  const queryNames = {
+    coverageMin: "coverage_min",
+    debrisMax: "debris_max",
+    day2CellsMin: "day2_cells_min",
+    day2CellsMax: "day2_cells_max"
+  };
+  Object.entries(queryNames).forEach(([key, parameter]) => {
+    if (entryFilters[key] === null) url.searchParams.delete(parameter);
+    else url.searchParams.set(parameter, entryFilters[key]);
+  });
+  window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
+  loadWells(state.detail?.well || null);
 }
 
 function selectedObject() {
@@ -163,13 +249,22 @@ async function refreshStats() {
 
 async function loadWells(preferredWell = null) {
   const search = $("wellSearch").value.trim();
-  const loaded = await api(
-    `/api/quick-review-wells?mode=${state.mode}&search=${encodeURIComponent(search)}`
-  );
+  const loaded = await api("/api/quick-review-wells?mode=all");
+  const entryFiltered = loaded.filter(passesEntryFilters);
+  renderEntryFilterSummary(entryFiltered.length, loaded.length);
+  let visible = state.mode === "pending"
+    ? entryFiltered.filter(item => !item.completed)
+    : state.mode === "reviewed"
+    ? entryFiltered.filter(item => item.completed)
+    : entryFiltered;
+  if (search) {
+    const needle = search.toUpperCase();
+    visible = visible.filter(item => String(item.well).toUpperCase().includes(needle));
+  }
   const typeFilter = $("wellTypeFilter").value;
   state.wells = typeFilter === "all"
-    ? loaded
-    : loaded.filter(item => item.screening_status === typeFilter);
+    ? visible
+    : visible.filter(item => item.screening_status === typeFilter);
   renderWellList();
   if (!state.wells.length) {
     state.detail = null;
@@ -194,6 +289,7 @@ function renderWellList() {
       <span class="well-name">${item.well}</span>
       <span class="well-summary">
         ${item.cell_count}细胞 · ${item.debris_count}杂质
+        · 人工${manualVerdictNames[item.manual_review_decision] || "未判定"}
         ${item.uncertain_count ? ` · ${item.uncertain_count}待定` : ""}
         ${item.temporal_review_count ? ` · ${item.temporal_review_count}时序复核` : ""}
         ${item.v3_cell_to_debris_count ? ` · ${item.v3_cell_to_debris_count} 条V3统一死细胞轨迹` : ""}
@@ -218,6 +314,16 @@ function renderEmptyWorkspace() {
   $("selectionEditor").classList.add("empty-selection");
   $("selectedTitle").textContent = "当前列表没有孔";
   $("selectedDetail").textContent = "";
+  renderWellVerdict(null);
+}
+
+function renderWellVerdict(decision = state.detail?.screening?.review_decision || "unclassified") {
+  const normalized = decision && manualVerdictNames[decision] ? decision : "unclassified";
+  $("wellVerdictLabel").textContent = decision === null ? "—" : manualVerdictNames[normalized];
+  document.querySelectorAll("[data-well-verdict]").forEach(button => {
+    button.classList.toggle("active", decision !== null && button.dataset.wellVerdict === normalized);
+    button.disabled = decision === null || state.busy;
+  });
 }
 
 function updateCurrentWellSummary() {
@@ -259,6 +365,8 @@ async function loadWell(well) {
     setMessage(`载入失败：${error.message}`, true);
   } finally {
     state.busy = false;
+    renderWellVerdict();
+    for (const timepoint of reviewTimepoints) renderCellTotalControl(timepoint);
   }
 }
 
@@ -267,6 +375,7 @@ function renderWell() {
   if (!detail) return;
   $("wellTitle").textContent = detail.well;
   updateCurrentWellSummary();
+  renderWellVerdict();
   const grid = $("timepointGrid");
   const lateGrid = $("lateTimepointGrid");
   grid.innerHTML = "";
@@ -331,6 +440,13 @@ function renderTimepointCard(timepoint, container, annotatable) {
   card.querySelector(".timepoint-breakdown").textContent = annotatable
     ? breakdownText(objects)
     : lateEvidenceText(imageInfo);
+  const cellTotalControl = card.querySelector(".cell-total-control");
+  cellTotalControl.hidden = !annotatable;
+  if (annotatable) {
+    cellTotalControl.querySelector(".cell-total-down").onclick = () => changeTimepointCellTotal(timepoint, -1);
+    cellTotalControl.querySelector(".cell-total-up").onclick = () => changeTimepointCellTotal(timepoint, 1);
+    cellTotalControl.querySelector(".cell-total-auto").onclick = () => saveTimepointCellTotal(timepoint, null);
+  }
   const image = card.querySelector(".well-image");
   const canvas = card.querySelector(".object-overlay");
   const loading = card.querySelector(".image-loading");
@@ -377,6 +493,7 @@ function renderTimepointCard(timepoint, container, annotatable) {
     }
   }
   container.appendChild(card);
+  if (annotatable) renderCellTotalControl(timepoint, card);
 }
 
 function lateEvidenceText(imageInfo) {
@@ -407,6 +524,162 @@ function breakdownText(objects) {
   if (counts.uncertain) parts.push(`待定 ${counts.uncertain}`);
   if (counts.invalid) parts.push(`排除 ${counts.invalid}`);
   return parts.join(" · ");
+}
+
+function automaticTimepointCellTotal(timepoint) {
+  return (state.detail?.objects || [])
+    .filter(object => object.timepoint === timepoint)
+    .reduce((total, object) => total + ({
+      single: 1,
+      touching_doublet: 2,
+      cluster_3plus: 3
+    }[editableDecisionLabel(object)] || 0), 0);
+}
+
+function timepointCellTotal(timepoint) {
+  const saved = state.detail?.cell_count_totals?.[timepoint];
+  const automatic = automaticTimepointCellTotal(timepoint);
+  return {
+    automatic_count: automatic,
+    cell_count: saved?.source === "human" ? Number(saved.cell_count || 0) : automatic,
+    source: saved?.source === "human" ? "human" : "automatic"
+  };
+}
+
+function renderCellTotalControl(timepoint, card = null) {
+  const target = card || document.querySelector(`.timepoint-card[data-timepoint="${timepoint}"]`);
+  if (!target || !reviewTimepoints.includes(timepoint)) return;
+  const total = timepointCellTotal(timepoint);
+  target.querySelector(".cell-total-value").textContent = total.cell_count;
+  const source = target.querySelector(".cell-total-source");
+  source.textContent = total.source === "human" ? "人工" : "自动";
+  source.classList.toggle("human", total.source === "human");
+  target.querySelector(".cell-total-down").disabled = state.busy || total.cell_count <= 0;
+  target.querySelector(".cell-total-up").disabled = state.busy;
+  target.querySelector(".cell-total-auto").disabled = state.busy || total.source !== "human";
+}
+
+function changeTimepointCellTotal(timepoint, delta) {
+  if (!state.detail || state.busy) return;
+  const current = timepointCellTotal(timepoint).cell_count;
+  saveTimepointCellTotal(timepoint, Math.max(0, current + delta));
+}
+
+function applyOptimisticTimepointCellTotal(well, timepoint, cellCount) {
+  if (!state.detail || state.detail.well !== well) return;
+  const automatic = automaticTimepointCellTotal(timepoint);
+  state.detail.cell_count_totals = state.detail.cell_count_totals || {};
+  state.detail.cell_count_totals[timepoint] = {
+    automatic_count: automatic,
+    cell_count: cellCount === null ? automatic : cellCount,
+    source: cellCount === null ? "automatic" : "human"
+  };
+  renderCellTotalControl(timepoint);
+}
+
+function cellCountSaveKey(well, timepoint) {
+  return `${well}:${timepoint}`;
+}
+
+function scheduleTimepointCellTotalSave(well, timepoint, cellCount) {
+  const key = cellCountSaveKey(well, timepoint);
+  let job = state.cellCountSaveJobs.get(key);
+  if (!job) {
+    const saved = state.detail?.cell_count_totals?.[timepoint];
+    job = {
+      well,
+      timepoint,
+      confirmed: saved?.source === "human" ? Number(saved.cell_count || 0) : null,
+      desired: cellCount,
+      timer: null,
+      inFlight: false,
+      promise: null
+    };
+    state.cellCountSaveJobs.set(key, job);
+  }
+  job.desired = cellCount;
+  if (job.timer) clearTimeout(job.timer);
+  job.timer = setTimeout(() => flushTimepointCellTotalSave(key), 350);
+}
+
+async function flushTimepointCellTotalSave(key) {
+  const job = state.cellCountSaveJobs.get(key);
+  if (!job) return;
+  if (job.timer) {
+    clearTimeout(job.timer);
+    job.timer = null;
+  }
+  if (job.inFlight) return job.promise;
+  const persistedValue = job.desired;
+  job.inFlight = true;
+  job.promise = (async () => {
+    try {
+      const result = await api("/api/timepoint-cell-count-review", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        keepalive: true,
+        body: JSON.stringify({
+          well: job.well,
+          timepoint: job.timepoint,
+          cell_count: persistedValue,
+          reviewer: "local_user"
+        })
+      });
+      job.confirmed = persistedValue;
+      if (result.screening) applyLocalScreeningUpdate(result.screening);
+      if (state.detail?.well === job.well) {
+        if (result.screening) state.detail.screening = result.screening;
+        if (result.report) state.detail.report = result.report;
+      }
+      if (Object.is(job.desired, persistedValue)) {
+        state.cellCountSaveJobs.delete(key);
+        if (state.detail?.well === job.well) {
+          setMessage(
+            persistedValue === null
+              ? `${job.well} ${job.timepoint} 已恢复自动细胞总数`
+              : `${job.well} ${job.timepoint} 的人工细胞总数已保存为 ${persistedValue}`
+          );
+        }
+      }
+    } catch (error) {
+      if (Object.is(job.desired, persistedValue)) {
+        state.cellCountSaveJobs.delete(key);
+        applyOptimisticTimepointCellTotal(job.well, job.timepoint, job.confirmed);
+        if (state.detail?.well === job.well) {
+          setMessage(`细胞总数保存失败：${error.message}`, true);
+        }
+      }
+    } finally {
+      job.inFlight = false;
+      job.promise = null;
+      if (state.cellCountSaveJobs.get(key) === job && !Object.is(job.desired, persistedValue)) {
+        job.timer = setTimeout(() => flushTimepointCellTotalSave(key), 80);
+      }
+    }
+  })();
+  return job.promise;
+}
+
+async function flushPendingCellCountSaves(well) {
+  while (true) {
+    const keys = [...state.cellCountSaveJobs.entries()]
+      .filter(([, job]) => job.well === well)
+      .map(([key]) => key);
+    if (!keys.length) return;
+    await Promise.all(keys.map(key => flushTimepointCellTotalSave(key)));
+  }
+}
+
+function saveTimepointCellTotal(timepoint, cellCount) {
+  if (!state.detail || state.busy) return;
+  const well = state.detail.well;
+  scheduleTimepointCellTotalSave(well, timepoint, cellCount);
+  applyOptimisticTimepointCellTotal(well, timepoint, cellCount);
+  setMessage(
+    cellCount === null
+      ? `${well} ${timepoint} 已恢复自动，正在后台保存…`
+      : `${well} ${timepoint} 已调整为 ${cellCount}，正在后台保存…`
+  );
 }
 
 function fitAndDraw(timepoint) {
@@ -1230,6 +1503,7 @@ function renderTimepointHeaders() {
     );
     card.querySelector(".timepoint-breakdown").textContent =
       breakdownText(objects);
+    renderCellTotalControl(timepoint, card);
   });
 }
 
@@ -1264,6 +1538,38 @@ async function saveLateGrowthDecision(timepoint, decision) {
     setMessage(`生长判定保存失败：${error.message}`, true);
   } finally {
     state.busy = false;
+  }
+}
+
+async function saveManualVerdict(decision) {
+  if (!state.detail || state.busy || !manualVerdictNames[decision]) return;
+  const well = state.detail.well;
+  state.busy = true;
+  renderWellVerdict(decision);
+  setMessage(`正在保存 ${well} 的人工判定…`);
+  try {
+    await api("/api/screening-review", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ well, decision, reviewer: "local_user" })
+    });
+    state.detail.screening = state.detail.screening || {};
+    state.detail.screening.review_decision = decision;
+    for (const collection of [state.wells, state.screeningWells]) {
+      const item = collection.find(row => String(row.well).toUpperCase() === well);
+      if (item) {
+        item.review_decision = decision;
+        item.manual_review_decision = decision;
+      }
+    }
+    renderWellList();
+    renderWellVerdict(decision);
+    setMessage(`${well} 已标记为${manualVerdictNames[decision]}`);
+  } catch (error) {
+    setMessage(`人工判定保存失败：${error.message}`, true);
+  } finally {
+    state.busy = false;
+    renderWellVerdict();
   }
 }
 
@@ -1392,6 +1698,7 @@ async function saveWell(approvePredictions = false) {
   }
   setMessage(`正在保存 ${well} 的 ${state.detail.objects.length} 个目标…`);
   try {
+    await flushPendingCellCountSaves(well);
     const result = await api("/api/quick-review-well-labels", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1504,8 +1811,21 @@ document.querySelectorAll("[data-mode]").forEach(button => {
 document.querySelectorAll(".class-buttons button").forEach(button => {
   button.onclick = () => setSelectedLabel(button.dataset.label);
 });
+document.querySelectorAll("[data-well-verdict]").forEach(button => {
+  button.onclick = () => saveManualVerdict(button.dataset.wellVerdict);
+});
 $("wellSearch").oninput = () => loadWells(state.detail?.well || null);
 $("wellTypeFilter").onchange = () => loadWells(state.detail?.well || null);
+window.addEventListener("pagehide", () => {
+  for (const key of state.cellCountSaveJobs.keys()) {
+    flushTimepointCellTotalSave(key);
+  }
+});
+$("applyPlateFilter").onclick = applyPlateFilterFromEditor;
+$("clearPlateFilter").onclick = () => {
+  Object.values(plateFilterFields).forEach(id => { $(id).value = ""; });
+  applyPlateFilterFromEditor();
+};
 $("markerScale").oninput = drawAll;
 $("diameterDown").onclick = () => changeSelectedDiameter(-2);
 $("diameterUp").onclick = () => changeSelectedDiameter(2);
@@ -1541,9 +1861,18 @@ document.addEventListener("keydown", event => {
     "5": "uncertain",
     "6": "invalid"
   };
+  const verdicts = {
+    q: "approved",
+    w: "pending",
+    e: "rejected"
+  };
+  const verdict = verdicts[event.key.toLowerCase()];
   if (labels[event.key]) {
     event.preventDefault();
     setSelectedLabel(labels[event.key]);
+  } else if (verdict) {
+    event.preventDefault();
+    saveManualVerdict(verdict);
   } else if (event.key === "Enter") {
     event.preventDefault();
     saveWell(false);
@@ -1563,4 +1892,5 @@ async function bootReview() {
   await Promise.all([refreshStats(), loadScreeningWells(), refreshUndoAction()]);
   await loadWells(initialWell?.toUpperCase() || null);
 }
+initializePlateFilterEditor();
 bootReview();

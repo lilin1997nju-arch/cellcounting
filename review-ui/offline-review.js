@@ -8,23 +8,65 @@
   let state={reviewer:"",plates:{}};try{state={...state,...JSON.parse(localStorage.getItem(storageKey)||"{}")}}catch(_){ }
   let plateIndex=0,wellIndex=0,selectedId="",zoom=1,missed=false;
   function plate(){return source.plates[plateIndex]} function well(){return plate()?.wells[wellIndex]}
-  function key(p,w){return `${p.slug}/${w.well}`} function wellState(p,w){return state.plates[key(p,w)]||(state.plates[key(p,w)]={completed:false,screening_decision:w.screening_decision||"pending",labels:{},new_objects:[]})}
+  function key(p,w){return `${p.slug}/${w.well}`}
+  function wellState(p,w){
+    const storage=key(p,w),existing=state.plates[storage];
+    if(!existing){
+      state.plates[storage]={completed:false,screening_decision:w.screening_decision||"unclassified",labels:{},new_objects:[],cell_count_overrides:{...(w.cell_count_overrides||{})}};
+    }else if(!existing.cell_count_overrides||typeof existing.cell_count_overrides!=="object"){
+      existing.cell_count_overrides={...(w.cell_count_overrides||{})};
+    }
+    return state.plates[storage]
+  }
   function save(){state.reviewer=$("reviewer").value.trim();localStorage.setItem(storageKey,JSON.stringify(state));renderProgress()}
   function toast(message){const node=$("toast");node.textContent=message;node.classList.add("show");setTimeout(()=>node.classList.remove("show"),1800)}
   function objects(p,w){const ws=wellState(p,w);return [...w.objects.map(o=>({...o,reviewed_label:ws.labels[o.candidate_id]||o.reviewed_label||o.final_label||o.current_label||o.integrated_label,is_new:false})),...ws.new_objects]}
+  function cellTotal(p,w,timepoint){
+    const ws=wellState(p,w),automatic=objects(p,w).filter(o=>String(o.timepoint).toUpperCase()===timepoint).reduce((sum,o)=>sum+({single:1,touching_doublet:2,cluster_3plus:3}[o.reviewed_label]||0),0);
+    const human=Object.prototype.hasOwnProperty.call(ws.cell_count_overrides,timepoint);
+    return {automatic,count:human?Number(ws.cell_count_overrides[timepoint]):automatic,human}
+  }
+  function installCellTotalControls(p,w){
+    document.querySelectorAll(".canvas").forEach(canvas=>{
+      const timepoint=canvas.dataset.timepoint,img=w.images[timepoint];
+      if(!img?.annotatable)return;
+      const total=cellTotal(p,w,timepoint),control=document.createElement("span");
+      control.className="cell-total";
+      control.innerHTML=`<button type="button" data-delta="-1">−</button><span>细胞总数 <strong>${total.count}</strong> <em>${total.human?"人工":"自动"}</em></span><button type="button" data-delta="1">＋</button><button type="button" class="cell-total-reset" ${total.human?"":"disabled"}>恢复自动</button>`;
+      control.querySelectorAll("[data-delta]").forEach(button=>button.onclick=event=>{event.stopPropagation();const current=cellTotal(p,w,timepoint).count;wellState(p,w).cell_count_overrides[timepoint]=Math.max(0,current+Number(button.dataset.delta));save();renderFrames()});
+      control.querySelector(".cell-total-reset").onclick=event=>{event.stopPropagation();delete wellState(p,w).cell_count_overrides[timepoint];save();renderFrames()};
+      canvas.closest(".frame").querySelector("h3").append(control)
+    })
+  }
   function renderPlateSelect(){ $("plateSelect").innerHTML=source.plates.map((p,i)=>`<option value="${i}">${esc(p.board_id)} · ${p.wells.length}孔</option>`).join("");$("plateSelect").value=plateIndex }
   function visibleWells(){const q=$("search").value.trim().toUpperCase();return plate().wells.map((w,i)=>({w,i})).filter(x=>!q||x.w.well.includes(q))}
   function renderList(){const p=plate();$("wellList").innerHTML=visibleWells().map(({w,i})=>{const ws=wellState(p,w);return `<button class="well-card ${i===wellIndex?"active":""} ${ws.completed?"done":""}" data-index="${i}"><b>${esc(w.well)}</b><small>${esc(w.report.final_category_label||w.report.final_category||"无模型结论")}</small></button>`}).join("");document.querySelectorAll(".well-card").forEach(n=>n.onclick=()=>{wellIndex=Number(n.dataset.index);selectedId="";renderAll()})}
   function renderProgress(){const all=source.plates.flatMap(p=>p.wells.map(w=>wellState(p,w)));const done=all.filter(x=>x.completed).length,percent=all.length?done/all.length*100:0;$("progress").innerHTML=`已完成 ${done}/${all.length} 孔<i><b style="width:${percent}%"></b></i>`;renderList()}
   function marker(o,img){const x=Number(o.x_px)/Number(img.source_width)*100,y=Number(o.y_px)/Number(img.source_height)*100,d=Math.max(14,Math.min(70,Number(o.diameter_px||20)/Number(img.source_width)*100));const label=o.reviewed_label||"uncertain";return `<button title="${esc(o.candidate_id)} · ${esc(labelNames[label]||label)}" class="marker ${esc(label)} ${o.candidate_id===selectedId?"selected":""} ${o.is_new?"new":""}" data-object="${esc(o.candidate_id)}" style="left:${x}%;top:${y}%;width:${d}%;aspect-ratio:1;--c:var(--${esc(label)})"></button>`}
   function renderFrames(){const p=plate(),w=well(),list=objects(p,w);$("frames").innerHTML=Object.keys(w.images).sort().map(tp=>{const img=w.images[tp],local=list.filter(o=>String(o.timepoint).toUpperCase()===tp);return `<article class="frame"><h3>${esc(tp)} <small>${local.length} 个目标</small></h3><div class="canvas-wrap"><div class="canvas" data-timepoint="${tp}" style="width:${zoom*100}%"><img draggable="false" src="${esc(img.url)}" alt="${esc(w.well)} ${tp}">${local.map(o=>marker(o,img)).join("")}</div></div></article>`}).join("")||'<div class="empty-frame">本孔没有可用图像</div>';
+    installCellTotalControls(p,w);
     document.querySelectorAll(".marker").forEach(n=>n.onclick=e=>{e.stopPropagation();selectedId=n.dataset.object;missed=false;$("missedMode").classList.remove("active");renderFrames();renderEditor()});
     document.querySelectorAll(".canvas").forEach(n=>n.onclick=e=>{if(!missed)return;const img=w.images[n.dataset.timepoint];if(!img.annotatable){toast("末次时点只用于查看，不能补漏");return}const rect=n.getBoundingClientRect(),x=(e.clientX-rect.left)/rect.width*img.source_width,y=(e.clientY-rect.top)/rect.height*img.source_height;const ws=wellState(p,w),id=`offline:${p.slug}:${w.well}:${n.dataset.timepoint}:${Date.now()}`;ws.new_objects.push({candidate_id:id,well:w.well,timepoint:n.dataset.timepoint,x_px:x,y_px:y,diameter_px:22,reviewed_label:"single",is_new:true});selectedId=id;save();renderFrames();renderEditor()})
   }
   function renderEditor(){const p=plate(),w=well(),o=objects(p,w).find(x=>x.candidate_id===selectedId);if(!o){$("objectEditor").className="object-editor empty";$("objectEditor").textContent="选择一个圈以修改结论";return}$("objectEditor").className="object-editor";$("objectEditor").innerHTML=`<strong>${esc(w.well)} ${esc(o.timepoint)}</strong><small>${esc(o.candidate_id)}</small>${Object.entries(labelNames).map(([v,n])=>`<button data-label="${v}" class="${o.reviewed_label===v?"active":""} ${v}" style="--c:var(--${v})">${n}</button>`).join("")}${o.is_new?'<button id="deleteObject">删除补漏</button>':""}`;document.querySelectorAll("[data-label]").forEach(n=>n.onclick=()=>{const ws=wellState(p,w);if(o.is_new){const found=ws.new_objects.find(x=>x.candidate_id===o.candidate_id);found.reviewed_label=n.dataset.label}else ws.labels[o.candidate_id]=n.dataset.label;save();renderFrames();renderEditor()});if(o.is_new)$("deleteObject").onclick=()=>{const ws=wellState(p,w);ws.new_objects=ws.new_objects.filter(x=>x.candidate_id!==o.candidate_id);selectedId="";save();renderFrames();renderEditor()}}
   function renderWell(){const p=plate(),w=well(),ws=wellState(p,w);$("plateLabel").textContent=p.board_id;$("wellTitle").textContent=w.well;$("modelConclusion").textContent=`模型结论：${w.report.final_category_label||w.report.final_category||"无"}${w.report.undetermined_reason?` · ${w.report.undetermined_reason}`:""}`;$("screeningDecision").value=ws.screening_decision;$("completeButton").textContent=ws.completed?"取消完成标记":"标记本孔完成";$("zoomLabel").textContent=`${Math.round(zoom*100)}%`;renderFrames();renderEditor()}
   function renderAll(){renderPlateSelect();renderList();renderProgress();renderWell()}
-  function exportResults(){save();if(!state.reviewer){toast("请先填写审核人");$("reviewer").focus();return}const result={format:source.format,version:source.version,exported_at:new Date().toISOString(),task_id:source.task.task_id,project_id:source.project.project_id,reviewer:state.reviewer,plates:source.plates.map(p=>({slug:p.slug,round_id:p.round_id,objects:p.wells.flatMap(w=>{const ws=wellState(p,w);return [...w.objects.map(o=>({candidate_id:o.candidate_id,reviewed_label:ws.labels[o.candidate_id]||o.reviewed_label||o.final_label||o.current_label||o.integrated_label,is_new:false})),...ws.new_objects]}),wells:p.wells.map(w=>({well:w.well,screening_decision:wellState(p,w).screening_decision,completed:wellState(p,w).completed}))}))};const blob=new Blob([JSON.stringify(result,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");a.href=url;a.download=`${source.task.name||"CellVision"}_离线审核结果.json`;a.click();URL.revokeObjectURL(url);toast("审核结果已导出")}
+  function exportResults(){
+    save();
+    if(!state.reviewer){toast("请先填写审核人");$("reviewer").focus();return}
+    const result={
+      format:source.format,version:source.version,exported_at:new Date().toISOString(),
+      task_id:source.task.task_id,project_id:source.project.project_id,reviewer:state.reviewer,
+      plates:source.plates.map(p=>({
+        slug:p.slug,round_id:p.round_id,
+        objects:p.wells.flatMap(w=>{const ws=wellState(p,w);return [...w.objects.map(o=>({candidate_id:o.candidate_id,reviewed_label:ws.labels[o.candidate_id]||o.reviewed_label||o.final_label||o.current_label||o.integrated_label,is_new:false})),...ws.new_objects]}),
+        wells:p.wells.map(w=>{const ws=wellState(p,w);return {well:w.well,screening_decision:ws.screening_decision,completed:ws.completed,cell_count_overrides:{...ws.cell_count_overrides}}})
+      }))
+    };
+    const blob=new Blob([JSON.stringify(result,null,2)],{type:"application/json"}),url=URL.createObjectURL(blob),a=document.createElement("a");
+    a.href=url;a.download=`${source.task.name||"CellVision"}_离线审核结果.json`;a.click();URL.revokeObjectURL(url);toast("审核结果已导出")
+  }
   document.documentElement.style.setProperty("--single","#00a881");document.documentElement.style.setProperty("--touching_doublet","#ffd54a");document.documentElement.style.setProperty("--cluster_3plus","#ff843d");document.documentElement.style.setProperty("--debris","#a881da");document.documentElement.style.setProperty("--invalid","#ef4e5c");document.documentElement.style.setProperty("--uncertain","#8b969b");
+  document.addEventListener("keydown",event=>{if(event.target.matches("input,select,textarea"))return;const decision={q:"approved",w:"pending",e:"rejected"}[event.key.toLowerCase()];if(!decision)return;event.preventDefault();const ws=wellState(plate(),well());ws.screening_decision=decision;$("screeningDecision").value=decision;save();toast(`已标记为${{approved:"合格",pending:"待定",rejected:"排除"}[decision]}`)});
   $("title").textContent=`${source.task.name} · ${source.project.project_name}`;$("reviewer").value=state.reviewer||"";$("reviewer").onchange=save;$("plateSelect").onchange=e=>{plateIndex=Number(e.target.value);wellIndex=0;selectedId="";renderAll()};$("search").oninput=renderList;$("screeningDecision").onchange=e=>{wellState(plate(),well()).screening_decision=e.target.value;save()};$("completeButton").onclick=()=>{const ws=wellState(plate(),well());ws.completed=!ws.completed;save();renderWell()};$("zoomIn").onclick=()=>{zoom=Math.min(3,zoom+.25);renderWell()};$("zoomOut").onclick=()=>{zoom=Math.max(.5,zoom-.25);renderWell()};$("zoomReset").onclick=()=>{zoom=1;renderWell()};$("missedMode").onclick=()=>{missed=!missed;selectedId="";$("missedMode").classList.toggle("active",missed);renderFrames();renderEditor()};$("exportButton").onclick=exportResults;renderAll();
 })();

@@ -13,7 +13,7 @@ from cellvision.review_server import (
     save_annotation,
     save_lineage_review,
 )
-from cellvision.review_quick_review import V3_TRACK_REVIEW_LABELS
+from cellvision.review_quick_review import V3_TRACK_REVIEW_LABELS, _quick_review_filter_metrics
 from PIL import Image
 
 
@@ -151,6 +151,75 @@ def test_track_review_accepts_cell_family_without_cell_subtype_options():
     assert 'value="single"' not in select
     assert 'value="touching_doublet"' not in select
     assert 'value="cluster_3plus"' not in select
+
+
+def test_quick_review_filter_metrics_use_endpoint_day2_and_manual_verdict():
+    local = pd.DataFrame([
+        {"timepoint": "T2", "final_review_label": "single", "current_label": "single"},
+        {"timepoint": "T2", "final_review_label": "debris", "current_label": "debris"},
+        {"timepoint": "T1", "final_review_label": "debris", "current_label": "debris"},
+    ])
+
+    metrics = _quick_review_filter_metrics(
+        local,
+        {"t2_cell_units": 4, "review_decision": "approved"},
+        {"day14_sheet_coverage_pct": 12.75},
+    )
+
+    assert metrics == {
+        "endpoint_coverage_pct": 12.75,
+        "day2_cell_count": 4,
+        "day2_debris_count": 1,
+        "manual_review_decision": "approved",
+    }
+
+
+def test_auto_review_exposes_pre_filter_and_well_verdict_shortcuts():
+    root = Path(__file__).parents[1] / "review-ui"
+    html = (root / "auto-review.html").read_text(encoding="utf-8")
+    script = (root / "auto-review.js").read_text(encoding="utf-8")
+
+    assert "本板筛选" in html
+    assert 'data-well-verdict="approved"' in html
+    assert 'data-well-verdict="pending"' in html
+    assert 'data-well-verdict="rejected"' in html
+    assert 'data-well-verdict="unclassified"' in html
+    assert 'q: "approved"' in script
+    assert 'w: "pending"' in script
+    assert 'e: "rejected"' in script
+    assert "verdicts[event.key.toLowerCase()]" in script
+    assert '<kbd>Q</kbd> 合格' in html
+    assert '<kbd>W</kbd> 待定' in html
+    assert '<kbd>E</kbd> 排除' in html
+    assert '<kbd>7</kbd> 合格' not in html
+    assert 'api("/api/screening-review"' in script
+    assert 'unclassified: "未判定"' in script
+
+
+def test_auto_review_cell_total_tracks_labels_until_human_override():
+    root = Path(__file__).parents[1] / "review-ui"
+    html = (root / "auto-review.html").read_text(encoding="utf-8")
+    stylesheet = (root / "auto-review.css").read_text(encoding="utf-8")
+    script = (root / "auto-review.js").read_text(encoding="utf-8")
+
+    assert 'class="cell-total-control"' in html
+    assert 'class="cell-total-down"' in html
+    assert 'class="cell-total-up"' in html
+    assert 'class="timepoint-control-row"' in html
+    assert html.index('class="cell-total-control"') > html.index('class="timepoint-control-row"')
+    assert "恢复自动" in html
+    assert "function automaticTimepointCellTotal(timepoint)" in script
+    assert 'saved?.source === "human"' in script
+    assert 'renderCellTotalControl(timepoint, card)' in script
+    assert 'api("/api/timepoint-cell-count-review"' in script
+    assert "scheduleTimepointCellTotalSave(well, timepoint, cellCount)" in script
+    assert "setTimeout(() => flushTimepointCellTotalSave(key), 350)" in script
+    assert "await flushPendingCellCountSaves(well);" in script
+    assert "state.busy = true;\n  for (const item of reviewTimepoints)" not in script
+    assert ".cell-total-control[hidden]{display:none}" in stylesheet
+    assert ".timepoint-control-row{grid-column:1 / -1;grid-row:2" in stylesheet
+    assert "grid-template-columns: repeat(3, minmax(380px, 1fr))" in stylesheet
+    assert "renderWellVerdict();\n    for (const timepoint" in script
 
 
 def test_late_review_copy_requires_full_well_view_without_default_zoom():

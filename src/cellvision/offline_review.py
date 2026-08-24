@@ -25,7 +25,11 @@ from .multiplicity import ensure_integrated_review_table, save_integrated_review
 from .review_helpers import _visible_v2_review_instances, _with_final_decisions
 from .review_storage import initialize_database, save_annotation
 from .review_summary import latest_prediction_path
-from .well_screening import build_well_screening, ensure_well_screening_review_table
+from .well_screening import (
+    build_well_screening,
+    ensure_well_screening_review_table,
+    ensure_well_timepoint_cell_count_review_table,
+)
 from .review_data_package import DATA_PACKAGE_FORMAT, DATA_PACKAGE_MANIFEST
 
 
@@ -268,8 +272,10 @@ def build_offline_review_bundle(
                     if isinstance(row, dict)
                 }
                 screening_reviews: dict[str, str] = {}
+                cell_count_overrides: dict[str, dict[str, int]] = {}
+                ensure_well_screening_review_table(paths["database"])
+                ensure_well_timepoint_cell_count_review_table(paths["database"])
                 with sqlite3.connect(paths["database"]) as connection:
-                    ensure_well_screening_review_table(paths["database"])
                     try:
                         screening_reviews = {
                             str(row[0]).upper(): str(row[1])
@@ -277,6 +283,13 @@ def build_offline_review_bundle(
                         }
                     except sqlite3.OperationalError:
                         pass
+                    for row_well, timepoint, cell_count in connection.execute(
+                        "SELECT well, timepoint, cell_count "
+                        "FROM well_timepoint_cell_count_reviews"
+                    ):
+                        cell_count_overrides.setdefault(
+                            str(row_well).upper(), {}
+                        )[str(timepoint).upper()] = int(cell_count)
                 slug = str(plate.get("slug") or plate.get("board_id") or f"plate-{index}")
                 plate_data: dict[str, Any] = {
                     "slug": slug,
@@ -344,7 +357,8 @@ def build_offline_review_bundle(
                         "well": well,
                         "images": well_images,
                         "objects": _json_safe(object_rows),
-                        "screening_decision": screening_reviews.get(well, "pending"),
+                        "screening_decision": screening_reviews.get(well, "unclassified"),
+                        "cell_count_overrides": cell_count_overrides.get(well, {}),
                         "report": _json_safe({
                             "final_category": report_row.get("final_category"),
                             "final_category_label": report_row.get("final_category_label"),
@@ -397,6 +411,7 @@ def import_offline_review_results(
     }
     updated_objects = 0
     updated_wells = 0
+    updated_cell_count_overrides = 0
     added_objects = 0
     skipped_incomplete_wells = 0
     preserved_empty_plates = 0
@@ -411,18 +426,50 @@ def import_offline_review_results(
             raise ValueError(f"审核结果包含未知板子：{slug}")
         paths = _plate_paths(plate, manifest_file)
         database = initialize_database(paths["database"])
+        result_well_items = [
+            item for item in result_plate.get("wells", []) if isinstance(item, dict)
+        ]
         completed_wells = {
             str(item.get("well") or "").upper()
-            for item in result_plate.get("wells", [])
-            if isinstance(item, dict) and bool(item.get("completed"))
+            for item in result_well_items
+            if bool(item.get("completed"))
         }
         skipped_incomplete_wells += sum(
-            1 for item in result_plate.get("wells", [])
-            if isinstance(item, dict) and not bool(item.get("completed"))
+            1 for item in result_well_items if not bool(item.get("completed"))
         )
-        if not completed_wells:
+        cell_count_replacement_wells: set[str] = set()
+        cell_count_items: list[tuple[str, str, int]] = []
+        for well_item in result_well_items:
+            if "cell_count_overrides" not in well_item:
+                continue
+            well = str(well_item.get("well") or "").upper()
+            if not well:
+                raise ValueError("人工细胞总数缺少孔号")
+            overrides = well_item.get("cell_count_overrides")
+            if overrides is None:
+                overrides = {}
+            if not isinstance(overrides, dict):
+                raise ValueError(f"孔 {well} 的人工细胞总数格式无效")
+            cell_count_replacement_wells.add(well)
+            for raw_timepoint, raw_count in overrides.items():
+                timepoint = str(raw_timepoint).upper()
+                if timepoint not in {"T0", "T1", "T2"}:
+                    raise ValueError(f"孔 {well} 的时间点无效：{timepoint}")
+                if isinstance(raw_count, bool):
+                    raise ValueError(f"孔 {well} {timepoint} 的人工细胞总数无效")
+                try:
+                    count = int(raw_count)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"孔 {well} {timepoint} 的人工细胞总数无效"
+                    ) from exc
+                if count < 0 or count > 10000 or count != raw_count:
+                    raise ValueError(f"孔 {well} {timepoint} 的人工细胞总数无效")
+                cell_count_items.append((well, timepoint, count))
+        if not completed_wells and not cell_count_replacement_wells:
             ensure_integrated_review_table(database)
             ensure_well_screening_review_table(database)
+            ensure_well_timepoint_cell_count_review_table(database)
             with sqlite3.connect(database) as connection:
                 has_existing_reviews = any((
                     connection.execute(
@@ -433,6 +480,9 @@ def import_offline_review_results(
                     ).fetchone(),
                     connection.execute(
                         "SELECT 1 FROM well_screening_reviews LIMIT 1"
+                    ).fetchone(),
+                    connection.execute(
+                        "SELECT 1 FROM well_timepoint_cell_count_reviews LIMIT 1"
                     ).fetchone(),
                 ))
             if has_existing_reviews:
@@ -447,11 +497,11 @@ def import_offline_review_results(
         review_items: list[dict[str, Any]] = []
         manual_items: list[tuple[dict[str, Any], dict[str, Any], str]] = []
         completed_well_items: list[tuple[str, str]] = []
-        for well_item in result_plate.get("wells", []):
+        for well_item in result_well_items:
             if not isinstance(well_item, dict) or not bool(well_item.get("completed")):
                 continue
-            decision = str(well_item.get("screening_decision") or "pending")
-            if decision not in {"approved", "rejected", "pending"}:
+            decision = str(well_item.get("screening_decision") or "unclassified")
+            if decision not in {"approved", "rejected", "pending", "unclassified"}:
                 raise ValueError(f"孔结论状态无效：{decision}")
             completed_well_items.append(
                 (str(well_item.get("well") or "").upper(), decision)
@@ -489,28 +539,44 @@ def import_offline_review_results(
 
         ensure_integrated_review_table(database)
         ensure_well_screening_review_table(database)
+        ensure_well_timepoint_cell_count_review_table(database)
         with sqlite3.connect(database) as connection:
-            annotation_ids = [
-                int(row[0])
-                for row in connection.execute(
-                    "SELECT annotation_id FROM quick_missed_objects WHERE round_id = ?",
-                    (round_id,),
-                ).fetchall()
-            ]
-            connection.execute(
-                "DELETE FROM quick_missed_objects WHERE round_id = ?", (round_id,)
-            )
-            if annotation_ids:
-                placeholders = ", ".join("?" for _ in annotation_ids)
+            if completed_wells:
+                annotation_ids = [
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT annotation_id FROM quick_missed_objects WHERE round_id = ?",
+                        (round_id,),
+                    ).fetchall()
+                ]
                 connection.execute(
-                    f"DELETE FROM annotations WHERE annotation_id IN ({placeholders})",
-                    annotation_ids,
+                    "DELETE FROM quick_missed_objects WHERE round_id = ?", (round_id,)
                 )
-            connection.execute(
-                "DELETE FROM integrated_training_reviews WHERE round_id = ?",
-                (round_id,),
-            )
-            connection.execute("DELETE FROM well_screening_reviews")
+                if annotation_ids:
+                    placeholders = ", ".join("?" for _ in annotation_ids)
+                    connection.execute(
+                        f"DELETE FROM annotations WHERE annotation_id IN ({placeholders})",
+                        annotation_ids,
+                    )
+                connection.execute(
+                    "DELETE FROM integrated_training_reviews WHERE round_id = ?",
+                    (round_id,),
+                )
+                connection.execute("DELETE FROM well_screening_reviews")
+            for well in cell_count_replacement_wells:
+                connection.execute(
+                    "DELETE FROM well_timepoint_cell_count_reviews WHERE well = ?",
+                    (well,),
+                )
+            updated = datetime.now(timezone.utc).isoformat()
+            for well, timepoint, count in cell_count_items:
+                connection.execute(
+                    "INSERT INTO well_timepoint_cell_count_reviews "
+                    "(well, timepoint, cell_count, reviewer, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (well, timepoint, count, reviewer, updated),
+                )
+                updated_cell_count_overrides += 1
 
         if review_items:
             updated_objects += save_integrated_reviews(database, round_id, review_items, reviewer)
@@ -552,10 +618,11 @@ def import_offline_review_results(
                 )
                 updated_wells += 1
         config_value = str(plate.get("config") or "")
-        if completed_wells and config_value:
+        refreshed_wells = completed_wells | cell_count_replacement_wells
+        if refreshed_wells and config_value:
             try:
                 config = load_config(_resolve(config_value, relative_to=manifest_file.parent))
-                build_well_screening(config, database, selected_wells=completed_wells)
+                build_well_screening(config, database, selected_wells=refreshed_wells)
                 settings = config.get("gated_report", {})
                 endpoint_csv = settings.get("endpoint_csv") or settings.get("day14_csv")
                 if endpoint_csv and settings.get("group_id") and settings.get("output_dir"):
@@ -596,6 +663,7 @@ def import_offline_review_results(
         "updated_objects": updated_objects,
         "added_objects": added_objects,
         "updated_wells": updated_wells,
+        "updated_cell_count_overrides": updated_cell_count_overrides,
         "skipped_incomplete_wells": skipped_incomplete_wells,
         "preserved_empty_plates": preserved_empty_plates,
         "refreshed_plates": refreshed_plates,
@@ -633,6 +701,8 @@ def export_offline_review_results(
         round_id, objects = _review_objects(paths["artifact_root"], database)
         completed_wells: set[str] = set()
         screening: dict[str, str] = {}
+        cell_count_overrides: dict[str, dict[str, int]] = {}
+        ensure_well_timepoint_cell_count_review_table(database)
         with sqlite3.connect(database) as connection:
             try:
                 rows = connection.execute(
@@ -649,12 +719,21 @@ def export_offline_review_results(
                 for well, decision, reviewer in rows:
                     well = str(well).upper()
                     screening[well] = str(decision)
-                    if str(decision) != "pending":
+                    if str(decision) in {"approved", "pending", "rejected"}:
                         completed_wells.add(well)
                     if reviewer:
                         reviewers.append(str(reviewer).strip())
             except sqlite3.OperationalError:
                 pass
+            rows = connection.execute(
+                "SELECT well, timepoint, cell_count, reviewer "
+                "FROM well_timepoint_cell_count_reviews"
+            ).fetchall()
+            for well, timepoint, cell_count, reviewer in rows:
+                well = str(well).upper()
+                cell_count_overrides.setdefault(well, {})[str(timepoint).upper()] = int(cell_count)
+                if reviewer:
+                    reviewers.append(str(reviewer).strip())
 
         object_rows: list[dict[str, Any]] = []
         if not objects.empty:
@@ -689,6 +768,7 @@ def export_offline_review_results(
         all_wells = sorted(
             set(objects.get("well", pd.Series(dtype=str)).astype(str).str.upper())
             | set(screening)
+            | set(cell_count_overrides)
             | completed_wells
         )
         payload["plates"].append({
@@ -698,8 +778,9 @@ def export_offline_review_results(
             "wells": [
                 {
                     "well": well,
-                    "screening_decision": screening.get(well, "pending"),
+                    "screening_decision": screening.get(well, "unclassified"),
                     "completed": well in completed_wells,
+                    "cell_count_overrides": cell_count_overrides.get(well, {}),
                 }
                 for well in all_wells
             ],

@@ -339,6 +339,40 @@ def _review_progress_for_plate(plate: dict[str, Any]) -> dict[str, Any]:
     return dict(result)
 
 
+def _manual_verdict_counts_for_plate(plate: dict[str, Any]) -> dict[str, int]:
+    """Count persisted well-level qualified/pending/excluded decisions."""
+
+    counts = {"approved": 0, "pending": 0, "rejected": 0, "unclassified": 0}
+    root = _plate_artifact_root(plate)
+    if root is None:
+        return counts
+    screening_source = root / "predictions" / "latest_well_screening.csv"
+    total_wells = 0
+    try:
+        screening = pd.read_csv(screening_source, usecols=lambda column: column == "well")
+        total_wells = int(screening["well"].astype(str).str.upper().nunique())
+    except (OSError, ValueError, pd.errors.ParserError):
+        total_wells = 0
+    database = root / "annotations" / "annotations.db"
+    explicit: list[str] = []
+    if database.exists():
+        try:
+            with sqlite3.connect(database) as connection:
+                explicit = [
+                    str(row[0]).lower()
+                    for row in connection.execute(
+                        "SELECT decision FROM well_screening_reviews"
+                    ).fetchall()
+                ]
+        except sqlite3.Error:
+            explicit = []
+    for decision in explicit:
+        if decision in {"approved", "pending", "rejected"}:
+            counts[decision] += 1
+    counts["unclassified"] = max(0, total_wells - sum(counts.values()))
+    return counts
+
+
 def _project_detection_dates(value: dict[str, Any]) -> tuple[str | None, str | None]:
     """Return the first/last acquisition dates at day precision."""
 
@@ -413,6 +447,7 @@ def _plate_summary(plate: dict[str, Any]) -> dict[str, Any]:
         "elapsed_seconds": elapsed,
         "report_path": str(report_path) if report_path else None,
         "config_path": str(_resolve(plate.get("config", ""))) if plate.get("config") else None,
+        "manual_verdict_counts": _manual_verdict_counts_for_plate(plate),
         **review_progress,
     }
 
@@ -530,6 +565,146 @@ def _export_count_columns(objects: pd.DataFrame) -> dict[tuple[str, str], int]:
     return counts
 
 
+def _export_debris_count_columns(objects: pd.DataFrame) -> dict[tuple[str, str], int]:
+    """Count final debris labels by well and timepoint for the Excel export."""
+
+    counts: dict[tuple[str, str], int] = {}
+    if objects.empty or not {"well", "timepoint"}.issubset(objects.columns):
+        return counts
+    label_column = "screen_label" if "screen_label" in objects.columns else "integrated_label"
+    if label_column not in objects.columns:
+        return counts
+    frame = objects.copy()
+    frame["_export_label"] = frame[label_column].map(_export_text).str.lower()
+    frame["_export_timepoint"] = frame["timepoint"].map(_export_text).str.upper()
+    frame["_export_well"] = frame["well"].map(_export_text).str.upper()
+    frame = frame[
+        frame["_export_timepoint"].eq("T2")
+        & frame["_export_label"].eq("debris")
+    ]
+    if not frame.empty:
+        for well, value in frame.groupby("_export_well", sort=False).size().items():
+            counts[(str(well), "T2:debris")] = int(value)
+    return counts
+
+
+def _export_percentage(value: Any) -> float | None:
+    """Return a finite percentage value without rounding it to an integer."""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not pd.notna(number):
+        return None
+    return number
+
+
+def _export_manual_verdicts(
+    plate: dict[str, Any], manifest_path: Path
+) -> dict[str, str]:
+    artifact_root = _export_reference_path(plate.get("artifact_root"), manifest_path.parent)
+    if artifact_root is None:
+        return {}
+    database = artifact_root / "annotations" / "annotations.db"
+    if not database.exists():
+        return {}
+    labels = {"approved": "合格", "pending": "待定", "rejected": "排除"}
+    try:
+        with sqlite3.connect(database) as connection:
+            return {
+                str(well).upper(): labels.get(str(decision).lower(), "")
+                for well, decision in connection.execute(
+                    "SELECT well, decision FROM well_screening_reviews"
+                ).fetchall()
+            }
+    except sqlite3.Error:
+        return {}
+
+
+def _project_review_filter_counts(
+    manifest: dict[str, Any],
+    manifest_path: Path,
+    *,
+    coverage_min: float | None = None,
+    debris_max: int | None = None,
+    day2_cells_min: int | None = None,
+    day2_cells_max: int | None = None,
+) -> dict[str, Any]:
+    """Count reviewable wells matching the project-level pre-review filters."""
+
+    plate_counts: list[dict[str, Any]] = []
+    total_matching = 0
+    total_reviewable = 0
+    for plate in manifest.get("plates", []):
+        if not isinstance(plate, dict):
+            continue
+        slug = _export_text(plate.get("slug") or plate.get("board_id"))
+        report_path, screening_path = _export_plate_csv_paths(plate, manifest_path)
+        report = _export_read_csv(report_path)
+        screening = _export_read_csv(screening_path)
+        object_path = screening_path.parent / "latest_screening_objects.csv" if screening_path else None
+        objects = _export_read_csv(object_path)
+        reviewable_wells: set[str] = set()
+        if not objects.empty and {"well", "timepoint"}.issubset(objects.columns):
+            label_column = "screen_label" if "screen_label" in objects.columns else "integrated_label"
+            if label_column in objects.columns:
+                frame = objects.copy()
+                frame["_filter_well"] = frame["well"].map(_export_text).str.upper()
+                frame["_filter_timepoint"] = frame["timepoint"].map(_export_text).str.upper()
+                frame["_filter_label"] = frame[label_column].map(_export_text).str.lower()
+                frame = frame[
+                    frame["_filter_timepoint"].isin(_EXPORT_TIMEPOINTS)
+                    & frame["_filter_label"].isin(_REVIEWABLE_LABELS)
+                ]
+                reviewable_wells = set(frame["_filter_well"])
+        report_rows = {
+            _export_text(row.get("well")).upper(): row
+            for row in report.to_dict(orient="records")
+            if _export_text(row.get("well"))
+        }
+        screening_rows = {
+            _export_text(row.get("well")).upper(): row
+            for row in screening.to_dict(orient="records")
+            if _export_text(row.get("well"))
+        }
+        if not reviewable_wells:
+            reviewable_wells = set(screening_rows)
+        debris_counts = _export_debris_count_columns(objects)
+        matching = 0
+        for well in reviewable_wells:
+            report_row = report_rows.get(well, {})
+            screening_row = screening_rows.get(well, {})
+            coverage = _export_percentage(
+                report_row.get("day14_sheet_coverage_pct", report_row.get("sheet_coverage_pct"))
+            )
+            cells = _export_number(screening_row.get("t2_cell_units"))
+            debris = debris_counts.get((well, "T2:debris"), 0)
+            if coverage_min is not None and (coverage is None or coverage <= coverage_min):
+                continue
+            if debris_max is not None and debris >= debris_max:
+                continue
+            if day2_cells_min is not None and cells < day2_cells_min:
+                continue
+            if day2_cells_max is not None and cells > day2_cells_max:
+                continue
+            matching += 1
+        reviewable = len(reviewable_wells)
+        total_matching += matching
+        total_reviewable += reviewable
+        plate_counts.append({
+            "slug": slug,
+            "board_id": _export_text(plate.get("board_id") or plate.get("group_id") or slug),
+            "matching_well_count": matching,
+            "reviewable_well_count": reviewable,
+        })
+    return {
+        "matching_well_count": total_matching,
+        "reviewable_well_count": total_reviewable,
+        "plates": plate_counts,
+    }
+
+
 def _export_project_rows(
     manifest: dict[str, Any],
     manifest_path: Path,
@@ -566,7 +741,10 @@ def _export_project_rows(
             if screening_path is not None
             else None
         )
-        object_counts = _export_count_columns(_export_read_csv(object_path))
+        objects = _export_read_csv(object_path)
+        object_counts = _export_count_columns(objects)
+        debris_counts = _export_debris_count_columns(objects)
+        manual_verdicts = _export_manual_verdicts(plate, manifest_path)
         report_rows = {
             _export_text(row.get("well")).upper(): row
             for row in report.to_dict(orient="records")
@@ -606,27 +784,33 @@ def _export_project_rows(
                 "板子名称": board_name,
                 "孔号": well,
                 "孔结论": conclusion,
+                "人工判定": manual_verdicts.get(well, ""),
             }
             for timepoint in _EXPORT_TIMEPOINTS:
-                for label_key, label in _EXPORT_COUNT_LABELS:
-                    output[f"{timepoint}{label}"] = object_counts.get(
-                        (well, f"{timepoint}:{label_key}"), 0
-                    )
                 weighted = _export_number(
                     screening_row.get(f"{timepoint.lower()}_cell_units")
                 )
                 # If an older result set has no object table, retain the
                 # persisted weighted units as a useful fallback total.
                 count_total = (
-                    output[f"{timepoint}单细胞个数"]
-                    + output[f"{timepoint}双细胞个数"] * 2
-                    + output[f"{timepoint}多细胞个数"] * 3
+                    object_counts.get((well, f"{timepoint}:single"), 0)
+                    + object_counts.get((well, f"{timepoint}:touching_doublet"), 0) * 2
+                    + object_counts.get((well, f"{timepoint}:cluster_3plus"), 0) * 3
                 )
                 has_object_counts = any(
                     key[0] == well and key[1].startswith(f"{timepoint}:")
                     for key in object_counts
                 )
-                output[f"{timepoint}推测细胞总数"] = count_total if has_object_counts else weighted
+                count_source = _export_text(
+                    screening_row.get(f"{timepoint.lower()}_cell_units_source")
+                ).lower()
+                output[f"{timepoint}细胞总数"] = (
+                    weighted if count_source == "human" or not has_object_counts else count_total
+                )
+            output["末点细胞覆盖率"] = _export_percentage(
+                report_row.get("day14_sheet_coverage_pct", report_row.get("sheet_coverage_pct"))
+            )
+            output["Day2杂质数"] = debris_counts.get((well, "T2:debris"), 0)
             rows.append(output)
     return rows, warnings
 
@@ -647,16 +831,9 @@ def _write_project_result_excel(
         task_name=task_name,
         category_overrides=category_overrides,
     )
-    columns = ["任务名称", "板子名称", "孔号", "孔结论"]
-    columns += [
-        f"{timepoint}{label}"
-        for timepoint in _EXPORT_TIMEPOINTS
-        for _, label in _EXPORT_COUNT_LABELS
-    ]
-    # Keep the three weighted totals adjacent so reviewers can compare the
-    # estimated cell count across T0, T1 and T2 without scanning past the
-    # per-timepoint multiplicity breakdown columns.
-    columns += [f"{timepoint}推测细胞总数" for timepoint in _EXPORT_TIMEPOINTS]
+    columns = ["任务名称", "板子名称", "孔号", "孔结论", "人工判定"]
+    columns += [f"{timepoint}细胞总数" for timepoint in _EXPORT_TIMEPOINTS]
+    columns += ["末点细胞覆盖率", "Day2杂质数"]
     frame = pd.DataFrame(rows, columns=columns)
     destination.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(destination, engine="openpyxl") as writer:
@@ -676,9 +853,14 @@ def _write_project_result_excel(
             max_length = max(len(str(cell.value or "")) for cell in column_cells)
             worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 24)
         worksheet.row_dimensions[1].height = 28
-        for row in worksheet.iter_rows(min_row=2, min_col=5):
+        for row in worksheet.iter_rows(min_row=2, min_col=6):
             for cell in row:
                 cell.number_format = "0"
+        coverage_column = columns.index("末点细胞覆盖率") + 1
+        for cell in next(worksheet.iter_cols(
+            min_col=coverage_column, max_col=coverage_column, min_row=2
+        )):
+            cell.number_format = '0.00"%"'
     return {"row_count": len(frame), "board_count": len(manifest.get("plates", [])), "warnings": warnings}
 
 
@@ -2480,6 +2662,18 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             catalog_detail = None
         if catalog_detail is not None and catalog_detail.get("plates"):
             catalog_plates = catalog_detail["plates"]
+            manifest_plates = {
+                str(item.get("slug") or _slug(item.get("board_id", ""))): item
+                for item in selected_manifest.get("plates", [])
+                if isinstance(item, dict)
+            }
+            verdict_totals = {"approved": 0, "pending": 0, "rejected": 0, "unclassified": 0}
+            for item in catalog_plates:
+                source_plate = manifest_plates.get(str(item.get("plate_slug") or item.get("slug") or ""), {})
+                verdict_counts = _manual_verdict_counts_for_plate(source_plate)
+                item["manual_verdict_counts"] = verdict_counts
+                for decision, value in verdict_counts.items():
+                    verdict_totals[decision] += int(value)
             mounted = [
                 str(item.get("plate_slug"))
                 for item in catalog_plates
@@ -2493,6 +2687,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                     or os.environ.get("CELLVISION_PORTABLE_REVIEW") == "1"
                 ),
                 "mounted_plates": mounted,
+                "manual_verdict_counts": verdict_totals,
                 "detection_start_date": _project_detection_dates(selected_manifest)[0],
                 "detection_end_date": _project_detection_dates(selected_manifest)[1],
             }
@@ -2507,9 +2702,12 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             ) is not None
         ]
         aggregate: dict[str, int] = {}
+        verdict_totals = {"approved": 0, "pending": 0, "rejected": 0, "unclassified": 0}
         for item in plates:
             for key, value in item["category_counts"].items():
                 aggregate[key] = aggregate.get(key, 0) + int(value)
+            for decision, value in item.get("manual_verdict_counts", {}).items():
+                verdict_totals[decision] += int(value)
         detection_start, detection_end = _project_detection_dates(selected_manifest)
         return {
             "project_id": selected_manifest.get("project_id", selected_path.parent.name),
@@ -2520,6 +2718,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             "recognized_plate_count": int(sum(item.get("status") == "completed" for item in plates)),
             "reviewed_plate_count": int(sum(bool(item.get("review_complete")) for item in plates)),
             "category_counts": aggregate,
+            "manual_verdict_counts": verdict_totals,
             "plates": plates,
             "single_cell_origin_well_count": int(aggregate.get("single_cell_origin", 0)),
             "detection_start_date": detection_start,
@@ -2536,6 +2735,29 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
                 or os.environ.get("CELLVISION_PORTABLE_REVIEW") == "1"
             ),
         }
+
+    @app.get("/api/project/review-filter-counts")
+    def project_review_filter_counts(
+        project_id: str | None = None,
+        coverage_min: float | None = None,
+        debris_max: int | None = None,
+        day2_cells_min: int | None = None,
+        day2_cells_max: int | None = None,
+    ) -> dict[str, Any]:
+        if day2_cells_min is not None and day2_cells_max is not None and day2_cells_min > day2_cells_max:
+            raise HTTPException(status_code=422, detail="Day2 cell minimum exceeds maximum")
+        selected_path = manifest_for_project(project_id)
+        selected_manifest = _read_manifest(selected_path)
+        if selected_manifest is None:
+            raise HTTPException(status_code=404, detail="project manifest not found")
+        return _project_review_filter_counts(
+            selected_manifest,
+            selected_path,
+            coverage_min=coverage_min,
+            debris_max=debris_max,
+            day2_cells_min=day2_cells_min,
+            day2_cells_max=day2_cells_max,
+        )
 
     @app.get("/api/project/export-results")
     def export_project_results(project_id: str | None = None) -> FileResponse:

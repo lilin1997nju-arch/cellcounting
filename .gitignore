@@ -19,3 +19,4 @@ artifacts/models/
 artifacts/runs/*/*.pt
 *.npz
 *.npy
+deploy/updates/CellVision-Update-20260824-r1/

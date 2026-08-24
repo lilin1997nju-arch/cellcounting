@@ -4,6 +4,8 @@ const projectId = document.querySelector('meta[name="project-id"]')?.content || 
 let projectData = null;
 let taskNameAutoValue = "";
 let projectDataPollTimer = null;
+let reviewFilterCounts = null;
+let reviewFilterCountRequest = 0;
 
 const toast = text => {
   $("toast").textContent = text;
@@ -398,7 +400,117 @@ function reviewText(plate) {
 
 function resultText(plate) {
   const counts = plate.category_counts || {};
-  return `<span class="result-summary">单细胞 ${count(counts.single_cell_origin).toLocaleString()} · 多细胞 ${count(counts.multi_cell_origin).toLocaleString()} · 待确定 ${count(counts.undetermined).toLocaleString()}</span>`;
+  const verdicts = plate.manual_verdict_counts || {};
+  return `<span class="result-summary">单细胞 ${count(counts.single_cell_origin).toLocaleString()} · 多细胞 ${count(counts.multi_cell_origin).toLocaleString()} · 待确定 ${count(counts.undetermined).toLocaleString()}</span>
+    <small class="manual-verdict-summary">合格孔 ${count(verdicts.approved).toLocaleString()} · 待定孔 ${count(verdicts.pending).toLocaleString()} · 排除孔 ${count(verdicts.rejected).toLocaleString()}</small>`;
+}
+
+const reviewFilterFields = {
+  coverage_min: "coverageMin",
+  debris_max: "debrisMax",
+  day2_cells_min: "day2CellsMin",
+  day2_cells_max: "day2CellsMax",
+};
+
+function reviewFilterStorageKey() {
+  return `cellvision.reviewFilters.${projectId || "default"}`;
+}
+
+function savedReviewFilters() {
+  try {
+    return JSON.parse(localStorage.getItem(reviewFilterStorageKey()) || "{}") || {};
+  } catch (_) {
+    return {};
+  }
+}
+
+function loadSavedReviewFilters() {
+  const saved = savedReviewFilters();
+  Object.entries(reviewFilterFields).forEach(([parameter, id]) => {
+    $(id).value = saved[parameter] ?? "";
+  });
+}
+
+function readReviewFilters() {
+  return Object.fromEntries(Object.entries(reviewFilterFields).map(([parameter, id]) => [
+    parameter,
+    $(id).value.trim(),
+  ]));
+}
+
+function validateReviewFilters(filters) {
+  const minimum = filters.day2_cells_min === "" ? null : Number(filters.day2_cells_min);
+  const maximum = filters.day2_cells_max === "" ? null : Number(filters.day2_cells_max);
+  if (minimum !== null && maximum !== null && minimum > maximum) {
+    $("reviewFilterError").textContent = "Day2 细胞数下限不能大于上限。";
+    $("reviewFilterError").hidden = false;
+    return false;
+  }
+  $("reviewFilterError").hidden = true;
+  return true;
+}
+
+function filteredReviewUrl(target, filters = readReviewFilters()) {
+  const url = new URL(target, window.location.href);
+  Object.entries(filters).forEach(([parameter, value]) => {
+    if (value === "") url.searchParams.delete(parameter);
+    else url.searchParams.set(parameter, value);
+  });
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
+function persistReviewFilters(filters) {
+  try {
+    localStorage.setItem(reviewFilterStorageKey(), JSON.stringify(filters));
+  } catch (_) {
+    // The filter remains usable for this page when storage is unavailable.
+  }
+}
+
+function renderReviewFilterCounts(result) {
+  reviewFilterCounts = result;
+  $("reviewFilterMatchCount").textContent = result
+    ? `满足条件 ${count(result.matching_well_count).toLocaleString()} / ${count(result.reviewable_well_count).toLocaleString()} 孔`
+    : "满足条件 — 孔";
+  const bySlug = new Map((result?.plates || []).map(item => [String(item.slug), item]));
+  document.querySelectorAll("[data-filter-match]").forEach(node => {
+    const item = bySlug.get(node.dataset.filterMatch);
+    node.textContent = item
+      ? `${count(item.matching_well_count).toLocaleString()} / ${count(item.reviewable_well_count).toLocaleString()}`
+      : "—";
+  });
+}
+
+async function refreshReviewFilterCounts() {
+  const filters = readReviewFilters();
+  if (!validateReviewFilters(filters)) return false;
+  persistReviewFilters(filters);
+  const requestId = ++reviewFilterCountRequest;
+  $("reviewFilterMatchCount").textContent = "正在统计…";
+  const query = new URLSearchParams();
+  if (projectId) query.set("project_id", projectId);
+  Object.entries(filters).forEach(([parameter, value]) => {
+    if (value !== "") query.set(parameter, value);
+  });
+  try {
+    const result = await api(`/api/project/review-filter-counts?${query}`);
+    if (requestId === reviewFilterCountRequest) renderReviewFilterCounts(result);
+    return true;
+  } catch (error) {
+    if (requestId === reviewFilterCountRequest) {
+      $("reviewFilterMatchCount").textContent = "统计失败";
+      toast(`筛选统计失败：${error.message}`);
+    }
+    return false;
+  }
+}
+
+function enterFilteredReview(target) {
+  const filters = readReviewFilters();
+  if (!validateReviewFilters(filters)) return;
+  persistReviewFilters(filters);
+  const destination = filteredReviewUrl(target, filters);
+  window.location.href = destination;
 }
 
 function renderProject(data) {
@@ -420,7 +532,11 @@ function renderProject(data) {
   $("mountedMeta").textContent = `已完成识别 ${recognized}/${plates.length} · 已审核 ${reviewed}/${plates.length}`;
 
   const counts = data.category_counts || {};
+  const verdicts = data.manual_verdict_counts || {};
   $("summaryCards").innerHTML = [
+    summaryCard("合格孔", verdicts.approved),
+    summaryCard("待定孔", verdicts.pending),
+    summaryCard("排除孔", verdicts.rejected),
     summaryCard("无明显生长", counts.no_obvious_growth),
     summaryCard("单细胞来源孔", counts.single_cell_origin),
     summaryCard("多细胞来源孔", counts.multi_cell_origin),
@@ -433,29 +549,35 @@ function renderProject(data) {
     const target = ready
       ? `/projects/${encodeURIComponent(projectId)}/plates/${encodeURIComponent(plate.slug)}/`
       : "#";
+    const reviewTarget = ready ? filteredReviewUrl(target) : "#";
     const status = plateStatus(plate);
     const countsForPlate = plate.category_counts || {};
     return `<tr class="${ready ? "clickable" : ""}" ${ready ? `data-href="${esc(target)}"` : ""}>
       <td><span class="plate-link">${esc(plate.board_id || plate.group_id)}</span><br><small>${esc(plate.group_id)}</small></td>
       <td><span class="status ${status.className}">${status.label}</span></td>
       <td><span class="review-progress">${reviewText(plate)}</span><small>${count(plate.reviewed_object_count).toLocaleString()}/${count(plate.reviewable_object_count).toLocaleString()} 个对象</small></td>
-      <td>${resultText({ category_counts: countsForPlate })}</td>
+      <td>${resultText({ category_counts: countsForPlate, manual_verdict_counts: plate.manual_verdict_counts })}</td>
+      <td><strong class="plate-filter-match" data-filter-match="${esc(plate.slug)}">—</strong></td>
       <td>${count(plate.well_count).toLocaleString()}</td>
       <td>${plate.elapsed_seconds ? `${Number(plate.elapsed_seconds).toFixed(1)} s` : "—"}</td>
-      <td>${ready ? `<a class="plate-open" href="${esc(target)}">进入审核 →</a>` : ""}</td>
+      <td>${ready ? `<a class="plate-open" href="${esc(reviewTarget)}">进入审核 →</a>` : ""}</td>
     </tr>`;
-  }).join("") : `<tr><td colspan="7" class="empty">暂无板子</td></tr>`;
+  }).join("") : `<tr><td colspan="8" class="empty">暂无板子</td></tr>`;
 
   document.querySelectorAll("tr[data-href]").forEach(row => row.addEventListener("click", event => {
-    if (event.target.closest("a")) return;
-    window.location.href = row.dataset.href;
+    event.preventDefault();
+    enterFilteredReview(row.dataset.href);
   }));
+  if (reviewFilterCounts) renderReviewFilterCounts(reviewFilterCounts);
 }
 
 async function loadProject({ silent = false } = {}) {
   try {
     renderProject(await api(`/api/project${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`));
-    await loadTasks();
+    await Promise.all([
+      loadTasks(),
+      reviewFilterCounts ? Promise.resolve() : refreshReviewFilterCounts(),
+    ]);
     if (projectDataPollTimer) clearInterval(projectDataPollTimer);
     projectDataPollTimer = setInterval(() => {
       if (document.visibilityState === "visible" && !$("taskDialog")?.open) {
@@ -609,6 +731,18 @@ $("cancelTaskButton").addEventListener("click", closeTaskDialog);
 $("closeProjectNameButton").addEventListener("click", closeProjectNameDialog);
 $("cancelProjectNameButton").addEventListener("click", closeProjectNameDialog);
 $("saveProjectNameButton").addEventListener("click", saveProjectName);
+$("clearReviewFilterButton").addEventListener("click", () => {
+  Object.values(reviewFilterFields).forEach(id => { $(id).value = ""; });
+  $("reviewFilterError").hidden = true;
+  refreshReviewFilterCounts();
+});
+$("reviewFilterForm").addEventListener("submit", event => {
+  event.preventDefault();
+  refreshReviewFilterCounts();
+});
+Object.values(reviewFilterFields).forEach(id => {
+  $(id).addEventListener("change", refreshReviewFilterCounts);
+});
 $("taskName").addEventListener("input", () => { $("taskName").dataset.edited = "1"; });
 $("browseButton").addEventListener("click", async () => {
   $("analysisResult").textContent = "正在打开文件夹选择器…";
@@ -655,4 +789,5 @@ $("queueButton").addEventListener("click", async () => {
   }
 });
 
+loadSavedReviewFilters();
 loadProject();

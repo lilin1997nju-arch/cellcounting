@@ -155,6 +155,13 @@ class WellScreeningReviewPayload(BaseModel):
     notes: str = ""
 
 
+class TimepointCellCountReviewPayload(BaseModel):
+    well: str
+    timepoint: str
+    cell_count: int | None = Field(default=None, ge=0, le=10000)
+    reviewer: str = "local_user"
+
+
 class LateGrowthReviewPayload(BaseModel):
     well: str
     timepoint: str

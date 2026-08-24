@@ -108,6 +108,22 @@ def ensure_well_screening_review_table(database: str | Path) -> None:
         )
 
 
+def ensure_well_timepoint_cell_count_review_table(database: str | Path) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS well_timepoint_cell_count_reviews (
+              well TEXT NOT NULL,
+              timepoint TEXT NOT NULL,
+              cell_count INTEGER NOT NULL,
+              reviewer TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (well, timepoint)
+            )
+            """
+        )
+
+
 def ensure_late_growth_review_table(database: str | Path) -> None:
     with sqlite3.connect(database) as connection:
         connection.execute(
@@ -477,13 +493,22 @@ def build_well_screening(
     if selected_well_filter is not None:
         image_wells = [well for well in image_wells if well in selected_well_filter]
     ensure_well_screening_review_table(database)
+    ensure_well_timepoint_cell_count_review_table(database)
     late_review_lookup = _late_growth_reviews(database)
     automatic_late_lookup = _automatic_late_growth(config)
     with sqlite3.connect(database) as connection:
         decisions = pd.read_sql_query("SELECT * FROM well_screening_reviews", connection)
+        cell_count_reviews = pd.read_sql_query(
+            "SELECT well, timepoint, cell_count FROM well_timepoint_cell_count_reviews",
+            connection,
+        )
     decision_lookup = (
         decisions.set_index("well").to_dict(orient="index") if not decisions.empty else {}
     )
+    cell_count_review_lookup = {
+        (str(row.well).upper(), str(row.timepoint).upper()): max(0, int(row.cell_count))
+        for row in cell_count_reviews.itertuples(index=False)
+    }
 
     rows: list[dict[str, Any]] = []
     object_rows: list[pd.DataFrame] = []
@@ -498,6 +523,7 @@ def build_well_screening(
         by_timepoint: dict[str, pd.DataFrame] = {}
         centers: dict[str, tuple[float, float] | None] = {}
         counts: dict[str, int] = {}
+        count_sources: dict[str, str] = {}
         for timepoint in ("T0", "T1", "T2"):
             selected = _nonmaximum_objects(local[local["timepoint"] == timepoint])
             by_timepoint[timepoint] = selected
@@ -507,7 +533,10 @@ def build_well_screening(
             suspected_dead = pd.Series(False, index=selected.index)
             active_selected = selected.loc[~suspected_dead]
             cells = active_selected[active_selected["screen_label"].isin(CELL_LABELS)]
-            counts[timepoint] = int(sum(CELL_UNITS[label] for label in cells["screen_label"]))
+            automatic_count = int(sum(CELL_UNITS[label] for label in cells["screen_label"]))
+            override = cell_count_review_lookup.get((well, timepoint))
+            counts[timepoint] = automatic_count if override is None else override
+            count_sources[timepoint] = "automatic" if override is None else "human"
             centers[timepoint] = _representative_center(active_selected)
             if not selected.empty:
                 object_rows.append(selected.assign(screen_well=well))
@@ -609,6 +638,9 @@ def build_well_screening(
             "t0_cell_units": counts["T0"],
             "t1_cell_units": counts["T1"],
             "t2_cell_units": counts["T2"],
+            "t0_cell_units_source": count_sources["T0"],
+            "t1_cell_units_source": count_sources["T1"],
+            "t2_cell_units_source": count_sources["T2"],
             "t0_cell_instances": int(len(t0_cells)),
             "t0_suspected_dead_instances": int(t0_suspected_dead.sum()),
             "suspected_dead_cell": bool(evidence_suspected_dead.any()),
@@ -637,7 +669,7 @@ def build_well_screening(
             "deep_search_required": not bool(skip_deep_search),
             "screening_confidence": confidence,
             "reviewed_fraction": reviewed_fraction,
-            "review_decision": decision.get("decision", "pending"),
+            "review_decision": decision.get("decision", "unclassified"),
             "review_notes": decision.get("notes", ""),
             "roi_json": json.dumps(roi, ensure_ascii=False),
         })
@@ -678,6 +710,7 @@ def build_well_screening(
         "single_not_divided": int((result["screening_status"] == "single_not_divided").sum()),
         "multi_origin": int((result["screening_status"] == "multi_origin").sum()),
         "pending_review": int((result["review_decision"] == "pending").sum()),
+        "unclassified_review": int((result["review_decision"] == "unclassified").sum()),
         "late_growth_no_growth": int((result["late_growth_status"] == "no_growth").sum()),
         "late_growth_pending": int((result["late_growth_status"] == "pending").sum()),
         "deep_search_skipped": int(result["skip_deep_search"].sum()),

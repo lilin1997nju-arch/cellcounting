@@ -1,5 +1,6 @@
 import asyncio
 import json
+import sqlite3
 from pathlib import Path
 
 from cellvision.project_server import (
@@ -7,6 +8,7 @@ from cellvision.project_server import (
     ProjectRenamePayload,
     TaskPayload,
     _folder_name,
+    _manual_verdict_counts_for_plate,
     create_project_app,
 )
 
@@ -36,6 +38,7 @@ def test_production_project_hub_hides_specialist_training_and_mask_routes(
     assert "/api/multiplicity-training-candidates" not in paths
     assert "/api/mask-review-rounds" not in paths
     assert "/api/project/export-results" in paths
+    assert "/api/project/review-filter-counts" in paths
     assert "/api/project/tasks/{task_id_value}/offline-review-export" in paths
     assert "/api/project/tasks/{task_id_value}/export-offline-review-results" in paths
     assert "/api/project/tasks/{task_id_value}/import-offline-review" in paths
@@ -62,6 +65,37 @@ def test_production_dashboard_has_no_training_or_mask_review_entry():
     assert "用本轮结果训练并生成下一轮" not in quick_review
     assert "导出 .cvreview 审核数据包" in dashboard_js
     assert "轮廓和快捷键与生产审核一致" in html
+    assert "统一审核筛选条件" in html
+    assert "筛选命中孔数" in html
+    assert "合格孔" in dashboard_js
+    assert "待定孔" in dashboard_js
+    assert "排除孔" in dashboard_js
+    assert "openReviewFilterDialog" not in dashboard_js
+    assert "refreshReviewFilterCounts" in dashboard_js
+
+
+def test_plate_manual_verdict_counts_keep_unreviewed_wells_unclassified(tmp_path: Path):
+    artifact_root = tmp_path / "plate"
+    predictions = artifact_root / "predictions"
+    predictions.mkdir(parents=True)
+    (predictions / "latest_well_screening.csv").write_text(
+        "well,review_decision\nA1,approved\nA2,pending\nA3,rejected\nA4,\n",
+        encoding="utf-8",
+    )
+    database = artifact_root / "annotations" / "annotations.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE well_screening_reviews(well TEXT PRIMARY KEY, decision TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO well_screening_reviews(well, decision) VALUES (?, ?)",
+            [("A1", "approved"), ("A2", "pending"), ("A3", "rejected")],
+        )
+
+    counts = _manual_verdict_counts_for_plate({"artifact_root": str(artifact_root)})
+
+    assert counts == {"approved": 1, "pending": 1, "rejected": 1, "unclassified": 1}
 
 
 def test_plate_review_manager_resolves_sibling_projects_and_uses_lru_limit(tmp_path: Path):

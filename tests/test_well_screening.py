@@ -9,9 +9,12 @@ from cellvision.well_screening import (
     _latest_prediction_source,
     _manual_missed_objects,
     _merge_selected_well_rows,
+    build_well_screening,
+    ensure_well_timepoint_cell_count_review_table,
     late_growth_gate,
     save_late_growth_review,
 )
+from cellvision.multiplicity import ensure_integrated_review_table, save_integrated_reviews
 from cellvision.late_growth_inference import (
     DenseGrowthMetrics,
     _representative_instance_center,
@@ -199,3 +202,75 @@ def test_manual_missed_objects_persist_across_inference_rounds(tmp_path):
 
     assert list(manual["candidate_id"]) == ["A2:T0:manual:1"]
     assert bool(manual.iloc[0]["is_manual_missed"]) is True
+
+
+def test_cell_total_recalculates_from_labels_until_human_override(tmp_path):
+    artifact = tmp_path / "artifacts"
+    predictions = artifact / "predictions"
+    manifests = artifact / "manifests"
+    predictions.mkdir(parents=True)
+    manifests.mkdir(parents=True)
+    rows = []
+    for index, timepoint in enumerate(("T0", "T1", "T2"), start=1):
+        rows.append({
+            "candidate_id": f"A1:{timepoint}:1",
+            "well": "A1",
+            "timepoint": timepoint,
+            "x_px": 100.0 * index,
+            "y_px": 100.0 * index,
+            "diameter_px": 12.0,
+            "integrated_label": "single",
+            "integrated_confidence": 0.95,
+            "integrated_round_id": "round-1",
+        })
+    pd.DataFrame(rows).to_csv(
+        predictions / "latest_integrated_predictions.csv", index=False
+    )
+    pd.DataFrame([
+        {"well": "A1", "timepoint": timepoint, "decode_status": "ok"}
+        for timepoint in ("T0", "T1", "T2")
+    ]).to_csv(manifests / "images.csv", index=False)
+    config = {"paths": {"artifact_root": str(artifact)}}
+    database = artifact / "annotations" / "annotations.db"
+    database.parent.mkdir(parents=True)
+
+    build_well_screening(config, database)
+    initial = pd.read_csv(predictions / "latest_well_screening.csv").iloc[0]
+    assert initial["t1_cell_units"] == 1
+    assert initial["t1_cell_units_source"] == "automatic"
+
+    ensure_integrated_review_table(database)
+    save_integrated_reviews(database, "round-1", [{
+        "candidate_id": "A1:T1:1",
+        "predicted_label": "single",
+        "reviewed_label": "touching_doublet",
+    }], "tester")
+    build_well_screening(config, database, selected_wells={"A1"})
+    recalculated = pd.read_csv(predictions / "latest_well_screening.csv").iloc[0]
+    assert recalculated["t1_cell_units"] == 2
+    assert recalculated["t1_cell_units_source"] == "automatic"
+
+    ensure_well_timepoint_cell_count_review_table(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO well_timepoint_cell_count_reviews VALUES (?, ?, ?, ?, ?)",
+            ("A1", "T1", 7, "tester", "now"),
+        )
+    save_integrated_reviews(database, "round-1", [{
+        "candidate_id": "A1:T1:1",
+        "predicted_label": "single",
+        "reviewed_label": "cluster_3plus",
+    }], "tester")
+    build_well_screening(config, database, selected_wells={"A1"})
+    locked = pd.read_csv(predictions / "latest_well_screening.csv").iloc[0]
+    assert locked["t1_cell_units"] == 7
+    assert locked["t1_cell_units_source"] == "human"
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM well_timepoint_cell_count_reviews WHERE well='A1' AND timepoint='T1'"
+        )
+    build_well_screening(config, database, selected_wells={"A1"})
+    restored = pd.read_csv(predictions / "latest_well_screening.csv").iloc[0]
+    assert restored["t1_cell_units"] == 3
+    assert restored["t1_cell_units_source"] == "automatic"

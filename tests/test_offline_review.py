@@ -50,6 +50,18 @@ def _fixture(tmp_path: Path) -> tuple[Path, dict]:
 
 def test_offline_bundle_is_self_contained_and_uses_relative_images(tmp_path: Path):
     manifest, task = _fixture(tmp_path)
+    artifact = Path(json.loads(manifest.read_text(encoding="utf-8"))["plates"][0]["artifact_root"])
+    database = artifact / "annotations" / "annotations.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE well_timepoint_cell_count_reviews ("
+            "well TEXT NOT NULL, timepoint TEXT NOT NULL, cell_count INTEGER NOT NULL, "
+            "reviewer TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (well, timepoint))"
+        )
+        connection.execute(
+            "INSERT INTO well_timepoint_cell_count_reviews VALUES (?, ?, ?, ?, ?)",
+            ("C2", "T0", 4, "tester", "now"),
+        )
     bundle, summary = build_offline_review_bundle(manifest, task, max_image_size=64)
     try:
         with ZipFile(bundle) as archive:
@@ -60,6 +72,14 @@ def test_offline_bundle_is_self_contained_and_uses_relative_images(tmp_path: Pat
             assert BUNDLE_FORMAT in data_script
             assert str(tmp_path) not in data_script
             assert "images/board-1/C2/T0.jpg" in data_script
+            assert '"cell_count_overrides":{"T0":4}' in data_script
+            html = archive.read("index.html").decode("utf-8")
+            script = archive.read("assets/offline-review.js").decode("utf-8")
+            assert '<option value="unclassified">未判定</option>' in html
+            assert "人工判定（Q/W/E）" in html
+            assert "function cellTotal(p,w,timepoint)" in script
+            assert "cell_count_overrides:{...ws.cell_count_overrides}" in script
+            assert 'const decision={q:"approved",w:"pending",e:"rejected"}' in script
         assert summary == {
             "plate_count": 1, "image_count": 1, "object_count": 1,
             "missing_image_count": 0, "missing_images": [],
@@ -128,6 +148,7 @@ def test_nonempty_later_import_replaces_the_plate_review_state(tmp_path: Path):
                 "well": "C2",
                 "screening_decision": "approved",
                 "completed": True,
+                "cell_count_overrides": {"T0": 6},
             }],
         }],
     }
@@ -264,6 +285,7 @@ def test_offline_import_rebuilds_the_changed_plate_summary(tmp_path: Path, monke
     assert rebuilt == [fake_config]
     assert result["refreshed_plates"] == 1
     assert result["refresh_warnings"] == []
+    assert result["updated_cell_count_overrides"] == 0
 
 
 def test_normal_review_results_can_be_exported_for_production_import(tmp_path: Path):
@@ -286,6 +308,7 @@ def test_normal_review_results_can_be_exported_for_production_import(tmp_path: P
                 "well": "C2",
                 "screening_decision": "approved",
                 "completed": True,
+                "cell_count_overrides": {"T0": 5},
             }],
         }],
     })
@@ -299,7 +322,55 @@ def test_normal_review_results_can_be_exported_for_production_import(tmp_path: P
     reviewed = next(item for item in plate["objects"] if item["candidate_id"] == "C2:T0:1")
     assert reviewed["reviewed_label"] == "touching_doublet"
     well = next(item for item in plate["wells"] if item["well"] == "C2")
-    assert well == {"well": "C2", "screening_decision": "approved", "completed": True}
+    assert well == {
+        "well": "C2",
+        "screening_decision": "approved",
+        "completed": True,
+        "cell_count_overrides": {"T0": 5},
+    }
+
+
+def test_offline_import_can_clear_cell_count_override_without_completing_well(tmp_path: Path):
+    manifest, task = _fixture(tmp_path)
+    artifact = Path(json.loads(manifest.read_text(encoding="utf-8"))["plates"][0]["artifact_root"])
+    database = artifact / "annotations" / "annotations.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE well_timepoint_cell_count_reviews ("
+            "well TEXT NOT NULL, timepoint TEXT NOT NULL, cell_count INTEGER NOT NULL, "
+            "reviewer TEXT, updated_at TEXT NOT NULL, PRIMARY KEY (well, timepoint))"
+        )
+        connection.execute(
+            "INSERT INTO well_timepoint_cell_count_reviews VALUES (?, ?, ?, ?, ?)",
+            ("C2", "T1", 8, "old", "old"),
+        )
+    payload = {
+        "format": BUNDLE_FORMAT,
+        "version": 1,
+        "task_id": "task-1",
+        "project_id": "project-1",
+        "reviewer": "Reviewer",
+        "plates": [{
+            "slug": "board-1",
+            "round_id": "round-1",
+            "objects": [],
+            "wells": [{
+                "well": "C2",
+                "screening_decision": "unclassified",
+                "completed": False,
+                "cell_count_overrides": {},
+            }],
+        }],
+    }
+
+    result = import_offline_review_results(manifest, task, payload)
+
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            "SELECT well, timepoint, cell_count FROM well_timepoint_cell_count_reviews"
+        ).fetchall()
+    assert rows == []
+    assert result["updated_cell_count_overrides"] == 0
 
 
 def test_offline_result_accepts_an_older_export_of_the_same_task_and_project(tmp_path: Path):

@@ -33,13 +33,23 @@
         </div>
         <span id="mountedMeta" class="badge"></span>
       </div>
+      <form id="reviewFilterForm" class="review-filter-bar">
+        <div class="review-filter-copy"><strong>统一审核筛选条件</strong><span>适用于下方所有板子，留空表示不限。</span></div>
+        <label>末点覆盖率 &gt;<div class="number-with-unit"><input id="coverageMin" type="number" min="0" max="100" step="0.01" placeholder="不限"><span>%</span></div></label>
+        <label>Day2 杂质数 &lt;<input id="debrisMax" type="number" min="0" step="1" placeholder="不限"></label>
+        <label>Day2 细胞数<input id="day2CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="day2CellsMax" type="number" min="0" step="1" placeholder="上限"></label>
+        <button id="applyReviewFilterButton" class="primary" type="submit">应用并统计</button>
+        <button id="clearReviewFilterButton" class="secondary" type="button">清空</button>
+        <strong id="reviewFilterMatchCount" class="filter-match-count">满足条件 — 孔</strong>
+        <p id="reviewFilterError" class="form-error" hidden></p>
+      </form>
       <div class="table-wrap">
         <table>
           <thead><tr>
             <th>板子</th><th>状态</th><th>审核进度</th><th>结果汇总</th>
-            <th>总孔数</th><th>耗时</th><th>操作</th>
+            <th>筛选命中孔数</th><th>总孔数</th><th>耗时</th><th>操作</th>
           </tr></thead>
-          <tbody id="plateRows"><tr><td colspan="7" class="empty">正在加载…</td></tr></tbody>
+          <tbody id="plateRows"><tr><td colspan="8" class="empty">正在加载…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -76,6 +86,6 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-dashboard.js?v=20260819-portable-review-v2"></script>
+  <script src="/project-assets/project-dashboard.js?v=20260824-review-filter-v2"></script>
 </body>
 </html>
