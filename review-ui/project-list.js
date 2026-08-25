@@ -47,6 +47,9 @@ function desktopBridgeConfig() {
 }
 
 async function browseProjectFolder() {
+  if (window.cellvisionDesktop?.chooseFolder) {
+    return window.cellvisionDesktop.chooseFolder();
+  }
   const bridge = desktopBridgeConfig();
   if (bridge) {
     try {

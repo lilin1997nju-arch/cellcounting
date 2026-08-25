@@ -30,5 +30,6 @@ def test_production_pages_use_the_per_user_desktop_bridge():
     for name in ("project-list.js", "project-dashboard.js"):
         script = (ROOT / "review-ui" / name).read_text(encoding="utf-8")
         assert "cellvision.desktopBridgePort" in script
+        assert "window.cellvisionDesktop?.chooseFolder" in script
         assert "X-CellVision-Bridge-Token" in script
         assert "browseProjectFolder()" in script

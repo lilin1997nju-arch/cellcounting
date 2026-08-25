@@ -1,0 +1,68 @@
+{
+  "name": "cellvision-desktop",
+  "version": "0.2.0",
+  "description": "Cell Vision offline production desktop client",
+  "main": "main.js",
+  "author": "Cell Vision",
+  "license": "UNLICENSED",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test test/*.test.js",
+    "pack:win": "electron-builder --win nsis --x64"
+  },
+  "devDependencies": {
+    "electron": "43.4.1",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "com.cellvision.production.desktop",
+    "productName": "Cell Vision",
+    "artifactName": "CellVision-Setup-${version}-${arch}.${ext}",
+    "asar": true,
+    "files": [
+      "main.js",
+      "preload.js",
+      "splash.html",
+      "splash.js",
+      "styles.css",
+      "lib/**/*"
+    ],
+    "extraFiles": [
+      {
+        "from": "payload/Application",
+        "to": "Application"
+      },
+      {
+        "from": "payload/root",
+        "to": "."
+      }
+    ],
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Cell Vision",
+      "runAfterFinish": true,
+      "deleteAppDataOnUninstall": false,
+      "include": "build/installer.nsh"
+    }
+  }
+}

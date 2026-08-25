@@ -6,6 +6,9 @@ __pycache__/
 .pytest-*/
 .release-smoke-*/
 release/
+electron/node_modules/
+electron/dist/
+electron/payload/
 *.pyc
 .env
 .env.production

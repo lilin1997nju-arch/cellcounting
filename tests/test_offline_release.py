@@ -29,7 +29,12 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert '"repair_project_manifests.py"' in builder
     assert '"Recover-CellVision-Projects.cmd"' in builder
     assert '"recover_cellvision_projects.ps1"' in builder
+    assert '"recover_cellvision_projects_launcher.ps1"' in builder
     assert '"PROJECT-RECOVERY-README.txt"' in builder
+    assert '"Import-CellVision-Workspace.cmd"' in builder
+    assert '"import_cellvision_workspace.py"' in builder
+    assert '"import_cellvision_workspace.ps1"' in builder
+    assert '"import_cellvision_workspace_launcher.ps1"' in builder
     assert '"Open-CellVision.cmd"' in builder
     assert "python-$PythonVersion-amd64.exe" not in builder
     assert '"torch==2.11.0"' in builder
