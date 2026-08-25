@@ -329,8 +329,31 @@ function chooseOfflineReviewResult(taskId, button) {
 
 async function api(url, options) {
   const response = await fetch(url, options);
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw new Error(await apiErrorMessage(response));
   return response.json();
+}
+
+async function apiErrorMessage(response) {
+  const fallback = `请求失败（HTTP ${response.status}）`;
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    return fallback;
+  }
+  const detail = payload?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (!Array.isArray(detail)) return fallback;
+  const fieldLabels = { name: "任务名称", created_by: "创建人", path: "数据文件夹" };
+  const messages = detail.map(item => {
+    const field = [...(item?.loc || [])].reverse().find(value => fieldLabels[value]);
+    const label = fieldLabels[field];
+    if (label && ["missing", "string_too_short", "value_error"].includes(item?.type)) {
+      return label === "数据文件夹" ? "请选择数据文件夹" : `请填写${label}`;
+    }
+    return label ? `${label}：${item?.msg || "内容无效"}` : (item?.msg || "提交内容无效");
+  });
+  return [...new Set(messages)].join("；") || fallback;
 }
 
 async function exportProjectResults() {
@@ -763,6 +786,31 @@ Object.values(reviewFilterFields).forEach(id => {
   $(id).addEventListener("change", refreshReviewFilterCounts);
 });
 $("taskName").addEventListener("input", () => { $("taskName").dataset.edited = "1"; });
+
+function dashboardTaskFieldValues() {
+  return {
+    name: $("taskName").value.trim(),
+    created_by: $("createdBy").value.trim(),
+    path: $("folderPath").value.trim(),
+  };
+}
+
+function validateDashboardTaskFields() {
+  const values = dashboardTaskFieldValues();
+  const required = [
+    ["name", "taskName", "请填写任务名称"],
+    ["created_by", "createdBy", "请填写创建人"],
+    ["path", "folderPath", "请选择数据文件夹"],
+  ];
+  for (const [field, inputId, message] of required) {
+    if (values[field]) continue;
+    toast(message);
+    $(inputId).focus();
+    return null;
+  }
+  return values;
+}
+
 $("browseButton").addEventListener("click", async () => {
   $("analysisResult").textContent = "正在打开文件夹选择器…";
   try {
@@ -778,11 +826,17 @@ $("browseButton").addEventListener("click", async () => {
   }
 });
 $("analyzeButton").addEventListener("click", async () => {
+  const path = $("folderPath").value.trim();
+  if (!path) {
+    toast("请选择数据文件夹");
+    $("folderPath").focus();
+    return;
+  }
   try {
     showAnalysis(await api("/api/project/analyze-folder", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: $("folderPath").value.trim() }),
+      body: JSON.stringify({ path }),
     }));
   } catch (error) {
     $("analysisResult").textContent = `解析失败：${error.message}`;
@@ -790,15 +844,13 @@ $("analyzeButton").addEventListener("click", async () => {
   }
 });
 $("queueButton").addEventListener("click", async () => {
+  const values = validateDashboardTaskFields();
+  if (!values) return;
   try {
     const task = await api("/api/project/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        name: $("taskName").value.trim(),
-        created_by: $("createdBy").value.trim(),
-        path: $("folderPath").value.trim(),
-      }),
+      body: JSON.stringify(values),
     });
     $("taskDialog").close();
     const excluded = count(task.excluded_group_count);

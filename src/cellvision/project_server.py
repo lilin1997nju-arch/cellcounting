@@ -33,7 +33,7 @@ from starlette.background import BackgroundTask
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from PIL import Image, ImageEnhance
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .config import PROJECT_ROOT, artifact_path, load_config
 from .project_catalog import ProjectCatalog, catalog_path_for_manifest
@@ -895,11 +895,28 @@ def _remove_export_file(path: str) -> None:
 class FolderPayload(BaseModel):
     path: str = Field(min_length=1)
 
+    @field_validator("path", mode="before")
+    @classmethod
+    def validate_required_path(cls, value: Any) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError("数据文件夹不能为空")
+        return normalized
+
 
 class TaskPayload(FolderPayload):
-    name: str = Field(default="新建项目任务", min_length=1, max_length=120)
-    created_by: str = Field(default="未填写", min_length=1, max_length=80)
+    name: str = Field(min_length=1, max_length=120)
+    created_by: str = Field(min_length=1, max_length=80)
     selected_timepoint_labels: list[str] = Field(default_factory=list)
+
+    @field_validator("name", "created_by", mode="before")
+    @classmethod
+    def validate_required_text(cls, value: Any, info: Any) -> str:
+        normalized = str(value or "").strip()
+        if not normalized:
+            label = "任务名称" if info.field_name == "name" else "创建人"
+            raise ValueError(f"{label}不能为空")
+        return normalized
 
 
 class ProjectRenamePayload(BaseModel):

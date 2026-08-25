@@ -3,6 +3,9 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pytest
+from pydantic import ValidationError
+
 from cellvision.project_server import (
     _PlateReviewManager,
     ProjectRenamePayload,
@@ -45,6 +48,38 @@ def test_cross_timepoint_selection_keeps_only_complete_board_intersection():
     excluded = {item["group_id"]: item for item in result["excluded_groups"]}
     assert excluded["G2"]["missing_timepoints"] == ["Day1"]
     assert excluded["G3"]["incomplete_timepoints"] == ["Day2"]
+
+
+@pytest.mark.parametrize(
+    ("payload", "missing_field"),
+    [
+        ({"name": "", "created_by": "张三", "path": r"E:\\data"}, "name"),
+        ({"name": "任务", "created_by": "   ", "path": r"E:\\data"}, "created_by"),
+        ({"name": "任务", "created_by": "张三", "path": ""}, "path"),
+    ],
+)
+def test_task_payload_reports_the_specific_blank_required_field(payload, missing_field):
+    with pytest.raises(ValidationError) as error:
+        TaskPayload.model_validate(payload)
+
+    assert error.value.errors()[0]["loc"] == (missing_field,)
+
+
+def test_new_task_dialog_shows_selected_timepoint_coverage_and_named_field_errors():
+    root = Path(__file__).parents[1] / "review-ui"
+    project_list = (root / "project-list.js").read_text(encoding="utf-8")
+    dashboard = (root / "project-dashboard.js").read_text(encoding="utf-8")
+    dashboard_css = (root / "project-dashboard.css").read_text(encoding="utf-8")
+
+    assert "当前所选时间点可计算" in project_list
+    assert "排除 ${coverage.excluded.length} 块板" in project_list
+    assert "selectedTimepointCoverage" in project_list
+    for script in (project_list, dashboard):
+        assert 'created_by: "创建人"' in script
+        assert "请填写创建人" in script
+        assert "请选择数据文件夹" in script
+    assert ".review-filter-copy{display:flex;flex:1 0 100%" in dashboard_css
+    assert "gap:14px 16px" in dashboard_css
 
 
 def test_production_project_hub_hides_specialist_training_and_mask_routes(

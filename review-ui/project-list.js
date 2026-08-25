@@ -29,8 +29,36 @@ const toast = text => {
 
 async function api(url, options) {
   const response = await fetch(url, options);
-  if (!response.ok) throw new Error(await response.text());
+  if (!response.ok) throw new Error(await apiErrorMessage(response));
   return response.json();
+}
+
+async function apiErrorMessage(response) {
+  const fallback = `请求失败（HTTP ${response.status}）`;
+  let payload;
+  try {
+    payload = await response.json();
+  } catch (_) {
+    return fallback;
+  }
+  const detail = payload?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (!Array.isArray(detail)) return fallback;
+  const fieldLabels = {
+    name: "任务名称",
+    created_by: "创建人",
+    path: "数据文件夹",
+    selected_timepoint_labels: "计算时间点",
+  };
+  const messages = detail.map(item => {
+    const field = [...(item?.loc || [])].reverse().find(value => fieldLabels[value]);
+    const label = fieldLabels[field];
+    if (label && ["missing", "string_too_short", "value_error"].includes(item?.type)) {
+      return label === "数据文件夹" ? "请选择数据文件夹" : `请填写${label}`;
+    }
+    return label ? `${label}：${item?.msg || "内容无效"}` : (item?.msg || "提交内容无效");
+  });
+  return [...new Set(messages)].join("；") || fallback;
 }
 
 function desktopBridgeConfig() {
@@ -499,7 +527,6 @@ function renderAnalysis(value) {
   analysis = value;
   applyDefaultTaskName(value.folder_name || folderNameFromPath($("folderPath").value));
   const options = value.timepoint_options || [];
-  $("analysisResult").textContent = `已解析：${value.group_count} 个板组，${value.session_count} 个时间点文件夹\n实际日龄：${(value.day_labels || []).join(", ")}\n完整96孔组：${value.complete_groups}`;
   const picker = $("timepointPicker");
   picker.hidden = false;
   const defaults = new Set(value.default_selected_timepoint_labels || []);
@@ -511,11 +538,52 @@ function renderAnalysis(value) {
   $("endpointNote").hidden = false;
   updateEndpoint();
   picker.querySelectorAll("input").forEach(input => input.addEventListener("change", updateEndpoint));
-  $("queueButton").disabled = !value.selection_valid;
 }
 
 function selectedDays() {
   return [...$("timepointPicker").querySelectorAll("input:checked")].map(input => input.dataset.day);
+}
+
+function selectedTimepointCoverage(selected) {
+  const byGroup = new Map();
+  for (const row of analysis?.session_records || []) {
+    const groupId = String(row.group_id || "").trim();
+    if (!groupId) continue;
+    if (!byGroup.has(groupId)) {
+      byGroup.set(groupId, { groupId, boardId: String(row.board_id || "").trim(), days: new Map() });
+    }
+    const group = byGroup.get(groupId);
+    const day = String(row.day_label || "");
+    if (!group.days.has(day)) group.days.set(day, []);
+    group.days.get(day).push(row);
+  }
+  const included = [];
+  const excluded = [];
+  for (const group of [...byGroup.values()].sort((left, right) => left.groupId.localeCompare(right.groupId))) {
+    const missing = selected.filter(day => !group.days.has(day));
+    const incomplete = selected.filter(day => {
+      const rows = group.days.get(day);
+      return rows && !rows.some(row => row.group_complete === true || ["1", "true", "yes", "y"].includes(String(row.group_complete).toLowerCase()));
+    });
+    if (!missing.length && !incomplete.length) {
+      included.push(group);
+      continue;
+    }
+    const reasons = [];
+    if (missing.length) reasons.push(`缺少 ${missing.join("、")}`);
+    if (incomplete.length) reasons.push(`${incomplete.join("、")} 文件不完整`);
+    excluded.push({ ...group, reason: reasons.join("；") });
+  }
+  return { included, excluded };
+}
+
+function updateAnalysisCoverage(selected) {
+  const coverage = selectedTimepointCoverage(selected);
+  const exclusionLines = coverage.excluded.length
+    ? `\n排除 ${coverage.excluded.length} 块板：\n${coverage.excluded.map(item => `- ${item.boardId || item.groupId}：${item.reason}`).join("\n")}`
+    : "\n所有板子的当前所选时间点均完整一致";
+  $("analysisResult").textContent = `已解析：原始 ${analysis?.group_count || 0} 个板组，${analysis?.session_count || 0} 个时间点文件夹\n实际日龄：${(analysis?.day_labels || []).join(", ")}\n当前所选时间点可计算：${coverage.included.length} 块板${exclusionLines}`;
+  return coverage;
 }
 
 function updateEndpoint() {
@@ -529,7 +597,32 @@ function updateEndpoint() {
   $("endpointNote").textContent = valid
     ? `末点：${later[later.length - 1].day_label}（默认使用最后勾选的后期时间点做生长快速排除）`
     : `当前不能加入队列：${missing.length ? `缺少 ${missing.join("、")}；` : "至少选择一个 Day7 或更晚时间点；"}`;
-  $("queueButton").disabled = !valid;
+  const coverage = updateAnalysisCoverage(selected);
+  $("queueButton").disabled = !valid || coverage.included.length < 1;
+}
+
+function taskFieldValues() {
+  return {
+    name: $("taskName").value.trim(),
+    created_by: $("createdBy").value.trim(),
+    path: $("folderPath").value.trim(),
+  };
+}
+
+function validateTaskFields() {
+  const values = taskFieldValues();
+  const required = [
+    ["name", "taskName", "请填写任务名称"],
+    ["created_by", "createdBy", "请填写创建人"],
+    ["path", "folderPath", "请选择数据文件夹"],
+  ];
+  for (const [field, inputId, message] of required) {
+    if (values[field]) continue;
+    toast(message);
+    $(inputId).focus();
+    return null;
+  }
+  return values;
 }
 
 function closeTaskDialog() {
@@ -614,11 +707,17 @@ $("browseButton").addEventListener("click", async () => {
 });
 
 async function analyzeFolder() {
+  const path = $("folderPath").value.trim();
+  if (!path) {
+    toast("请选择数据文件夹");
+    $("folderPath").focus();
+    return;
+  }
   try {
     renderAnalysis(await api("/api/project/analyze-folder", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ path: $("folderPath").value.trim() }),
+      body: JSON.stringify({ path }),
     }));
   } catch (error) {
     $("analysisResult").textContent = `解析失败：${error.message}`;
@@ -629,14 +728,14 @@ async function analyzeFolder() {
 $("analyzeButton").addEventListener("click", analyzeFolder);
 $("taskName").addEventListener("input", () => { $("taskName").dataset.edited = "1"; });
 $("queueButton").addEventListener("click", async () => {
+  const values = validateTaskFields();
+  if (!values) return;
   try {
     const task = await api("/api/project/tasks", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        name: $("taskName").value.trim(),
-        created_by: $("createdBy").value.trim(),
-        path: $("folderPath").value.trim(),
+        ...values,
         selected_timepoint_labels: selectedDays(),
       }),
     });

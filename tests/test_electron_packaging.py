@@ -14,6 +14,10 @@ def test_electron_client_is_pinned_and_has_no_native_runtime_dependencies():
     assert "dependencies" not in package
     assert package["build"]["nsis"]["perMachine"] is True
     assert package["build"]["nsis"]["deleteAppDataOnUninstall"] is False
+    assert package["build"]["nsis"]["createDesktopShortcut"] is True
+    assert package["build"]["nsis"]["createStartMenuShortcut"] is True
+    assert package["build"]["nsis"]["shortcutName"] == "Cell Vision"
+    assert "icon" not in package["build"]["win"]
 
 
 def test_nsis_installer_preserves_workspace_and_configures_prerequisites():
