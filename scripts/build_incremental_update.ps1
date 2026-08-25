@@ -1,8 +1,9 @@
 <# Build the one-click Cell Vision production update package. #>
 [CmdletBinding()]
 param(
-    [string]$PackageId = "cellvision-update-20260824-r1",
-    [string]$TargetVersion = "2026.08.24-r1",
+    [string]$PackageId = "cellvision-update-20260825-r2",
+    [string]$PackageName = "CellVision-Update-20260825-r2",
+    [string]$TargetVersion = "2026.08.25-r2",
     [string]$ProductionBaseline = "CellVision-offline-6231fdce81-cpu (informational only)",
     [string]$ProductionApplicationRoot = "",
     [string]$OutputRoot = "",
@@ -19,7 +20,6 @@ if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
 }
 $ProductionApplicationRoot = [IO.Path]::GetFullPath($ProductionApplicationRoot)
 $OutputRoot = [IO.Path]::GetFullPath($OutputRoot)
-$packageName = "CellVision-Update-20260824-r1"
 $packageRoot = [IO.Path]::GetFullPath((Join-Path $OutputRoot $packageName))
 $zipPath = [IO.Path]::GetFullPath((Join-Path $OutputRoot "$packageName.zip"))
 $zipHashPath = "$zipPath.sha256.txt"
@@ -44,11 +44,13 @@ $runtimeFiles = @(
     "review-ui/project-dashboard.js",
     "src/cellvision/offline_review.py",
     "src/cellvision/project_server.py",
+    "src/cellvision/project_worker.py",
     "src/cellvision/review_payloads.py",
     "src/cellvision/review_quick_review.py",
     "src/cellvision/review_screening_api.py",
     "src/cellvision/review_summary.py",
-    "src/cellvision/well_screening.py"
+    "src/cellvision/well_screening.py",
+    "scripts/analyze_day14_sheet_growth.py"
 )
 
 foreach ($relative in $runtimeFiles) {
@@ -101,7 +103,7 @@ $readmeLines = @(
     "Install:",
     "1. Put the entire $packageName folder in the Cell Vision installation root.",
     "2. Double-click Update-CellVision.cmd and approve the Windows administrator prompt.",
-    "3. The updater locates CellVisionProduction, backs up 15 files, replaces them, restarts the service, and checks /api/ready.",
+    "3. The updater locates CellVisionProduction, backs up 17 files, replaces them, restarts the service, and checks /api/ready.",
     "4. Installation is complete when update completed successfully is shown.",
     "",
     "Rollback:",

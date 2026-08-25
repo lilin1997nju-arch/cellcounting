@@ -628,6 +628,10 @@ def _project_review_filter_counts(
     *,
     coverage_min: float | None = None,
     debris_max: int | None = None,
+    day0_cells_min: int | None = None,
+    day0_cells_max: int | None = None,
+    day1_cells_min: int | None = None,
+    day1_cells_max: int | None = None,
     day2_cells_min: int | None = None,
     day2_cells_max: int | None = None,
 ) -> dict[str, Any]:
@@ -678,15 +682,26 @@ def _project_review_filter_counts(
             coverage = _export_percentage(
                 report_row.get("day14_sheet_coverage_pct", report_row.get("sheet_coverage_pct"))
             )
-            cells = _export_number(screening_row.get("t2_cell_units"))
+            cells = {
+                day: _export_number(screening_row.get(f"t{day}_cell_units"))
+                for day in (0, 1, 2)
+            }
             debris = debris_counts.get((well, "T2:debris"), 0)
             if coverage_min is not None and (coverage is None or coverage <= coverage_min):
                 continue
             if debris_max is not None and debris >= debris_max:
                 continue
-            if day2_cells_min is not None and cells < day2_cells_min:
+            if day0_cells_min is not None and cells[0] < day0_cells_min:
                 continue
-            if day2_cells_max is not None and cells > day2_cells_max:
+            if day0_cells_max is not None and cells[0] > day0_cells_max:
+                continue
+            if day1_cells_min is not None and cells[1] < day1_cells_min:
+                continue
+            if day1_cells_max is not None and cells[1] > day1_cells_max:
+                continue
+            if day2_cells_min is not None and cells[2] < day2_cells_min:
+                continue
+            if day2_cells_max is not None and cells[2] > day2_cells_max:
                 continue
             matching += 1
         reviewable = len(reviewable_wells)
@@ -1011,32 +1026,76 @@ def _validate_timepoint_selection(
     return chosen_labels, str(endpoint["day_label"]), int(endpoint["day_number"])
 
 
-def _validate_group_timepoint_coverage(
-    session_records: list[dict[str, Any]], selected: list[str]
-) -> None:
-    """Do not enqueue a multi-board task with a silently incomplete board."""
+def _session_is_complete(row: dict[str, Any]) -> bool:
+    value = row.get("group_complete")
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "y"}
+    return bool(value)
 
-    missing: list[str] = []
-    by_group: dict[str, dict[str, dict[str, Any]]] = {}
+
+def _complete_group_timepoint_selection(
+    session_records: list[dict[str, Any]], selected: list[str]
+) -> dict[str, Any]:
+    """Return only boards that have complete sessions at every selected day."""
+
+    selected_labels = list(dict.fromkeys(str(label) for label in selected))
+    selected_lookup = {label.casefold(): label for label in selected_labels}
+    by_group: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    board_ids: dict[str, str] = {}
     for row in session_records:
-        group = str(row.get("group_id", ""))
-        label = str(row.get("day_label", "")).casefold()
-        by_group.setdefault(group, {})[label] = row
+        group = str(row.get("group_id") or "").strip()
+        label = str(row.get("day_label") or "").casefold()
+        if not group:
+            continue
+        by_group.setdefault(group, {})
+        board_id = str(row.get("board_id") or "").strip()
+        if board_id:
+            board_ids.setdefault(group, board_id)
+        if label in selected_lookup:
+            by_group[group].setdefault(label, []).append(row)
+
+    included_group_ids: list[str] = []
+    excluded_groups: list[dict[str, Any]] = []
     for group, available in sorted(by_group.items()):
-        absent = [label for label in selected if str(label).casefold() not in available]
-        if absent:
-            missing.append(f"{group}: {', '.join(absent)}")
-        incomplete = [
-            label for label in selected
-            if label.casefold() in available
-            and not bool(available[label.casefold()].get("group_complete"))
+        missing = [
+            label for key, label in selected_lookup.items() if key not in available
         ]
-        if incomplete:
-            missing.append(f"{group}: incomplete 96-well session(s) at {', '.join(incomplete)}")
-    if missing:
-        preview = "; ".join(missing[:4])
-        suffix = " …" if len(missing) > 4 else ""
-        raise HTTPException(status_code=422, detail=f"所选时间点在部分板子中缺失：{preview}{suffix}")
+        incomplete = [
+            label
+            for key, label in selected_lookup.items()
+            if key in available and not any(_session_is_complete(row) for row in available[key])
+        ]
+        if missing or incomplete:
+            reasons = []
+            if missing:
+                reasons.append(f"缺少 {', '.join(missing)}")
+            if incomplete:
+                reasons.append(f"{', '.join(incomplete)} 不完整")
+            excluded_groups.append({
+                "group_id": group,
+                "board_id": board_ids.get(group, ""),
+                "missing_timepoints": missing,
+                "incomplete_timepoints": incomplete,
+                "reason": "；".join(reasons),
+            })
+        else:
+            included_group_ids.append(group)
+
+    included = set(included_group_ids)
+    selected_sessions = [
+        row
+        for row in session_records
+        if str(row.get("group_id") or "").strip() in included
+        and str(row.get("day_label") or "").casefold() in selected_lookup
+        and _session_is_complete(row)
+    ]
+    return {
+        "included_group_ids": included_group_ids,
+        "included_group_count": len(included_group_ids),
+        "excluded_group_count": len(excluded_groups),
+        "excluded_groups": excluded_groups,
+        "sessions": selected_sessions,
+    }
 
 
 def _parse_folder(path_value: str) -> dict[str, Any]:
@@ -1060,6 +1119,25 @@ def _parse_folder(path_value: str) -> dict[str, Any]:
         default_endpoint_day = None
         selection_valid = False
         selection_error = str(exc.detail)
+    default_coverage = (
+        _complete_group_timepoint_selection(
+            [
+                _safe(row)
+                for row in sessions[
+                    ["group_id", "board_id", "timepoint_label", "day_label", "culture_day", "session_path", "group_complete"]
+                ].to_dict(orient="records")
+            ],
+            default_selected,
+        )
+        if selection_valid
+        else {
+            "included_group_ids": [],
+            "included_group_count": 0,
+            "excluded_group_count": 0,
+            "excluded_groups": [],
+            "sessions": [],
+        }
+    )
     day_values = sorted(
         {str(value) for value in sessions["day_label"].dropna()},
         key=lambda label: (
@@ -1093,6 +1171,9 @@ def _parse_folder(path_value: str) -> dict[str, Any]:
         "default_endpoint_day_number": default_endpoint_day,
         "selection_valid": selection_valid,
         "selection_error": selection_error,
+        "compatible_group_count": default_coverage["included_group_count"],
+        "excluded_group_count": default_coverage["excluded_group_count"],
+        "excluded_groups": default_coverage["excluded_groups"],
         "session_records": [
             _safe(row)
             for row in sessions[
@@ -2741,11 +2822,23 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
         project_id: str | None = None,
         coverage_min: float | None = None,
         debris_max: int | None = None,
+        day0_cells_min: int | None = None,
+        day0_cells_max: int | None = None,
+        day1_cells_min: int | None = None,
+        day1_cells_max: int | None = None,
         day2_cells_min: int | None = None,
         day2_cells_max: int | None = None,
     ) -> dict[str, Any]:
-        if day2_cells_min is not None and day2_cells_max is not None and day2_cells_min > day2_cells_max:
-            raise HTTPException(status_code=422, detail="Day2 cell minimum exceeds maximum")
+        for day, minimum, maximum in (
+            (0, day0_cells_min, day0_cells_max),
+            (1, day1_cells_min, day1_cells_max),
+            (2, day2_cells_min, day2_cells_max),
+        ):
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Day{day} cell minimum exceeds maximum",
+                )
         selected_path = manifest_for_project(project_id)
         selected_manifest = _read_manifest(selected_path)
         if selected_manifest is None:
@@ -2755,6 +2848,10 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             selected_path,
             coverage_min=coverage_min,
             debris_max=debris_max,
+            day0_cells_min=day0_cells_min,
+            day0_cells_max=day0_cells_max,
+            day1_cells_min=day1_cells_min,
+            day1_cells_max=day1_cells_max,
             day2_cells_min=day2_cells_min,
             day2_cells_max=day2_cells_max,
         )
@@ -3372,12 +3469,15 @@ public static class CellVisionWindowFocus
         selected, endpoint_label, endpoint_day = _validate_timepoint_selection(
             analysis["timepoint_options"], payload.selected_timepoint_labels
         )
-        _validate_group_timepoint_coverage(analysis.get("session_records", []), selected)
-        selected_set = {label.casefold() for label in selected}
-        selected_sessions = [
-            row for row in analysis.get("session_records", [])
-            if str(row.get("day_label", "")).casefold() in selected_set
-        ]
+        coverage = _complete_group_timepoint_selection(
+            analysis.get("session_records", []), selected
+        )
+        if not coverage["included_group_ids"]:
+            raise HTTPException(
+                status_code=422,
+                detail="所选时间点没有完整一致的板子，无法创建计算任务。",
+            )
+        selected_sessions = coverage["sessions"]
         endpoint_timepoint_labels = sorted({
             str(row.get("timepoint_label"))
             for row in selected_sessions
@@ -3430,6 +3530,8 @@ public static class CellVisionWindowFocus
                 "endpoint_day_label": endpoint_label,
             },
             "sessions": selected_sessions,
+            "included_group_ids": coverage["included_group_ids"],
+            "excluded_groups": coverage["excluded_groups"],
             "created_at": now,
         }
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3472,8 +3574,12 @@ public static class CellVisionWindowFocus
             "status": "queued",
             "created_at": now,
             "updated_at": now,
-            "group_count": analysis["group_count"],
-            "session_count": analysis["session_count"],
+            "group_count": coverage["included_group_count"],
+            "session_count": len(selected_sessions),
+            "source_group_count": analysis["group_count"],
+            "source_session_count": analysis["session_count"],
+            "excluded_group_count": coverage["excluded_group_count"],
+            "excluded_groups": coverage["excluded_groups"],
             "timepoint_labels": analysis["timepoint_labels"],
             "day_labels": analysis["day_labels"],
             "timepoint_options": analysis["timepoint_options"],

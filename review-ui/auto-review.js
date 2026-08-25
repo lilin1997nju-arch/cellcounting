@@ -61,12 +61,20 @@ const finiteFilter = name => {
 const entryFilters = {
   coverageMin: finiteFilter("coverage_min"),
   debrisMax: finiteFilter("debris_max"),
+  day0CellsMin: finiteFilter("day0_cells_min"),
+  day0CellsMax: finiteFilter("day0_cells_max"),
+  day1CellsMin: finiteFilter("day1_cells_min"),
+  day1CellsMax: finiteFilter("day1_cells_max"),
   day2CellsMin: finiteFilter("day2_cells_min"),
   day2CellsMax: finiteFilter("day2_cells_max")
 };
 const plateFilterFields = {
   coverageMin: "plateCoverageMin",
   debrisMax: "plateDebrisMax",
+  day0CellsMin: "plateDay0CellsMin",
+  day0CellsMax: "plateDay0CellsMax",
+  day1CellsMin: "plateDay1CellsMin",
+  day1CellsMax: "plateDay1CellsMax",
   day2CellsMin: "plateDay2CellsMin",
   day2CellsMax: "plateDay2CellsMax"
 };
@@ -135,11 +143,15 @@ function pct(value) {
 function passesEntryFilters(item) {
   const coverage = Number(item.endpoint_coverage_pct);
   const debris = Number(item.day2_debris_count);
-  const cells = Number(item.day2_cell_count);
+  const cells = [0, 1, 2].map(day => Number(item[`day${day}_cell_count`]));
   if (entryFilters.coverageMin !== null && (!Number.isFinite(coverage) || coverage <= entryFilters.coverageMin)) return false;
   if (entryFilters.debrisMax !== null && (!Number.isFinite(debris) || debris >= entryFilters.debrisMax)) return false;
-  if (entryFilters.day2CellsMin !== null && (!Number.isFinite(cells) || cells < entryFilters.day2CellsMin)) return false;
-  if (entryFilters.day2CellsMax !== null && (!Number.isFinite(cells) || cells > entryFilters.day2CellsMax)) return false;
+  for (const day of [0, 1, 2]) {
+    const minimum = entryFilters[`day${day}CellsMin`];
+    const maximum = entryFilters[`day${day}CellsMax`];
+    if (minimum !== null && (!Number.isFinite(cells[day]) || cells[day] < minimum)) return false;
+    if (maximum !== null && (!Number.isFinite(cells[day]) || cells[day] > maximum)) return false;
+  }
   return true;
 }
 
@@ -147,8 +159,12 @@ function renderEntryFilterSummary(matched, total) {
   const conditions = [];
   if (entryFilters.coverageMin !== null) conditions.push(`末点覆盖率 > ${entryFilters.coverageMin}%`);
   if (entryFilters.debrisMax !== null) conditions.push(`Day2杂质 < ${entryFilters.debrisMax}`);
-  if (entryFilters.day2CellsMin !== null || entryFilters.day2CellsMax !== null) {
-    conditions.push(`Day2细胞 ${entryFilters.day2CellsMin ?? "不限"}～${entryFilters.day2CellsMax ?? "不限"}`);
+  for (const day of [0, 1, 2]) {
+    const minimum = entryFilters[`day${day}CellsMin`];
+    const maximum = entryFilters[`day${day}CellsMax`];
+    if (minimum !== null || maximum !== null) {
+      conditions.push(`Day${day}细胞 ${minimum ?? "不限"}～${maximum ?? "不限"}`);
+    }
   }
   $("entryFilterSummary").textContent = conditions.length
     ? `本板筛选：${conditions.join("；")}（命中 ${matched}/${total} 孔）`
@@ -166,14 +182,14 @@ function applyPlateFilterFromEditor() {
     key,
     $(id).value.trim() === "" ? null : Number($(id).value),
   ]));
-  if (
-    values.day2CellsMin !== null
-    && values.day2CellsMax !== null
-    && values.day2CellsMin > values.day2CellsMax
-  ) {
-    $("plateFilterError").textContent = "Day2 细胞数下限不能大于上限。";
-    $("plateFilterError").hidden = false;
-    return;
+  for (const day of [0, 1, 2]) {
+    const minimum = values[`day${day}CellsMin`];
+    const maximum = values[`day${day}CellsMax`];
+    if (minimum !== null && maximum !== null && minimum > maximum) {
+      $("plateFilterError").textContent = `Day${day} 细胞数下限不能大于上限。`;
+      $("plateFilterError").hidden = false;
+      return;
+    }
   }
   Object.assign(entryFilters, values);
   $("plateFilterError").hidden = true;
@@ -181,6 +197,10 @@ function applyPlateFilterFromEditor() {
   const queryNames = {
     coverageMin: "coverage_min",
     debrisMax: "debris_max",
+    day0CellsMin: "day0_cells_min",
+    day0CellsMax: "day0_cells_max",
+    day1CellsMin: "day1_cells_min",
+    day1CellsMax: "day1_cells_max",
     day2CellsMin: "day2_cells_min",
     day2CellsMax: "day2_cells_max"
   };

@@ -20,3 +20,4 @@ artifacts/runs/*/*.pt
 *.npz
 *.npy
 deploy/updates/CellVision-Update-20260824-r1/
+deploy/updates/CellVision-Update-20260825-r2/

@@ -155,6 +155,8 @@ def test_track_review_accepts_cell_family_without_cell_subtype_options():
 
 def test_quick_review_filter_metrics_use_endpoint_day2_and_manual_verdict():
     local = pd.DataFrame([
+        {"timepoint": "T0", "final_review_label": "single", "current_label": "single"},
+        {"timepoint": "T1", "final_review_label": "touching_doublet", "current_label": "touching_doublet"},
         {"timepoint": "T2", "final_review_label": "single", "current_label": "single"},
         {"timepoint": "T2", "final_review_label": "debris", "current_label": "debris"},
         {"timepoint": "T1", "final_review_label": "debris", "current_label": "debris"},
@@ -162,12 +164,14 @@ def test_quick_review_filter_metrics_use_endpoint_day2_and_manual_verdict():
 
     metrics = _quick_review_filter_metrics(
         local,
-        {"t2_cell_units": 4, "review_decision": "approved"},
+        {"t0_cell_units": 5, "t2_cell_units": 4, "review_decision": "approved"},
         {"day14_sheet_coverage_pct": 12.75},
     )
 
     assert metrics == {
         "endpoint_coverage_pct": 12.75,
+        "day0_cell_count": 5,
+        "day1_cell_count": 2,
         "day2_cell_count": 4,
         "day2_debris_count": 1,
         "manual_review_decision": "approved",
@@ -180,6 +184,8 @@ def test_auto_review_exposes_pre_filter_and_well_verdict_shortcuts():
     script = (root / "auto-review.js").read_text(encoding="utf-8")
 
     assert "本板筛选" in html
+    assert 'id="plateDay0CellsMin"' in html
+    assert 'id="plateDay1CellsMin"' in html
     assert 'data-well-verdict="approved"' in html
     assert 'data-well-verdict="pending"' in html
     assert 'data-well-verdict="rejected"' in html
@@ -194,6 +200,8 @@ def test_auto_review_exposes_pre_filter_and_well_verdict_shortcuts():
     assert '<kbd>7</kbd> 合格' not in html
     assert 'api("/api/screening-review"' in script
     assert 'unclassified: "未判定"' in script
+    assert 'finiteFilter("day0_cells_min")' in script
+    assert 'finiteFilter("day1_cells_min")' in script
 
 
 def test_auto_review_cell_total_tracks_labels_until_human_override():

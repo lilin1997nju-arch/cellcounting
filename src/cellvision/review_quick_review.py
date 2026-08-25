@@ -69,18 +69,20 @@ def _quick_review_filter_metrics(
     """Build the well-level values used by the pre-review filter UI."""
 
     labels = local["final_review_label"].fillna(local["current_label"])
-    t2_mask = local["timepoint"].astype(str).str.upper().eq("T2")
-    t2_labels = labels[t2_mask]
-    calculated_cells = int(
-        sum(CELL_UNIT_WEIGHTS.get(str(label), 0) for label in t2_labels)
-    )
-    try:
-        screening_cells = float(screening.get("t2_cell_units"))
-    except (TypeError, ValueError):
-        screening_cells = float("nan")
-    day2_cell_count = (
-        calculated_cells if not np.isfinite(screening_cells) else int(round(screening_cells))
-    )
+    timepoints = local["timepoint"].astype(str).str.upper()
+
+    def cell_count(timepoint: str) -> int:
+        selected_labels = labels[timepoints.eq(timepoint)]
+        calculated = int(
+            sum(CELL_UNIT_WEIGHTS.get(str(label), 0) for label in selected_labels)
+        )
+        try:
+            screening_count = float(screening.get(f"{timepoint.lower()}_cell_units"))
+        except (TypeError, ValueError):
+            screening_count = float("nan")
+        return calculated if not np.isfinite(screening_count) else int(round(screening_count))
+
+    t2_labels = labels[timepoints.eq("T2")]
     raw_coverage = report.get(
         "day14_sheet_coverage_pct",
         report.get("endpoint_sheet_coverage_pct"),
@@ -96,7 +98,9 @@ def _quick_review_filter_metrics(
         manual_decision = "unclassified"
     return {
         "endpoint_coverage_pct": endpoint_coverage,
-        "day2_cell_count": day2_cell_count,
+        "day0_cell_count": cell_count("T0"),
+        "day1_cell_count": cell_count("T1"),
+        "day2_cell_count": cell_count("T2"),
         "day2_debris_count": int(t2_labels.eq("debris").sum()),
         "manual_review_decision": manual_decision,
     }

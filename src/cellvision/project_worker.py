@@ -99,6 +99,30 @@ def _day_number(label: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _filter_sessions_for_task(
+    sessions: pd.DataFrame, plan: dict[str, Any]
+) -> tuple[pd.DataFrame, set[str]]:
+    """Restrict a parsed index to the cross-timepoint board intersection."""
+
+    included_group_ids = {
+        str(value)
+        for value in plan.get("included_group_ids", [])
+        if str(value).strip()
+    }
+    if not included_group_ids:
+        return sessions, included_group_ids
+    available_group_ids = set(sessions["group_id"].astype(str))
+    missing_group_ids = sorted(included_group_ids - available_group_ids)
+    if missing_group_ids:
+        raise RuntimeError(
+            "任务中的板子已不在 sessions.idx 中：" + ", ".join(missing_group_ids)
+        )
+    return (
+        sessions[sessions["group_id"].astype(str).isin(included_group_ids)].copy(),
+        included_group_ids,
+    )
+
+
 def _duration_seconds(started_at: str | None, finished_at: str | None = None) -> float:
     if not started_at:
         return 0.0
@@ -777,6 +801,7 @@ class ProjectTaskWorker:
         sessions = parse_sessions_index(index, root, timepoint_origin=0)
         if sessions.empty:
             raise RuntimeError("sessions.idx 没有可用采集记录")
+        sessions, included_group_ids = _filter_sessions_for_task(sessions, plan)
         endpoint_rows = sessions[
             sessions["day_label"].astype(str).str.casefold() == endpoint_label.casefold()
         ]
@@ -795,19 +820,22 @@ class ProjectTaskWorker:
             stage="endpoint_screening",
             message=f"{self.runtime.label} 正在计算 {endpoint_label} 快速生长筛选",
         )
+        endpoint_command = [
+            sys.executable,
+            str(PROJECT_ROOT / "scripts" / "analyze_day14_sheet_growth.py"),
+            "--root",
+            str(root),
+            "--index",
+            str(index),
+            "--output",
+            str(endpoint_dir),
+            "--endpoint-day",
+            str(endpoint_day),
+        ]
+        for group_id in sorted(included_group_ids):
+            endpoint_command.extend(["--group-id", group_id])
         self._run_command(
-            [
-                sys.executable,
-                str(PROJECT_ROOT / "scripts" / "analyze_day14_sheet_growth.py"),
-                "--root",
-                str(root),
-                "--index",
-                str(index),
-                "--output",
-                str(endpoint_dir),
-                "--endpoint-day",
-                str(endpoint_day),
-            ],
+            endpoint_command,
             task_id=task_id,
             env=self._child_env(task),
         )

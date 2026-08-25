@@ -135,6 +135,10 @@ def test_project_review_filter_counts_use_strict_coverage_and_debris_limits(tmp_
         manifest_path,
         coverage_min=10,
         debris_max=2,
+        day0_cells_min=9,
+        day0_cells_max=9,
+        day1_cells_min=2,
+        day1_cells_max=2,
         day2_cells_min=2,
         day2_cells_max=2,
     )
@@ -144,9 +148,17 @@ def test_project_review_filter_counts_use_strict_coverage_and_debris_limits(tmp_
     debris_boundary = _project_review_filter_counts(
         manifest, manifest_path, debris_max=1
     )
+    day0_boundary = _project_review_filter_counts(
+        manifest, manifest_path, day0_cells_max=8
+    )
+    day1_boundary = _project_review_filter_counts(
+        manifest, manifest_path, day1_cells_min=3
+    )
 
     assert matching["matching_well_count"] == 1
     assert matching["reviewable_well_count"] == 1
     assert matching["plates"][0]["matching_well_count"] == 1
     assert coverage_boundary["matching_well_count"] == 0
     assert debris_boundary["matching_well_count"] == 0
+    assert day0_boundary["matching_well_count"] == 0
+    assert day1_boundary["matching_well_count"] == 0

@@ -408,6 +408,10 @@ function resultText(plate) {
 const reviewFilterFields = {
   coverage_min: "coverageMin",
   debris_max: "debrisMax",
+  day0_cells_min: "day0CellsMin",
+  day0_cells_max: "day0CellsMax",
+  day1_cells_min: "day1CellsMin",
+  day1_cells_max: "day1CellsMax",
   day2_cells_min: "day2CellsMin",
   day2_cells_max: "day2CellsMax",
 };
@@ -439,12 +443,16 @@ function readReviewFilters() {
 }
 
 function validateReviewFilters(filters) {
-  const minimum = filters.day2_cells_min === "" ? null : Number(filters.day2_cells_min);
-  const maximum = filters.day2_cells_max === "" ? null : Number(filters.day2_cells_max);
-  if (minimum !== null && maximum !== null && minimum > maximum) {
-    $("reviewFilterError").textContent = "Day2 细胞数下限不能大于上限。";
-    $("reviewFilterError").hidden = false;
-    return false;
+  for (const day of [0, 1, 2]) {
+    const minimumValue = filters[`day${day}_cells_min`];
+    const maximumValue = filters[`day${day}_cells_max`];
+    const minimum = minimumValue === "" ? null : Number(minimumValue);
+    const maximum = maximumValue === "" ? null : Number(maximumValue);
+    if (minimum !== null && maximum !== null && minimum > maximum) {
+      $("reviewFilterError").textContent = `Day${day} 细胞数下限不能大于上限。`;
+      $("reviewFilterError").hidden = false;
+      return false;
+    }
   }
   $("reviewFilterError").hidden = true;
   return true;
@@ -646,8 +654,16 @@ document.addEventListener("visibilitychange", () => {
 function showAnalysis(value) {
   analysis = value;
   applyDefaultTaskName(value.folder_name || folderNameFromPath($("folderPath").value));
-  $("analysisResult").textContent = `已解析：${value.group_count} 个板组，${value.session_count} 个时间点文件夹\n时间点：${value.timepoint_labels.join(", ")} · 日龄：${value.day_labels.join(", ")}\n完整96孔组：${value.complete_groups}`;
-  $("queueButton").disabled = false;
+  const compatible = count(value.compatible_group_count);
+  const excluded = count(value.excluded_group_count);
+  const excludedPreview = (value.excluded_groups || []).slice(0, 4)
+    .map(item => `${item.board_id || item.group_id}：${item.reason}`)
+    .join("；");
+  const exclusionLine = excluded
+    ? `\n将排除 ${excluded} 块板：${excludedPreview}${excluded > 4 ? "……" : ""}`
+    : "\n所有板子的所选时间点均完整一致";
+  $("analysisResult").textContent = `已解析：原始 ${value.group_count} 个板组，${value.session_count} 个时间点文件夹\n时间点：${value.timepoint_labels.join(", ")} · 日龄：${value.day_labels.join(", ")}\n跨时间点一致且完整：${compatible} 块板${exclusionLine}`;
+  $("queueButton").disabled = !value.selection_valid || compatible < 1;
 }
 
 function closeTaskDialog() {
@@ -782,7 +798,8 @@ $("queueButton").addEventListener("click", async () => {
       }),
     });
     $("taskDialog").close();
-    toast(`已加入任务队列：${task.name}`);
+    const excluded = count(task.excluded_group_count);
+    toast(`已加入任务队列：${task.name}（计算 ${count(task.group_count)} 块板${excluded ? `，排除 ${excluded} 块` : ""}）`);
     await loadTasks();
   } catch (error) {
     toast(`加入队列失败：${error.message}`);

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SUMMARY_VERSION = 3  # bump: well rows now include pre-review filter metrics and manual verdicts
+SUMMARY_VERSION = 4  # bump: pre-review rows now include Day0 and Day1 cell totals
 SUMMARY_FILENAME = "quick_review_summary.json"
 PREDICTION_FILENAMES = (
     "latest_integrated_predictions.csv",

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>细胞筛选项目</title>
-  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260819-portable-review-v2">
+  <link rel="stylesheet" href="/project-assets/project-dashboard.css?v=20260825-review-filter-v3">
 </head>
 <body>
   <header class="project-header">
@@ -35,9 +35,11 @@
       </div>
       <form id="reviewFilterForm" class="review-filter-bar">
         <div class="review-filter-copy"><strong>统一审核筛选条件</strong><span>适用于下方所有板子，留空表示不限。</span></div>
-        <label>末点覆盖率 &gt;<div class="number-with-unit"><input id="coverageMin" type="number" min="0" max="100" step="0.01" placeholder="不限"><span>%</span></div></label>
-        <label>Day2 杂质数 &lt;<input id="debrisMax" type="number" min="0" step="1" placeholder="不限"></label>
-        <label>Day2 细胞数<input id="day2CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="day2CellsMax" type="number" min="0" step="1" placeholder="上限"></label>
+        <label class="single-filter">末点覆盖率 &gt;<div class="number-with-unit"><input id="coverageMin" type="number" min="0" max="100" step="0.01" placeholder="不限"><span>%</span></div></label>
+        <label class="single-filter">Day2 杂质数 &lt;<input id="debrisMax" type="number" min="0" step="1" placeholder="不限"></label>
+        <label class="range-filter"><span>Day0 细胞数</span><div class="range-inputs"><input id="day0CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="day0CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
+        <label class="range-filter"><span>Day1 细胞数</span><div class="range-inputs"><input id="day1CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="day1CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
+        <label class="range-filter"><span>Day2 细胞数</span><div class="range-inputs"><input id="day2CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="day2CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
         <button id="applyReviewFilterButton" class="primary" type="submit">应用并统计</button>
         <button id="clearReviewFilterButton" class="secondary" type="button">清空</button>
         <strong id="reviewFilterMatchCount" class="filter-match-count">满足条件 — 孔</strong>
@@ -86,6 +88,6 @@
     </form>
   </dialog>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/project-assets/project-dashboard.js?v=20260824-review-filter-v2"></script>
+  <script src="/project-assets/project-dashboard.js?v=20260825-review-filter-v3"></script>
 </body>
 </html>

@@ -53,7 +53,9 @@
           <div class="plate-filter-fields">
             <label>末点覆盖率 &gt;<input id="plateCoverageMin" type="number" min="0" max="100" step="0.01" placeholder="不限"></label>
             <label>Day2 杂质数 &lt;<input id="plateDebrisMax" type="number" min="0" step="1" placeholder="不限"></label>
-            <label>Day2 细胞数<input id="plateDay2CellsMin" type="number" min="0" step="1" placeholder="下限"><span>～</span><input id="plateDay2CellsMax" type="number" min="0" step="1" placeholder="上限"></label>
+            <label class="plate-range-filter"><span>Day0 细胞数</span><div class="range-inputs"><input id="plateDay0CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="plateDay0CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
+            <label class="plate-range-filter"><span>Day1 细胞数</span><div class="range-inputs"><input id="plateDay1CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="plateDay1CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
+            <label class="plate-range-filter"><span>Day2 细胞数</span><div class="range-inputs"><input id="plateDay2CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="plateDay2CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
             <p id="plateFilterError" class="plate-filter-error" hidden></p>
             <div><button id="applyPlateFilter" type="button">应用本板筛选</button><button id="clearPlateFilter" type="button">清空</button></div>
           </div>
@@ -247,6 +249,6 @@
     </form>
   </dialog>
 
-  <script src="assets/auto-review.js?v=20260824-cell-total-v6"></script>
+  <script src="assets/auto-review.js?v=20260825-review-filter-v7"></script>
 </body>
 </html>

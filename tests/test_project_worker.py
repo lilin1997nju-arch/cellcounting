@@ -1,6 +1,9 @@
 from pathlib import Path
 
-from cellvision.project_worker import ProjectTaskWorker
+import pandas as pd
+import pytest
+
+from cellvision.project_worker import ProjectTaskWorker, _filter_sessions_for_task
 from cellvision.runtime import detect_compute_runtime
 from cellvision.task_queue import TaskQueueStore
 
@@ -34,6 +37,23 @@ def _project_store(root: Path, project_id: str) -> TaskQueueStore:
         encoding="utf-8",
     )
     return TaskQueueStore(project_dir / "task_queue.json")
+
+
+def test_project_worker_filters_sessions_to_task_board_intersection():
+    sessions = pd.DataFrame([
+        {"group_id": "G1", "day_label": "Day0"},
+        {"group_id": "G1", "day_label": "Day1"},
+        {"group_id": "G2", "day_label": "Day0"},
+    ])
+
+    selected, group_ids = _filter_sessions_for_task(
+        sessions, {"included_group_ids": ["G1"]}
+    )
+
+    assert group_ids == {"G1"}
+    assert selected["group_id"].unique().tolist() == ["G1"]
+    with pytest.raises(RuntimeError, match="G3"):
+        _filter_sessions_for_task(sessions, {"included_group_ids": ["G3"]})
 
 
 def test_project_worker_claims_oldest_started_task_across_projects(tmp_path: Path):

@@ -90,6 +90,19 @@ def _component_metrics(
 
 def analyze(args: argparse.Namespace) -> tuple[Path, Path, Path]:
     sessions = parse_sessions_index(args.index, args.root)
+    requested_group_ids = {
+        str(value) for value in getattr(args, "group_id", []) if str(value).strip()
+    }
+    if requested_group_ids:
+        available_group_ids = set(sessions["group_id"].astype(str))
+        missing_group_ids = sorted(requested_group_ids - available_group_ids)
+        if missing_group_ids:
+            raise RuntimeError(
+                "Requested groups were not found: " + ", ".join(missing_group_ids)
+            )
+        sessions = sessions[
+            sessions["group_id"].astype(str).isin(requested_group_ids)
+        ].copy()
     available_days = pd.to_numeric(sessions["culture_day"], errors="coerce").dropna().astype(int)
     endpoint_day = int(args.endpoint_day) if str(args.endpoint_day).strip() else (
         max(day for day in available_days.unique() if int(day) >= 7)
@@ -214,6 +227,12 @@ def main() -> None:
     parser.add_argument("--index", default="")
     parser.add_argument("--output", default="artifacts/day14_screening/ql2603")
     parser.add_argument("--endpoint-day", default="", help="Actual culture day used as the endpoint; blank selects the latest available day >= 7")
+    parser.add_argument(
+        "--group-id",
+        action="append",
+        default=[],
+        help="Only analyze this group ID; repeat to include multiple boards",
+    )
     parser.add_argument("--downsample", type=int, default=4)
     parser.add_argument("--minimum-confluence-to-analyze", type=float, default=3.0)
     # A smaller 0.5% pilot threshold retained sparse edge colonies such as

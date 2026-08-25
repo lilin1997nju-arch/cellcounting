@@ -7,6 +7,7 @@ from cellvision.project_server import (
     _PlateReviewManager,
     ProjectRenamePayload,
     TaskPayload,
+    _complete_group_timepoint_selection,
     _folder_name,
     _manual_verdict_counts_for_plate,
     create_project_app,
@@ -16,6 +17,34 @@ from cellvision.project_server import (
 def test_folder_name_uses_parent_for_sessions_index():
     assert _folder_name(r"E:\\CM\\20260623 QL2603") == "20260623 QL2603"
     assert _folder_name(r"E:\\CM\\20260623 QL2603\\sessions.idx") == "20260623 QL2603"
+
+
+def test_cross_timepoint_selection_keeps_only_complete_board_intersection():
+    selected = ["Day0", "Day1", "Day2", "Day7"]
+    records = [
+        {
+            "group_id": group,
+            "board_id": board,
+            "day_label": day,
+            "group_complete": not (group == "G3" and day == "Day2"),
+        }
+        for group, board, days in (
+            ("G1", "T1-1", selected),
+            ("G2", "T1-2", ["Day0", "Day2", "Day7"]),
+            ("G3", "T1-3", selected),
+        )
+        for day in days
+    ]
+
+    result = _complete_group_timepoint_selection(records, selected)
+
+    assert result["included_group_ids"] == ["G1"]
+    assert result["included_group_count"] == 1
+    assert len(result["sessions"]) == 4
+    assert result["excluded_group_count"] == 2
+    excluded = {item["group_id"]: item for item in result["excluded_groups"]}
+    assert excluded["G2"]["missing_timepoints"] == ["Day1"]
+    assert excluded["G3"]["incomplete_timepoints"] == ["Day2"]
 
 
 def test_production_project_hub_hides_specialist_training_and_mask_routes(
@@ -67,11 +96,15 @@ def test_production_dashboard_has_no_training_or_mask_review_entry():
     assert "轮廓和快捷键与生产审核一致" in html
     assert "统一审核筛选条件" in html
     assert "筛选命中孔数" in html
+    assert 'id="day0CellsMin"' in html
+    assert 'id="day1CellsMin"' in html
     assert "合格孔" in dashboard_js
     assert "待定孔" in dashboard_js
     assert "排除孔" in dashboard_js
     assert "openReviewFilterDialog" not in dashboard_js
     assert "refreshReviewFilterCounts" in dashboard_js
+    assert 'day0_cells_min: "day0CellsMin"' in dashboard_js
+    assert 'day1_cells_min: "day1CellsMin"' in dashboard_js
 
 
 def test_plate_manual_verdict_counts_keep_unreviewed_wells_unclassified(tmp_path: Path):
@@ -321,6 +354,17 @@ def test_new_task_records_creator_and_uses_folder_name_for_project(
         }
         for item in options
     ]
+    records.extend([
+        {
+            "group_id": "DEMO T1-2",
+            "board_id": "T1-2",
+            "day_label": item["day_label"],
+            "timepoint_label": item["timepoint_labels"][0],
+            "group_complete": True,
+        }
+        for item in options
+        if item["day_label"] != "Day1"
+    ])
     monkeypatch.setattr(
         project_server,
         "_parse_folder",
@@ -328,8 +372,8 @@ def test_new_task_records_creator_and_uses_folder_name_for_project(
             "root": str(source),
             "folder_name": source.name,
             "index": str(source / "sessions.idx"),
-            "group_count": 1,
-            "session_count": 4,
+            "group_count": 2,
+            "session_count": 7,
             "timepoint_labels": ["T0", "T1", "T2", "T3"],
             "day_labels": ["Day0", "Day1", "Day2", "Day7"],
             "timepoint_options": options,
@@ -350,6 +394,13 @@ def test_new_task_records_creator_and_uses_folder_name_for_project(
         )
     )
     assert task["created_by"] == "张三"
+    assert task["group_count"] == 1
+    assert task["session_count"] == 4
+    assert task["source_group_count"] == 2
+    assert task["excluded_group_count"] == 1
+    plan = json.loads(Path(task["plan_path"]).read_text(encoding="utf-8"))
+    assert plan["included_group_ids"] == ["DEMO T1-1"]
+    assert {item["group_id"] for item in plan["sessions"]} == {"DEMO T1-1"}
     project = json.loads(Path(task["project_manifest"]).read_text(encoding="utf-8"))
     assert project["project_name"] == source.name
     project_queue = Path(task["project_manifest"]).parent / "task_queue.json"
