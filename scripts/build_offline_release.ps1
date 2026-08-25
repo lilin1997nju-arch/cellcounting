@@ -225,6 +225,9 @@ try {
         "configure_service.ps1",
         "configure_service_launcher.ps1",
         "disable_service_autostart.ps1",
+        "Start-CellVision.cmd",
+        "start_cellvision_platform.ps1",
+        "repair_project_manifests.py",
         "Open-CellVision.cmd"
     )) {
         Copy-Item -LiteralPath (Join-Path $repository "deploy\portable\$name") -Destination (Join-Path $releaseRoot $name)

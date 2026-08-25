@@ -24,6 +24,9 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert 'Join-Path $releaseRoot "Workspace"' in builder
     assert '"Configure-CellVision-Service.cmd"' in builder
     assert '"Disable-CellVision-Autostart.cmd"' in builder
+    assert '"Start-CellVision.cmd"' in builder
+    assert '"start_cellvision_platform.ps1"' in builder
+    assert '"repair_project_manifests.py"' in builder
     assert '"Open-CellVision.cmd"' in builder
     assert "python-$PythonVersion-amd64.exe" not in builder
     assert '"torch==2.11.0"' in builder
@@ -106,6 +109,7 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     configure = (ROOT / "deploy" / "portable" / "configure_service.ps1").read_text(encoding="utf-8")
     configure_launcher = (ROOT / "deploy" / "portable" / "configure_service_launcher.ps1").read_text(encoding="utf-8")
     launcher = (ROOT / "deploy" / "portable" / "Open-CellVision.cmd").read_text(encoding="utf-8")
+    daily_launcher = (ROOT / "deploy" / "portable" / "start_cellvision_platform.ps1").read_text(encoding="utf-8")
     disable_autostart = (ROOT / "deploy" / "portable" / "disable_service_autostart.ps1").read_text(encoding="utf-8")
     prepare = (ROOT / "scripts" / "prepare_portable_production_runtime.ps1").read_text(encoding="utf-8")
     setup = (ROOT / "scripts" / "setup_production.ps1").read_text(encoding="utf-8")
@@ -113,16 +117,27 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert 'Join-Path $deploymentRoot "Application"' in configure
     assert 'Join-Path $deploymentRoot "Workspace"' in configure
     assert 'Join-Path $workspaceRoot "Projects"' in configure
-    assert "*S-1-5-11:(OI)(CI)M" in configure
-    assert "/inheritance:e /grant" in configure
-    assert "/T /C" not in configure
-    assert "readiness can take up to 90 seconds" in configure
+    assert "*S-1-5-11:(OI)(CI)M" not in configure
+    assert "icacls.exe" not in configure
+    assert "Backing up project metadata" in configure
+    assert "--recover" in configure
+    assert "RepairService" in configure
+    assert "Refusing to switch Workspace automatically" in configure
     assert "PORTABLE_SERVICE_CONFIGURATION_VALIDATION_OK" in configure
     assert "pywin32_postinstall" not in configure
     assert 'Join-Path $applicationRoot "Python312\\pythonservice.exe"' in configure
     assert 'Join-Path $env:LOCALAPPDATA "CellVisionInstallerLogs"' in configure_launcher
     assert "Start-Transcript" in configure_launcher
     assert "%~dp0Application\\Python312\\python.exe" in launcher
+    assert 'Get-Service -Name $serviceName' in daily_launcher
+    assert 'api/project/worker-runtime' in daily_launcher
+    assert 'api/catalog/status' in daily_launcher
+    assert 'repair_project_manifests.py' in daily_launcher
+    assert 'project.json is missing or invalid' in daily_launcher
+    assert 'belongs to a different Cell Vision folder' in daily_launcher
+    assert 'Start-Service -Name $serviceName' in daily_launcher
+    assert 'install_production_service.ps1' not in daily_launcher
+    assert 'icacls.exe' not in daily_launcher
     assert "www.nuget.org/api/v2/package/python" in prepare
     assert "cellvision-portable.pth" in prepare
     assert 'Join-Path $runtime "pythonservice.exe"' in prepare

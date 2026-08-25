@@ -3,6 +3,7 @@
 param(
     [int]$Port = 8777,
     [ValidateSet("auto", "cpu", "cuda")][string]$Device = "auto",
+    [switch]$RepairService,
     [switch]$ValidateOnly
 )
 
@@ -12,6 +13,7 @@ $applicationRoot = Join-Path $deploymentRoot "Application"
 $workspaceRoot = Join-Path $deploymentRoot "Workspace"
 $python = Join-Path $applicationRoot "Python312\python.exe"
 $serviceHost = Join-Path $applicationRoot "Python312\pythonservice.exe"
+$recoveryScript = Join-Path $deploymentRoot "repair_project_manifests.py"
 $serviceRuntimeDll = Get-ChildItem -LiteralPath (Join-Path $applicationRoot "Python312") `
     -Filter "pywintypes*.dll" -File -ErrorAction SilentlyContinue | Select-Object -First 1
 
@@ -20,7 +22,8 @@ foreach ($required in @(
     $serviceHost,
     (Join-Path $applicationRoot "src\cellvision"),
     (Join-Path $applicationRoot "ModelBundle"),
-    (Join-Path $applicationRoot "scripts\setup_production.ps1")
+    (Join-Path $applicationRoot "scripts\setup_production.ps1"),
+    $recoveryScript
 )) {
     if (-not (Test-Path -LiteralPath $required)) { throw "Portable deployment is incomplete: $required" }
 }
@@ -51,6 +54,11 @@ foreach ($directory in @($workspaceRoot, $projectsRoot, $databaseRoot, $logsRoot
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 }
 
+Write-Host "Backing up project metadata before service configuration ..." -ForegroundColor Cyan
+$backupOutput = & $python $recoveryScript --projects-root $projectsRoot --backup
+if ($LASTEXITCODE -ne 0) { throw "Unable to back up project metadata before service configuration." }
+Write-Host $backupOutput -ForegroundColor DarkGray
+
 $setup = Join-Path $applicationRoot "scripts\setup_production.ps1"
 $previousPipNoIndex = $env:PIP_NO_INDEX
 $previousPipDisableVersionCheck = $env:PIP_DISABLE_PIP_VERSION_CHECK
@@ -67,18 +75,60 @@ try {
     $env:PIP_DISABLE_PIP_VERSION_CHECK = $previousPipDisableVersionCheck
 }
 
-Write-Host "Configuring shared domain-user permissions ..." -ForegroundColor Cyan
-& icacls.exe $applicationRoot /inheritance:e /grant `
-    '*S-1-5-32-545:(OI)(CI)RX' '*S-1-5-11:(OI)(CI)RX' /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Unable to grant shared application access." }
-& icacls.exe $workspaceRoot /inheritance:e /grant `
-    '*S-1-5-32-545:(OI)(CI)M' '*S-1-5-11:(OI)(CI)M' /C /Q | Out-Null
-if ($LASTEXITCODE -ne 0) { throw "Unable to grant shared workspace access." }
-
-Write-Host "Registering and starting Cell Vision service; readiness can take up to 90 seconds ..." -ForegroundColor Cyan
+Write-Host "Using the existing administrator and LocalSystem permissions; no recursive ACL rewrite is needed." -ForegroundColor DarkGray
+Write-Host "Ensuring the Cell Vision service is registered and ready ..." -ForegroundColor Cyan
 $serviceInstaller = Join-Path $applicationRoot "scripts\install_production_service.ps1"
-& $serviceInstaller -InstallRoot $applicationRoot -Port $Port -Action install
-if ($LASTEXITCODE -ne 0) { throw "Unable to install the Cell Vision production service." }
+$existingService = Get-Service -Name "CellVisionProduction" -ErrorAction SilentlyContinue
+$installService = $null -eq $existingService
+if ($null -ne $existingService) {
+    $serviceInfo = Get-CimInstance Win32_Service -Filter "Name='CellVisionProduction'" -ErrorAction Stop
+    $pathName = [string]$serviceInfo.PathName
+    $actualHost = ""
+    if ($pathName -match '^\s*"([^"]+)"') { $actualHost = $Matches[1] }
+    elseif ($pathName -match '^\s*([^\s]+)') { $actualHost = $Matches[1] }
+    $sameHost = -not [string]::IsNullOrWhiteSpace($actualHost) -and [string]::Equals(
+        [IO.Path]::GetFullPath($actualHost),
+        [IO.Path]::GetFullPath($serviceHost),
+        [StringComparison]::OrdinalIgnoreCase
+    )
+    if (-not $sameHost -and -not $RepairService) {
+        throw (
+            "CellVisionProduction belongs to a different installation: $actualHost. " +
+            "Refusing to switch Workspace automatically. Use the daily launcher from that installation, " +
+            "or rerun configure_service.ps1 with -RepairService after confirming the intended folder."
+        )
+    }
+    $installService = -not $sameHost
+}
+if ($installService) {
+    & $serviceInstaller -InstallRoot $applicationRoot -Port $Port -Action install
+    if ($LASTEXITCODE -ne 0) { throw "Unable to install the Cell Vision production service." }
+} else {
+    if ($existingService.Status -ne "Stopped") {
+        & $serviceInstaller -InstallRoot $applicationRoot -Port $Port -Action stop
+        if ($LASTEXITCODE -ne 0) { throw "Unable to stop the existing Cell Vision production service." }
+    }
+    & $serviceInstaller -InstallRoot $applicationRoot -Port $Port -Action start
+    if ($LASTEXITCODE -ne 0) { throw "Unable to start the existing Cell Vision production service." }
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 90; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ready" -TimeoutSec 2
+            if ($response.status -eq "ready") { $ready = $true; break }
+        } catch {}
+        Start-Sleep -Seconds 1
+    }
+    if (-not $ready) { throw "Cell Vision service did not become ready on port $Port." }
+}
+
+$recoveryOutput = & $python $recoveryScript --projects-root $projectsRoot --recover
+if ($LASTEXITCODE -ne 0) { throw "Project metadata recovery failed after service configuration." }
+Write-Host $recoveryOutput -ForegroundColor DarkGray
+try {
+    $null = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/catalog/status" -TimeoutSec 30
+} catch {
+    Write-Warning "The project catalog will refresh when the homepage is next opened: $($_.Exception.Message)"
+}
 
 Write-Host "" 
 Write-Host "Cell Vision portable production is configured." -ForegroundColor Green
