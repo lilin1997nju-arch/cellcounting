@@ -93,6 +93,10 @@
    - 对缺失关键产物的残缺项目只报告原因并跳过，不删除原目录，也不制造无法正常打开的项目；恢复后强制刷新目录数据库，使曾被标记删除的有效项目重新显示。
 4. 当前本机的 `ql2603-production-acceptance-6231fdce81` 只剩一个 `annotations.db`，清单、配置、图片清单、报告及两块板目录均缺失，无法从现存文件安全重建，工具已按设计跳过且未改动原数据。生产电脑上的项目如果板子产物完整或已有新备份，则可自动恢复；否则需要找回原 `project.json` 或对应备份。
 5. 验证：Windows PowerShell 5.1 语法解析通过；服务已运行场景下日常入口成功，API、工作器、目录数据库刷新和异常目录提示均正常；元数据精确恢复、完整目录重建、残缺项目拒绝恢复等针对性测试通过；完整测试集 `pytest -q`：`250 passed`，仅有既有 FastAPI `on_event` 弃用警告；`git diff --check` 通过。
+6. 新增生产端手动恢复入口 `Recover-CellVision-Projects.cmd` / `recover_cellvision_projects.ps1`：
+   - 放在安装目录根目录双击执行；先生成元数据备份，再执行安全恢复并确保服务/计算工作器可用，最后强制刷新主页目录；
+   - 控制台逐项显示从备份恢复、从完整产物重建及跳过的项目与原因；完整日志写入 `Workspace/Logs/cellvision-project-recovery.log`；
+   - 独立恢复包 `deploy/updates/CellVision-ProjectRecovery-20260825.zip` 内含入口、辅助脚本及中文说明，生产端无需联网或安装额外依赖。
 
 ## 生产更新包 r1（历史）
 

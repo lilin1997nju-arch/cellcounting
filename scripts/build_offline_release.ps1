@@ -228,6 +228,9 @@ try {
         "Start-CellVision.cmd",
         "start_cellvision_platform.ps1",
         "repair_project_manifests.py",
+        "Recover-CellVision-Projects.cmd",
+        "recover_cellvision_projects.ps1",
+        "PROJECT-RECOVERY-README.txt",
         "Open-CellVision.cmd"
     )) {
         Copy-Item -LiteralPath (Join-Path $repository "deploy\portable\$name") -Destination (Join-Path $releaseRoot $name)

@@ -27,6 +27,9 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert '"Start-CellVision.cmd"' in builder
     assert '"start_cellvision_platform.ps1"' in builder
     assert '"repair_project_manifests.py"' in builder
+    assert '"Recover-CellVision-Projects.cmd"' in builder
+    assert '"recover_cellvision_projects.ps1"' in builder
+    assert '"PROJECT-RECOVERY-README.txt"' in builder
     assert '"Open-CellVision.cmd"' in builder
     assert "python-$PythonVersion-amd64.exe" not in builder
     assert '"torch==2.11.0"' in builder
@@ -110,6 +113,7 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     configure_launcher = (ROOT / "deploy" / "portable" / "configure_service_launcher.ps1").read_text(encoding="utf-8")
     launcher = (ROOT / "deploy" / "portable" / "Open-CellVision.cmd").read_text(encoding="utf-8")
     daily_launcher = (ROOT / "deploy" / "portable" / "start_cellvision_platform.ps1").read_text(encoding="utf-8")
+    recovery_launcher = (ROOT / "deploy" / "portable" / "recover_cellvision_projects.ps1").read_text(encoding="utf-8")
     disable_autostart = (ROOT / "deploy" / "portable" / "disable_service_autostart.ps1").read_text(encoding="utf-8")
     prepare = (ROOT / "scripts" / "prepare_portable_production_runtime.ps1").read_text(encoding="utf-8")
     setup = (ROOT / "scripts" / "setup_production.ps1").read_text(encoding="utf-8")
@@ -138,6 +142,10 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert 'Start-Service -Name $serviceName' in daily_launcher
     assert 'install_production_service.ps1' not in daily_launcher
     assert 'icacls.exe' not in daily_launcher
+    assert '--backup --recover' in recovery_launcher
+    assert 'api/catalog/status' in recovery_launcher
+    assert '-NoOpen' in recovery_launcher
+    assert 'Remove-Item' not in recovery_launcher
     assert "www.nuget.org/api/v2/package/python" in prepare
     assert "cellvision-portable.pth" in prepare
     assert 'Join-Path $runtime "pythonservice.exe"' in prepare

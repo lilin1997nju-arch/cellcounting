@@ -107,6 +107,7 @@ function Show-ProjectManifestAudit {
     $validCount = 0
     $incomplete = New-Object System.Collections.Generic.List[string]
     foreach ($directory in Get-ChildItem -LiteralPath $projectsRoot -Directory -ErrorAction SilentlyContinue) {
+        if ($directory.Name -eq ".metadata-backups") { continue }
         $manifest = Join-Path $directory.FullName "project.json"
         if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) {
             if ($directory.Name -ne "active" -and $null -ne (
