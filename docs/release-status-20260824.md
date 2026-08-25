@@ -97,6 +97,9 @@
    - 放在安装目录根目录双击执行；先生成元数据备份，再执行安全恢复并确保服务/计算工作器可用，最后强制刷新主页目录；
    - 控制台逐项显示从备份恢复、从完整产物重建及跳过的项目与原因；完整日志写入 `Workspace/Logs/cellvision-project-recovery.log`；
    - 独立恢复包 `deploy/updates/CellVision-ProjectRecovery-20260825.zip` 内含入口、辅助脚本及中文说明，生产端无需联网或安装额外依赖。
+7. 汇总生产维护包 `deploy/updates/CellVision-Production-Maintenance-20260825.zip`：
+   - 包含日常一键启动、项目列表恢复、元数据备份恢复、安全服务配置入口及两份中文说明，共10个根目录文件；
+   - 解压后将全部文件直接覆盖到生产安装目录根目录；不包含且不会覆盖 `Application`、`Workspace`、模型或项目数据。
 
 ## 生产更新包 r1（历史）
 
