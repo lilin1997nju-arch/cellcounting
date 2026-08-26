@@ -149,7 +149,7 @@ body {
 .plate-filter-editor summary{cursor:pointer;padding:7px 8px;font-weight:700}
 .plate-filter-fields{display:grid;gap:7px;border-top:1px solid #e6dab0;padding:8px}
 .plate-filter-fields label{margin:0;color:#725a19;font-size:10px}
-.plate-filter-fields input{width:100%;margin-top:3px;border:1px solid #d4c89f;border-radius:5px;padding:5px 6px;font:inherit}
+.plate-filter-fields input,.plate-filter-fields select{width:100%;margin-top:3px;border:1px solid #d4c89f;border-radius:5px;padding:5px 6px;background:#fff;color:#4d461f;font:inherit}
 .plate-filter-fields .range-inputs{display:grid;grid-template-columns:minmax(48px,1fr) auto minmax(48px,1fr);gap:4px;align-items:end}
 .plate-filter-fields .range-inputs input{min-width:0}
 .plate-filter-fields .range-inputs b{padding-bottom:5px;font-weight:400}
@@ -157,6 +157,10 @@ body {
 .plate-filter-fields button{flex:1;border:1px solid #c9bb85;border-radius:5px;padding:5px;background:#fff;color:#725a19;font-size:10px}
 .plate-filter-error{margin:0;border-radius:4px;padding:5px;background:#f9ded8;color:#963e34}
 .plate-filter-error[hidden]{display:none}
+.pending-queue-notice{display:grid;gap:4px;margin:8px;border:1px solid #dfbc59;border-radius:7px;padding:8px;background:#fff6d9;color:#725a19;font-size:10px;line-height:1.4}
+.pending-queue-notice[hidden]{display:none}
+.pending-queue-notice strong{font-size:11px}
+.pending-queue-notice a{color:#126b66;font-weight:700;text-decoration:none}
 
 .well-tabs {
   display: grid;

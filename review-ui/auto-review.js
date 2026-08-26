@@ -58,6 +58,12 @@ const finiteFilter = name => {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0 ? value : null;
 };
+const manualVerdictFilterValues = new Set([
+  "approved", "pending", "rejected", "unclassified"
+]);
+const requestedManualVerdict = String(
+  entryFilterParameters.get("manual_verdict") || ""
+).toLowerCase();
 const entryFilters = {
   coverageMin: finiteFilter("coverage_min"),
   debrisMax: finiteFilter("debris_max"),
@@ -66,7 +72,10 @@ const entryFilters = {
   day1CellsMin: finiteFilter("day1_cells_min"),
   day1CellsMax: finiteFilter("day1_cells_max"),
   day2CellsMin: finiteFilter("day2_cells_min"),
-  day2CellsMax: finiteFilter("day2_cells_max")
+  day2CellsMax: finiteFilter("day2_cells_max"),
+  manualVerdict: manualVerdictFilterValues.has(requestedManualVerdict)
+    ? requestedManualVerdict
+    : "all"
 };
 const plateFilterFields = {
   coverageMin: "plateCoverageMin",
@@ -78,6 +87,26 @@ const plateFilterFields = {
   day2CellsMin: "plateDay2CellsMin",
   day2CellsMax: "plateDay2CellsMax"
 };
+function parsePendingPlateQueue() {
+  if (entryFilterParameters.get("pending_queue") !== "1") {
+    return { active: false, slugs: [], index: -1 };
+  }
+  try {
+    const parsed = JSON.parse(entryFilterParameters.get("pending_plate_queue") || "[]");
+    const slugs = Array.isArray(parsed)
+      ? parsed.map(value => String(value).trim()).filter(Boolean).slice(0, 500)
+      : [];
+    const index = Number(entryFilterParameters.get("pending_queue_index"));
+    if (!slugs.length || !Number.isInteger(index) || index < 0 || index >= slugs.length) {
+      return { active: false, slugs: [], index: -1 };
+    }
+    return { active: true, slugs, index };
+  } catch (_) {
+    return { active: false, slugs: [], index: -1 };
+  }
+}
+const pendingPlateQueue = parsePendingPlateQueue();
+if (pendingPlateQueue.active) entryFilters.manualVerdict = "pending";
 const cellSubtypeLabels = ["single", "touching_doublet", "cluster_3plus"];
 const labelColors = {
   single: "#27d79a",
@@ -102,7 +131,10 @@ const state = {
   wellLoadedAt: null,
   prefetchedDetails: new Map(),
   prefetchingDetails: new Map(),
-  cellCountSaveJobs: new Map()
+  cellCountSaveJobs: new Map(),
+  pendingQueueVisited: new Set(),
+  pendingQueueAdvancing: false,
+  pendingQueueComplete: false
 };
 
 async function api(url, options) {
@@ -144,6 +176,10 @@ function passesEntryFilters(item) {
   const coverage = Number(item.endpoint_coverage_pct);
   const debris = Number(item.day2_debris_count);
   const cells = [0, 1, 2].map(day => Number(item[`day${day}_cell_count`]));
+  const manualVerdict = manualVerdictFilterValues.has(String(item.manual_review_decision).toLowerCase())
+    ? String(item.manual_review_decision).toLowerCase()
+    : "unclassified";
+  if (entryFilters.manualVerdict !== "all" && manualVerdict !== entryFilters.manualVerdict) return false;
   if (entryFilters.coverageMin !== null && (!Number.isFinite(coverage) || coverage <= entryFilters.coverageMin)) return false;
   if (entryFilters.debrisMax !== null && (!Number.isFinite(debris) || debris >= entryFilters.debrisMax)) return false;
   for (const day of [0, 1, 2]) {
@@ -157,6 +193,9 @@ function passesEntryFilters(item) {
 
 function renderEntryFilterSummary(matched, total) {
   const conditions = [];
+  if (entryFilters.manualVerdict !== "all") {
+    conditions.push(`人工判定 = ${manualVerdictNames[entryFilters.manualVerdict]}`);
+  }
   if (entryFilters.coverageMin !== null) conditions.push(`末点覆盖率 > ${entryFilters.coverageMin}%`);
   if (entryFilters.debrisMax !== null) conditions.push(`Day2杂质 < ${entryFilters.debrisMax}`);
   for (const day of [0, 1, 2]) {
@@ -175,6 +214,41 @@ function initializePlateFilterEditor() {
   Object.entries(plateFilterFields).forEach(([key, id]) => {
     $(id).value = entryFilters[key] ?? "";
   });
+  $("plateManualVerdictFilter").value = entryFilters.manualVerdict;
+}
+
+function initializePendingQueue() {
+  const notice = $("pendingQueueNotice");
+  if (!notice || !pendingPlateQueue.active) return;
+  notice.hidden = false;
+  $("pendingQueueProgress").textContent = `第 ${pendingPlateQueue.index + 1}/${pendingPlateQueue.slugs.length} 块板；Q/W/E 保存后自动进入下一孔`;
+  if (projectBackUrl) $("pendingQueueBack").href = projectBackUrl;
+}
+
+function advancePendingPlateQueue() {
+  if (!pendingPlateQueue.active || state.pendingQueueAdvancing) return false;
+  const nextIndex = pendingPlateQueue.index + 1;
+  if (nextIndex >= pendingPlateQueue.slugs.length) {
+    state.pendingQueueComplete = true;
+    const progress = $("pendingQueueProgress");
+    if (progress) progress.textContent = "本轮所有待定孔已依次审核";
+    return false;
+  }
+  state.pendingQueueAdvancing = true;
+  const projectUrl = new URL(projectBackUrl || "/", window.location.origin);
+  if (!projectUrl.pathname.endsWith("/")) projectUrl.pathname += "/";
+  const target = new URL(
+    `plates/${encodeURIComponent(pendingPlateQueue.slugs[nextIndex])}/`,
+    projectUrl
+  );
+  target.searchParams.set("manual_verdict", "pending");
+  target.searchParams.set("mode", "all");
+  target.searchParams.set("pending_queue", "1");
+  target.searchParams.set("pending_plate_queue", JSON.stringify(pendingPlateQueue.slugs));
+  target.searchParams.set("pending_queue_index", String(nextIndex));
+  setMessage(`本板待定孔已审核，正在进入第 ${nextIndex + 1} 块板…`);
+  window.location.assign(`${target.pathname}${target.search}`);
+  return true;
 }
 
 function applyPlateFilterFromEditor() {
@@ -182,6 +256,11 @@ function applyPlateFilterFromEditor() {
     key,
     $(id).value.trim() === "" ? null : Number($(id).value),
   ]));
+  values.manualVerdict = pendingPlateQueue.active
+    ? "pending"
+    : manualVerdictFilterValues.has($("plateManualVerdictFilter").value)
+    ? $("plateManualVerdictFilter").value
+    : "all";
   for (const day of [0, 1, 2]) {
     const minimum = values[`day${day}CellsMin`];
     const maximum = values[`day${day}CellsMax`];
@@ -202,10 +281,11 @@ function applyPlateFilterFromEditor() {
     day1CellsMin: "day1_cells_min",
     day1CellsMax: "day1_cells_max",
     day2CellsMin: "day2_cells_min",
-    day2CellsMax: "day2_cells_max"
+    day2CellsMax: "day2_cells_max",
+    manualVerdict: "manual_verdict"
   };
   Object.entries(queryNames).forEach(([key, parameter]) => {
-    if (entryFilters[key] === null) url.searchParams.delete(parameter);
+    if (entryFilters[key] === null || entryFilters[key] === "all") url.searchParams.delete(parameter);
     else url.searchParams.set(parameter, entryFilters[key]);
   });
   window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
@@ -272,11 +352,14 @@ async function loadWells(preferredWell = null) {
   const loaded = await api("/api/quick-review-wells?mode=all");
   const entryFiltered = loaded.filter(passesEntryFilters);
   renderEntryFilterSummary(entryFiltered.length, loaded.length);
-  let visible = state.mode === "pending"
-    ? entryFiltered.filter(item => !item.completed)
-    : state.mode === "reviewed"
-    ? entryFiltered.filter(item => item.completed)
+  const queueFiltered = pendingPlateQueue.active
+    ? entryFiltered.filter(item => !state.pendingQueueVisited.has(String(item.well).toUpperCase()))
     : entryFiltered;
+  let visible = state.mode === "pending"
+    ? queueFiltered.filter(item => !item.completed)
+    : state.mode === "reviewed"
+    ? queueFiltered.filter(item => item.completed)
+    : queueFiltered;
   if (search) {
     const needle = search.toUpperCase();
     visible = visible.filter(item => String(item.well).toUpperCase().includes(needle));
@@ -289,6 +372,7 @@ async function loadWells(preferredWell = null) {
   if (!state.wells.length) {
     state.detail = null;
     state.selectedId = null;
+    if (pendingPlateQueue.active && queueFiltered.length === 0 && advancePendingPlateQueue()) return;
     renderEmptyWorkspace();
     return;
   }
@@ -325,16 +409,20 @@ function renderWellList() {
 }
 
 function renderEmptyWorkspace() {
-  $("wellTitle").textContent = "没有待审核孔";
+  const queueFinished = pendingPlateQueue.active && state.pendingQueueComplete;
+  $("wellTitle").textContent = queueFinished ? "待定孔队列已完成" : "没有待审核孔";
   $("timepointGrid").innerHTML = "";
   $("lateTimepointGrid").innerHTML = "";
   $("lateTimepointSection").hidden = true;
-  $("currentWellState").textContent = "本组已完成";
-  $("currentWellDetail").textContent = "可切换到“已完成”或“全部”查看";
+  $("currentWellState").textContent = queueFinished ? "全部待定孔已依次审核" : "本组已完成";
+  $("currentWellDetail").textContent = queueFinished
+    ? "仍保留为待定的孔会继续显示在项目统计中；可返回项目查看最新数量"
+    : "可切换到“已完成”或“全部”查看";
   $("selectionEditor").classList.add("empty-selection");
   $("selectedTitle").textContent = "当前列表没有孔";
   $("selectedDetail").textContent = "";
   renderWellVerdict(null);
+  if (queueFinished) setMessage("本轮所有待定孔已依次审核，可返回项目查看最新统计");
 }
 
 function renderWellVerdict(decision = state.detail?.screening?.review_decision || "unclassified") {
@@ -1564,6 +1652,7 @@ async function saveLateGrowthDecision(timepoint, decision) {
 async function saveManualVerdict(decision) {
   if (!state.detail || state.busy || !manualVerdictNames[decision]) return;
   const well = state.detail.well;
+  const nextWell = nextWellAfter(well);
   state.busy = true;
   renderWellVerdict(decision);
   setMessage(`正在保存 ${well} 的人工判定…`);
@@ -1575,6 +1664,7 @@ async function saveManualVerdict(decision) {
     });
     state.detail.screening = state.detail.screening || {};
     state.detail.screening.review_decision = decision;
+    let updatedWell = state.wells.find(row => String(row.well).toUpperCase() === well) || null;
     for (const collection of [state.wells, state.screeningWells]) {
       const item = collection.find(row => String(row.well).toUpperCase() === well);
       if (item) {
@@ -1582,9 +1672,18 @@ async function saveManualVerdict(decision) {
         item.manual_review_decision = decision;
       }
     }
-    renderWellList();
     renderWellVerdict(decision);
-    setMessage(`${well} 已标记为${manualVerdictNames[decision]}`);
+    const leavesCurrentFilter = entryFilters.manualVerdict !== "all"
+      && updatedWell && !passesEntryFilters(updatedWell);
+    if (pendingPlateQueue.active || leavesCurrentFilter) {
+      if (pendingPlateQueue.active) state.pendingQueueVisited.add(well);
+      state.busy = false;
+      await loadWells(nextWell);
+      setMessage(`${well} 已标记为${manualVerdictNames[decision]}，已进入下一个孔`);
+    } else {
+      renderWellList();
+      setMessage(`${well} 已标记为${manualVerdictNames[decision]}`);
+    }
   } catch (error) {
     setMessage(`人工判定保存失败：${error.message}`, true);
   } finally {
@@ -1752,6 +1851,7 @@ async function saveWell(approvePredictions = false) {
       })
     });
     state.undoAction = result.undo_action || null;
+    if (pendingPlateQueue.active) state.pendingQueueVisited.add(well);
     state.busy = false;
     renderUndoButton();
     await Promise.all([
@@ -1844,6 +1944,7 @@ window.addEventListener("pagehide", () => {
 $("applyPlateFilter").onclick = applyPlateFilterFromEditor;
 $("clearPlateFilter").onclick = () => {
   Object.values(plateFilterFields).forEach(id => { $(id).value = ""; });
+  $("plateManualVerdictFilter").value = pendingPlateQueue.active ? "pending" : "all";
   applyPlateFilterFromEditor();
 };
 $("markerScale").oninput = drawAll;
@@ -1899,11 +2000,13 @@ document.addEventListener("keydown", event => {
   }
 });
 
-const initialWell = new URLSearchParams(window.location.search).get("well");
-if (initialWell) {
-  state.mode = "all";
+const initialWell = entryFilterParameters.get("well");
+const initialMode = entryFilterParameters.get("mode");
+if (["pending", "reviewed", "all"].includes(initialMode)) state.mode = initialMode;
+if (initialWell) state.mode = "all";
+if (initialWell || initialMode) {
   document.querySelectorAll("[data-mode]").forEach(node => {
-    node.classList.toggle("active", node.dataset.mode === "all");
+    node.classList.toggle("active", node.dataset.mode === state.mode);
   });
 }
 async function bootReview() {
@@ -1913,4 +2016,5 @@ async function bootReview() {
   await loadWells(initialWell?.toUpperCase() || null);
 }
 initializePlateFilterEditor();
+initializePendingQueue();
 bootReview();

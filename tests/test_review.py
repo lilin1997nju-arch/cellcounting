@@ -186,6 +186,11 @@ def test_auto_review_exposes_pre_filter_and_well_verdict_shortcuts():
     assert "本板筛选" in html
     assert 'id="plateDay0CellsMin"' in html
     assert 'id="plateDay1CellsMin"' in html
+    assert 'id="plateManualVerdictFilter"' in html
+    assert '<option value="unclassified">未判定</option>' in html
+    assert '<option value="approved">合格</option>' in html
+    assert '<option value="pending">待定</option>' in html
+    assert '<option value="rejected">排除</option>' in html
     assert 'data-well-verdict="approved"' in html
     assert 'data-well-verdict="pending"' in html
     assert 'data-well-verdict="rejected"' in html
@@ -202,6 +207,21 @@ def test_auto_review_exposes_pre_filter_and_well_verdict_shortcuts():
     assert 'unclassified: "未判定"' in script
     assert 'finiteFilter("day0_cells_min")' in script
     assert 'finiteFilter("day1_cells_min")' in script
+    assert 'manualVerdict: "manual_verdict"' in script
+    assert 'entryFilters.manualVerdict !== "all"' in script
+
+
+def test_auto_review_supports_project_pending_well_queue():
+    root = Path(__file__).parents[1] / "review-ui"
+    html = (root / "auto-review.html").read_text(encoding="utf-8")
+    script = (root / "auto-review.js").read_text(encoding="utf-8")
+
+    assert 'id="pendingQueueNotice"' in html
+    assert 'entryFilterParameters.get("pending_queue")' in script
+    assert 'entryFilters.manualVerdict = "pending"' in script
+    assert 'target.searchParams.set("manual_verdict", "pending")' in script
+    assert 'state.pendingQueueVisited.add(well)' in script
+    assert "advancePendingPlateQueue()" in script
 
 
 def test_auto_review_cell_total_tracks_labels_until_human_override():

@@ -1,6 +1,6 @@
 {
   "name": "cellvision-desktop",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Cell Vision offline production desktop client",
   "main": "main.js",
   "author": "Cell Vision",
@@ -19,6 +19,7 @@
     "appId": "com.cellvision.production.desktop",
     "productName": "Cell Vision",
     "artifactName": "CellVision-Setup-${version}-${arch}.${ext}",
+    "electronDist": "node_modules/electron/dist",
     "asar": true,
     "files": [
       "main.js",

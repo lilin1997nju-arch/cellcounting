@@ -390,8 +390,29 @@ async function exportProjectResults() {
   }
 }
 
-function summaryCard(label, value) {
-  return `<div class="summary-card"><span>${label}</span><strong>${count(value).toLocaleString()}</strong></div>`;
+function summaryCard(label, value, action = null) {
+  const actionHtml = action
+    ? `<button id="${esc(action.id)}" class="summary-card-action" type="button" ${action.disabled ? "disabled" : ""}>${esc(action.label)}</button>`
+    : "";
+  return `<div class="summary-card ${action ? "has-action" : ""}"><div><span>${label}</span><strong>${count(value).toLocaleString()}</strong></div>${actionHtml}</div>`;
+}
+
+function pendingReviewQueueUrl(plates, mountedPlates) {
+  const mounted = new Set((mountedPlates || []).map(String));
+  const slugs = (plates || [])
+    .filter(plate => mounted.has(String(plate.slug)) && count(plate.manual_verdict_counts?.pending) > 0)
+    .map(plate => String(plate.slug));
+  if (!slugs.length) return "";
+  const target = new URL(
+    `/projects/${encodeURIComponent(projectId)}/plates/${encodeURIComponent(slugs[0])}/`,
+    window.location.href
+  );
+  target.searchParams.set("manual_verdict", "pending");
+  target.searchParams.set("mode", "all");
+  target.searchParams.set("pending_queue", "1");
+  target.searchParams.set("pending_plate_queue", JSON.stringify(slugs));
+  target.searchParams.set("pending_queue_index", "0");
+  return `${target.pathname}${target.search}`;
 }
 
 function dateOnly(value) {
@@ -567,9 +588,14 @@ function renderProject(data) {
 
   const counts = data.category_counts || {};
   const verdicts = data.manual_verdict_counts || {};
+  const pendingQueueTarget = pendingReviewQueueUrl(plates, mounted);
   $("summaryCards").innerHTML = [
     summaryCard("合格孔", verdicts.approved),
-    summaryCard("待定孔", verdicts.pending),
+    summaryCard("待定孔", verdicts.pending, {
+      id: "pendingReviewQueueButton",
+      label: pendingQueueTarget ? "队列审核 →" : "暂无待定孔",
+      disabled: !pendingQueueTarget,
+    }),
     summaryCard("排除孔", verdicts.rejected),
     summaryCard("无明显生长", counts.no_obvious_growth),
     summaryCard("单细胞来源孔", counts.single_cell_origin),
@@ -577,6 +603,10 @@ function renderProject(data) {
     summaryCard("待确定", counts.undetermined),
     summaryCard("阳性对照", counts.positive_control),
   ].join("");
+  const pendingQueueButton = $("pendingReviewQueueButton");
+  if (pendingQueueButton && pendingQueueTarget) {
+    pendingQueueButton.onclick = () => { window.location.href = pendingQueueTarget; };
+  }
 
   $("plateRows").innerHTML = plates.length ? plates.map(plate => {
     const ready = mounted.includes(plate.slug);

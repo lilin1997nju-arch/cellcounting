@@ -7,7 +7,7 @@
   <meta name="review-base-url" content="">
   <title>按孔快速审核</title>
   <link rel="stylesheet" href="assets/teach.css">
-  <link rel="stylesheet" href="assets/auto-review.css?v=20260824-cell-total-v6">
+  <link rel="stylesheet" href="assets/auto-review.css?v=20260826-manual-queue-v1">
 </head>
 <body>
   <header class="topbar">
@@ -36,6 +36,11 @@
 
   <main class="quick-layout">
     <aside class="well-sidebar">
+      <div id="pendingQueueNotice" class="pending-queue-notice" hidden>
+        <strong>项目待定孔队列</strong>
+        <span id="pendingQueueProgress"></span>
+        <a id="pendingQueueBack" href="#">返回项目</a>
+      </div>
       <div class="sidebar-search">
         <label for="wellSearch">搜索孔位</label>
         <input id="wellSearch" placeholder="例如 H6">
@@ -51,6 +56,15 @@
         <details class="plate-filter-editor">
           <summary id="entryFilterSummary">本板筛选：未设置</summary>
           <div class="plate-filter-fields">
+            <label>人工判定
+              <select id="plateManualVerdictFilter">
+                <option value="all">不限</option>
+                <option value="unclassified">未判定</option>
+                <option value="approved">合格</option>
+                <option value="pending">待定</option>
+                <option value="rejected">排除</option>
+              </select>
+            </label>
             <label>末点覆盖率 &gt;<input id="plateCoverageMin" type="number" min="0" max="100" step="0.01" placeholder="不限"></label>
             <label>Day2 杂质数 &lt;<input id="plateDebrisMax" type="number" min="0" step="1" placeholder="不限"></label>
             <label class="plate-range-filter"><span>Day0 细胞数</span><div class="range-inputs"><input id="plateDay0CellsMin" type="number" min="0" step="1" placeholder="下限"><b>～</b><input id="plateDay0CellsMax" type="number" min="0" step="1" placeholder="上限"></div></label>
@@ -249,6 +263,6 @@
     </form>
   </dialog>
 
-  <script src="assets/auto-review.js?v=20260825-review-filter-v7"></script>
+  <script src="assets/auto-review.js?v=20260826-manual-queue-v1"></script>
 </body>
 </html>

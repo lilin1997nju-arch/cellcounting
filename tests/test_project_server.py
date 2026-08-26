@@ -136,6 +136,10 @@ def test_production_dashboard_has_no_training_or_mask_review_entry():
     assert "合格孔" in dashboard_js
     assert "待定孔" in dashboard_js
     assert "排除孔" in dashboard_js
+    assert "pendingReviewQueueUrl" in dashboard_js
+    assert 'id: "pendingReviewQueueButton"' in dashboard_js
+    assert 'target.searchParams.set("pending_queue", "1")' in dashboard_js
+    assert 'target.searchParams.set("manual_verdict", "pending")' in dashboard_js
     assert "openReviewFilterDialog" not in dashboard_js
     assert "refreshReviewFilterCounts" in dashboard_js
     assert 'day0_cells_min: "day0CellsMin"' in dashboard_js

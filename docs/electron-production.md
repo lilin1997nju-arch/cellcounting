@@ -2,7 +2,7 @@
 
 ## 交付结构
 
-`CellVision-Setup-0.2.1-x64.exe` 是面向 Windows 10/11 x64 的单文件离线安装程序，包含：
+`CellVision-Setup-0.2.2-x64.exe` 是面向 Windows 10/11 x64 的单文件离线安装程序，包含：
 
 - Electron 43.4.1 桌面客户端；
 - CPU 版 Python 3.12、PyTorch、模型及生产服务；
@@ -58,6 +58,6 @@ scripts\build_electron_installer.ps1 `
   -PortableReleaseRoot release\CellVision-offline-6231fdce81-cpu
 ```
 
-构建脚本会覆盖最新源码和审核界面，下载并校验微软签名的 VC++ x64 运行库，然后生成 `electron\dist\CellVision-Setup-0.2.1-x64.exe`。
+构建脚本会覆盖最新源码和审核界面，下载并校验微软签名的 VC++ x64 运行库，然后生成 `electron\dist\CellVision-Setup-0.2.2-x64.exe`。
 
 当前内部交付程序没有商业代码签名证书，Windows可能显示“未知发布者”或 SmartScreen 提示；这不影响离线运行，但正式大规模发布前应使用组织代码签名证书签署安装程序。
