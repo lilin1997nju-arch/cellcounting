@@ -31,7 +31,7 @@
 !macro customUnInstall
   ${If} ${FileExists} "$INSTDIR\Application\scripts\install_production_service.ps1"
     DetailPrint "Stopping and unregistering the Cell Vision production service ..."
-    ExecWait '"powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Application\scripts\install_production_service.ps1" -InstallRoot "$INSTDIR\Application" -Action uninstall' $0
+    ExecWait '"powershell.exe" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$INSTDIR\Application\scripts\install_production_service.ps1" -InstallRoot "$INSTDIR\Application" -ServiceName "CellVisionDesktopProduction" -Action uninstall' $0
   ${EndIf}
 !macroend
 

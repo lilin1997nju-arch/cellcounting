@@ -3,7 +3,7 @@
 param([switch]$ValidateOnly)
 
 $ErrorActionPreference = "Stop"
-$serviceName = "CellVisionProduction"
+$serviceName = "CellVisionDesktopProduction"
 if ($ValidateOnly) {
     Write-Output "DISABLE_AUTOSTART_SCRIPT_VALIDATION_OK"
     exit 0

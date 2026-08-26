@@ -6,7 +6,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$serviceName = "CellVisionProduction"
+$serviceName = "CellVisionDesktopProduction"
 $deploymentRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $applicationRoot = Join-Path $deploymentRoot "Application"
 $targetWorkspace = Join-Path $deploymentRoot "Workspace"

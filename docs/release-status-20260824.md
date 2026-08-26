@@ -192,3 +192,13 @@
 5. 交付安装包：`electron/dist/CellVision-Setup-0.2.2-x64.exe`，386,654,295字节（约368.7 MiB），SHA-256 `7cab2427df8a3ee4a87a87e73514ede0518f91e996354096a25f46c1bd41c8e3`。
 6. 验证：JavaScript语法与差异格式检查通过；Python完整测试262项、Electron测试5项通过；本地真实项目页面确认人工判定筛选命中1/63孔，无待定孔入口正确禁用，两块板空待定队列可自动跨板并到达完成页；安装载荷内源码已核对包含人工筛选和跨板队列逻辑。
 7. 本机桌面端所连接的生产服务目录已同步6个界面文件，旧文件备份至 `Application/update-backups/20260826-093405-cellvision-electron-0.2.2`；安装状态记录更新为 `2026.08.26-electron-0.2.2`。同步后源/目标SHA-256逐文件一致，8777服务保持Running且 `/api/ready` 返回ready，HTTP实际返回新版缓存标识和待定队列代码；Workspace未修改。
+
+## 2026-08-26 桌面版旧服务与端口隔离
+
+1. Electron 客户端版本升级至0.2.3，桌面版 Windows 服务改用独立名称 `CellVisionDesktopProduction`；其他目录中原有的 `CellVisionProduction` 不会被停止或删除。
+2. 安装及日常启动新增端口冲突处理：优先使用 `Application/.env.production` 中的既有端口；若端口属于其他程序或其他 Cell Vision 实例，则从后续端口中选择空闲端口并持久化。端口变更需要重启桌面服务时只申请一次管理员授权。
+3. 每个保留的 Workspace 新增稳定的 `.cellvision-instance-id`；后端 `/api/ready` 返回该实例标识，Electron 和启动脚本只接受与当前 Workspace 一致的响应，避免旧服务虽返回 ready 但客户端打开错误项目目录。
+4. 从0.2.2同目录升级时，配置程序会移除指向当前安装目录的旧 `CellVisionProduction` 注册，再注册独立桌面服务，避免同一 Workspace 被两个服务并发访问；指向其他安装目录的旧服务保持不变。
+5. 本机非破坏性冲突验证：旧 `CellVisionProduction` 保持 Running 并占用8777，旧健康接口无实例标识；空闲端口探测选择8778，符合新桌面版自动回退预期。
+6. 交付安装包：`electron/dist/CellVision-Setup-0.2.3-x64.exe`，386,696,646字节，SHA-256 `8443e21c0a74ba9ca5de7f355aa54edbb5059e608e9ee3c308192b80015a8f86`。
+7. 验证：完整Python测试集、Electron 6项测试、PowerShell 5.1语法解析及 `git diff --check` 均通过；安装载荷已核对包含独立服务名、实例校验和自动端口选择逻辑。Workspace和现有项目数据未修改。

@@ -27,12 +27,18 @@ Workspace\Projects\.metadata-backups\<时间戳>\
 服务已经运行时不会重启或重装；服务停止时只启动服务，并检查 API 和计算工作器，
 随后打开平台。日志保存在 Workspace\Logs\cellvision-daily-launch.log。
 
+桌面版使用独立的 CellVisionDesktopProduction 服务。若 8777 已被旧版服务或其他程序占用，
+启动器会自动选择后续空闲端口并写入 Application\.env.production；端口切换时只需确认一次
+管理员授权。客户端还会核对 Workspace 实例标识，不会误连旧服务或打开错误的项目目录。
+
 四、服务配置入口
 ----------------
 Configure-CellVision-Service.cmd 只用于首次安装服务或服务确实损坏时重新配置，
 不要作为日常启动入口。
 
-更新后的配置脚本会先备份项目元数据；同一安装目录下不再卸载重装服务；
+更新后的配置脚本会先备份项目元数据；同一安装目录下不再卸载重装桌面服务；
+从旧桌面包升级时，会将本安装目录原有的 CellVisionProduction 迁移为独立桌面服务名；
+其他安装目录中的旧服务不会被停止或删除。
 如果检测到服务属于另一份 Cell Vision 安装目录，会默认停止并提示，避免切换到错误的 Workspace。
 
 五、文件用途

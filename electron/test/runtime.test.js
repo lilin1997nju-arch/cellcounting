@@ -8,6 +8,7 @@ const path = require("node:path");
 const {
   commandLineDeploymentRoot,
   configuredPort,
+  ensureInstanceId,
   isAllowedClientUrl,
   normalizeWorkspaceSelection,
   parseEnvironment,
@@ -26,6 +27,15 @@ test("configured port reads the bundled production environment", () => {
   fs.writeFileSync(path.join(root, "Application", ".env.production"), "CELLVISION_PORT=8899\n");
   assert.equal(configuredPort(root), 8899);
   assert.equal(configuredPort(root, 9001), 9001);
+});
+
+test("workspace instance id is stable and unique per deployment", () => {
+  const first = fs.mkdtempSync(path.join(os.tmpdir(), "cellvision-instance-a-"));
+  const second = fs.mkdtempSync(path.join(os.tmpdir(), "cellvision-instance-b-"));
+  const firstValue = ensureInstanceId(first);
+  assert.match(firstValue, /^[0-9a-f-]{36}$/i);
+  assert.equal(ensureInstanceId(first), firstValue);
+  assert.notEqual(ensureInstanceId(second), firstValue);
 });
 
 test("workspace selector accepts either Workspace or its parent", () => {

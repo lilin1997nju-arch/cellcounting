@@ -7,6 +7,7 @@ const path = require("node:path");
 const {
   commandLineDeploymentRoot,
   configuredPort,
+  ensureInstanceId,
   findDevelopmentDeploymentRoot,
   isAllowedClientUrl,
   normalizeWorkspaceSelection,
@@ -16,6 +17,7 @@ let mainWindow = null;
 let startupPromise = null;
 let deploymentRoot = "";
 let productionPort = 8777;
+let instanceId = "";
 let lastStartupStatus = { message: "正在初始化客户端……", kind: "progress" };
 const bootstrapLog = path.join(process.env.LOCALAPPDATA || process.env.TEMP || __dirname, "CellVision", "electron-bootstrap.log");
 
@@ -113,8 +115,14 @@ async function ensurePlatform() {
   startupPromise = (async () => {
     sendStatus("正在检查 Cell Vision 服务和计算工作器……");
     await runPowerShell("start_cellvision_platform.ps1", ["-NoOpen", "-StartupTimeoutSeconds", "180"]);
+    productionPort = configuredPort(deploymentRoot);
     const ready = await apiJson("api/ready");
     if (ready.status !== "ready") throw new Error("Cell Vision 服务尚未就绪。");
+    if (!ready.instance_id || ready.instance_id !== instanceId) {
+      throw new Error(
+        `端口 ${productionPort} 上运行的是其他 Cell Vision 实例。当前客户端已拒绝连接，以免打开错误的 Workspace。`,
+      );
+    }
     sendStatus("服务已就绪，正在打开项目主页……", "success");
     await mainWindow.loadURL(`http://127.0.0.1:${productionPort}/?electron=1`);
   })();
@@ -301,6 +309,7 @@ else {
     }
     try {
       assertDeployment();
+      instanceId = ensureInstanceId(deploymentRoot);
       productionPort = configuredPort(deploymentRoot);
     } catch (error) {
       dialog.showErrorBox("Cell Vision 安装不完整", error.message);

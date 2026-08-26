@@ -20,12 +20,32 @@ except ImportError:  # Keep development and non-Windows imports functional.
     win32serviceutil = None
 
 
-SERVICE_NAME = "CellVisionProduction"
-SERVICE_DISPLAY_NAME = "Cell Vision Production Engine"
-
-
 def installation_root() -> Path:
     return Path(__file__).resolve().parents[2]
+
+
+def configured_service_name(root: Path | None = None) -> str:
+    configured = os.environ.get("CELLVISION_SERVICE_NAME", "").strip()
+    if configured:
+        return configured
+    env_path = (root or installation_root()) / ".env.production"
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8-sig").splitlines():
+            if raw_line.startswith("CELLVISION_SERVICE_NAME="):
+                value = raw_line.split("=", 1)[1].strip()
+                if value:
+                    return value
+    except OSError:
+        pass
+    return "CellVisionProduction"
+
+
+SERVICE_NAME = configured_service_name()
+SERVICE_DISPLAY_NAME = (
+    "Cell Vision Desktop Production Engine"
+    if SERVICE_NAME == "CellVisionDesktopProduction"
+    else "Cell Vision Production Engine"
+)
 
 
 def load_production_environment(root: Path) -> dict[str, str]:

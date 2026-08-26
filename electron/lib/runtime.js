@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 function parseEnvironment(text) {
   const values = {};
@@ -24,6 +25,26 @@ function configuredPort(deploymentRoot, explicitPort = 0) {
     if (Number.isInteger(port) && port > 0 && port < 65536) return port;
   } catch {}
   return 8777;
+}
+
+function ensureInstanceId(deploymentRoot) {
+  const workspaceRoot = path.join(deploymentRoot, "Workspace");
+  const instancePath = path.join(workspaceRoot, ".cellvision-instance-id");
+  fs.mkdirSync(workspaceRoot, { recursive: true });
+  try {
+    const current = fs.readFileSync(instancePath, "utf8").trim();
+    if (current) return current;
+  } catch {}
+  const value = crypto.randomUUID();
+  try {
+    fs.writeFileSync(instancePath, `${value}\n`, { encoding: "utf8", flag: "wx" });
+    return value;
+  } catch (error) {
+    if (error?.code !== "EEXIST") throw error;
+    const current = fs.readFileSync(instancePath, "utf8").trim();
+    if (!current) throw new Error(`Cell Vision 实例标识为空：${instancePath}`);
+    return current;
+  }
 }
 
 function normalizeWorkspaceSelection(selectedPath) {
@@ -70,6 +91,7 @@ function commandLineDeploymentRoot(argv) {
 module.exports = {
   commandLineDeploymentRoot,
   configuredPort,
+  ensureInstanceId,
   findDevelopmentDeploymentRoot,
   isAllowedClientUrl,
   normalizeWorkspaceSelection,

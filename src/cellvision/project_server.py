@@ -76,6 +76,23 @@ if not production_mode_enabled():
     )
 
 
+def _production_instance_id() -> str:
+    """Return the stable ID of the installed Workspace, when configured."""
+
+    configured = os.environ.get("CELLVISION_INSTANCE_ID", "").strip()
+    if configured:
+        return configured
+    artifact_root = os.environ.get("CELLVISION_ARTIFACT_ROOT", "").strip()
+    if not artifact_root:
+        return ""
+    try:
+        return (Path(artifact_root) / ".cellvision-instance-id").read_text(
+            encoding="utf-8-sig"
+        ).strip()
+    except OSError:
+        return ""
+
+
 def _safe(value: Any) -> Any:
     """Convert pandas/numpy values to JSON-safe primitives."""
 
@@ -2699,6 +2716,7 @@ def create_project_app(manifest_path: str | Path) -> FastAPI:
             raise HTTPException(status_code=503, detail={"missing": missing})
         return {
             "status": "ready",
+            "instance_id": _production_instance_id(),
             "project": project_name,
             "plate_count": len(mounted),
             "project_count": len(_project_manifest_paths(manifest_file)),

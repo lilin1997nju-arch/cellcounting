@@ -3,12 +3,13 @@
 param(
     [string]$InstallRoot = "",
     [int]$Port = 8777,
+    [string]$ServiceName = "CellVisionProduction",
     [ValidateSet("install", "uninstall", "start", "stop", "status")]
     [string]$Action = "install"
 )
 
 $ErrorActionPreference = "Stop"
-$serviceName = "CellVisionProduction"
+$serviceName = $ServiceName
 if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
     $InstallRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot ".."))
 } else {
@@ -16,6 +17,18 @@ if ([string]::IsNullOrWhiteSpace($InstallRoot)) {
 }
 $basePython = Join-Path $InstallRoot "Python312\python.exe"
 $manager = Join-Path $InstallRoot "scripts\manage_production_service.py"
+$environmentPath = Join-Path $InstallRoot ".env.production"
+
+function Get-EnvironmentValue {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if (-not (Test-Path -LiteralPath $environmentPath -PathType Leaf)) { return "" }
+    $prefix = $Name + "="
+    $line = Get-Content -LiteralPath $environmentPath | Where-Object {
+        $_.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1
+    if ($null -eq $line) { return "" }
+    return $line.Substring($prefix.Length).Trim()
+}
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -29,8 +42,14 @@ function Invoke-ServiceManager {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
     if (-not (Test-Path -LiteralPath $basePython -PathType Leaf)) { throw "Service Python is missing: $basePython" }
     if (-not (Test-Path -LiteralPath $manager -PathType Leaf)) { throw "Service manager is missing: $manager" }
-    & $basePython $manager @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "Service manager failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')" }
+    $previousServiceName = $env:CELLVISION_SERVICE_NAME
+    try {
+        $env:CELLVISION_SERVICE_NAME = $serviceName
+        & $basePython $manager @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "Service manager failed with exit code ${LASTEXITCODE}: $($Arguments -join ' ')" }
+    } finally {
+        $env:CELLVISION_SERVICE_NAME = $previousServiceName
+    }
 }
 
 if ($Action -eq "status") {
@@ -83,10 +102,14 @@ Start-Service -Name $serviceName
 (Get-Service -Name $serviceName).WaitForStatus("Running", [TimeSpan]::FromSeconds(30))
 
 $ready = $false
+$instanceId = Get-EnvironmentValue -Name "CELLVISION_INSTANCE_ID"
 for ($attempt = 0; $attempt -lt 90; $attempt++) {
     try {
         $response = Invoke-RestMethod -Uri "http://127.0.0.1:$Port/api/ready" -TimeoutSec 2
-        if ($response.status -eq "ready") { $ready = $true; break }
+        if ($response.status -eq "ready" -and [string]$response.instance_id -eq $instanceId) {
+            $ready = $true
+            break
+        }
     } catch {}
     Start-Sleep -Seconds 1
 }

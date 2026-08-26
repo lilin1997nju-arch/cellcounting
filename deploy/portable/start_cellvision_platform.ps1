@@ -8,7 +8,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$serviceName = "CellVisionProduction"
+$serviceName = "CellVisionDesktopProduction"
 $deploymentRoot = [IO.Path]::GetFullPath($PSScriptRoot)
 $applicationRoot = Join-Path $deploymentRoot "Application"
 $workspaceRoot = Join-Path $deploymentRoot "Workspace"
@@ -16,6 +16,7 @@ $logRoot = Join-Path $workspaceRoot "Logs"
 $python = Join-Path $applicationRoot "Python312\python.exe"
 $expectedServiceHost = Join-Path $applicationRoot "Python312\pythonservice.exe"
 $environmentPath = Join-Path $applicationRoot ".env.production"
+$instanceIdPath = Join-Path $workspaceRoot ".cellvision-instance-id"
 $recoveryScript = Join-Path $deploymentRoot "repair_project_manifests.py"
 New-Item -ItemType Directory -Force -Path $logRoot | Out-Null
 $logPath = Join-Path $logRoot "cellvision-daily-launch.log"
@@ -43,8 +44,7 @@ function Test-Administrator {
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Get-ConfiguredPort {
-    if ($Port -gt 0) { return $Port }
+function Get-PersistedPort {
     if (Test-Path -LiteralPath $environmentPath -PathType Leaf) {
         $line = Get-Content -LiteralPath $environmentPath | Where-Object {
             $_ -match '^CELLVISION_PORT=(\d+)\s*$'
@@ -52,6 +52,82 @@ function Get-ConfiguredPort {
         if ($line -match '^CELLVISION_PORT=(\d+)\s*$') { return [int]$Matches[1] }
     }
     return 8777
+}
+
+function Get-ConfiguredPort {
+    if ($Port -gt 0) { return $Port }
+    return Get-PersistedPort
+}
+
+function Set-ConfiguredPort {
+    param([Parameter(Mandatory = $true)][int]$Value)
+    $lines = @(Get-Content -LiteralPath $environmentPath -ErrorAction Stop)
+    $updated = $false
+    for ($index = 0; $index -lt $lines.Count; $index++) {
+        if ($lines[$index] -match '^CELLVISION_PORT=') {
+            $lines[$index] = "CELLVISION_PORT=$Value"
+            $updated = $true
+            break
+        }
+    }
+    if (-not $updated) { $lines += "CELLVISION_PORT=$Value" }
+    [IO.File]::WriteAllText(
+        $environmentPath,
+        (($lines -join [Environment]::NewLine) + [Environment]::NewLine),
+        (New-Object Text.UTF8Encoding($false))
+    )
+}
+
+function Ensure-InstanceId {
+    New-Item -ItemType Directory -Force -Path $workspaceRoot | Out-Null
+    if (-not (Test-Path -LiteralPath $instanceIdPath -PathType Leaf)) {
+        [IO.File]::WriteAllText(
+            $instanceIdPath,
+            ([guid]::NewGuid().ToString("D") + [Environment]::NewLine),
+            (New-Object Text.UTF8Encoding($false))
+        )
+    }
+    $value = (Get-Content -LiteralPath $instanceIdPath -Raw -Encoding UTF8).Trim()
+    if ([string]::IsNullOrWhiteSpace($value)) { throw "Cell Vision instance ID is empty: $instanceIdPath" }
+    return $value
+}
+
+function Test-TcpPortAvailable {
+    param([Parameter(Mandatory = $true)][int]$Candidate)
+    $listener = $null
+    try {
+        $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, $Candidate)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($null -ne $listener) { try { $listener.Stop() } catch {} }
+    }
+}
+
+function Find-AvailablePort {
+    param([Parameter(Mandatory = $true)][int]$Preferred)
+    for ($offset = 1; $offset -le 1000; $offset++) {
+        $candidate = $Preferred + $offset
+        if ($candidate -gt 65535) { break }
+        if (Test-TcpPortAvailable -Candidate $candidate) { return $candidate }
+    }
+    throw "No free local TCP port was found after port $Preferred."
+}
+
+function Test-InstanceReady {
+    param(
+        [Parameter(Mandatory = $true)][int]$ReadyPort,
+        [Parameter(Mandatory = $true)][string]$ExpectedInstanceId
+    )
+    try {
+        $response = Invoke-RestMethod -Uri "http://127.0.0.1:$ReadyPort/api/ready" -TimeoutSec 2
+        return [string]$response.status -eq "ready" -and `
+            [string]$response.instance_id -eq $ExpectedInstanceId
+    } catch {
+        return $false
+    }
 }
 
 function Get-ServiceExecutable {
@@ -160,6 +236,38 @@ if (-not [string]::Equals(
     )
 }
 
+$instanceId = Ensure-InstanceId
+$persistedPort = Get-PersistedPort
+$readyPort = Get-ConfiguredPort
+$portConfigurationChanged = $false
+if ($Port -gt 0 -and $readyPort -ne $persistedPort) {
+    if (-not (Test-Administrator)) { Invoke-ElevatedLauncher }
+    Set-ConfiguredPort -Value $readyPort
+    $portConfigurationChanged = $true
+    Write-LaunchStatus "Updated this installation to use port $readyPort." Yellow
+}
+
+$currentInstanceReady = Test-InstanceReady -ReadyPort $readyPort -ExpectedInstanceId $instanceId
+if (-not $currentInstanceReady -and -not (Test-TcpPortAvailable -Candidate $readyPort)) {
+    $occupiedPort = $readyPort
+    $readyPort = Find-AvailablePort -Preferred $occupiedPort
+    $Port = $readyPort
+    if (-not (Test-Administrator)) { Invoke-ElevatedLauncher }
+    Set-ConfiguredPort -Value $readyPort
+    $portConfigurationChanged = $true
+    Write-LaunchStatus (
+        "Port $occupiedPort belongs to another process or Cell Vision installation; " +
+        "this installation was moved to port $readyPort."
+    ) Yellow
+}
+
+if ($portConfigurationChanged -and $service.Status -ne "Stopped") {
+    Write-LaunchStatus "Restarting $serviceName to apply the new port ..." Cyan
+    Stop-Service -Name $serviceName -Force
+    (Get-Service -Name $serviceName).WaitForStatus("Stopped", [TimeSpan]::FromSeconds(30))
+    $service = Get-Service -Name $serviceName -ErrorAction Stop
+}
+
 if ($service.Status -eq "Stopped") {
     if (-not (Test-Administrator)) { Invoke-ElevatedLauncher }
     Write-LaunchStatus "Starting $serviceName ..." Cyan
@@ -172,7 +280,6 @@ if ($service.Status -eq "Stopped") {
     Write-LaunchStatus "$serviceName is already running; no reinstall or restart is needed." Green
 }
 
-$readyPort = Get-ConfiguredPort
 $baseUrl = "http://127.0.0.1:$readyPort/"
 $timer = [Diagnostics.Stopwatch]::StartNew()
 $lastNoticeSecond = -1
@@ -185,7 +292,8 @@ while ($timer.Elapsed.TotalSeconds -lt $StartupTimeoutSeconds) {
     $apiReady = $false
     try {
         $response = Invoke-RestMethod -Uri ($baseUrl + "api/ready") -TimeoutSec 2
-        $apiReady = [string]$response.status -eq "ready"
+        $apiReady = [string]$response.status -eq "ready" -and `
+            [string]$response.instance_id -eq $instanceId
     } catch {}
     if ($apiReady -and (Test-WorkerRuntime -BaseUrl $baseUrl)) {
         $platformReady = $true

@@ -29,6 +29,8 @@ param(
     [string]$Device = "auto",
     [int]$Port = 8777,
     [string]$BindHost = "127.0.0.1",
+    [string]$InstanceId = "",
+    [string]$ServiceName = "CellVisionProduction",
     [switch]$AllowRemote,
     [switch]$SkipModelCheck,
     [switch]$ForceRecreate,
@@ -346,6 +348,8 @@ CELLVISION_PYTHON=$(Convert-ToEnvPath $script:PythonPath)
 CELLVISION_MANIFEST=$(Convert-ToEnvPath $Manifest)
 CELLVISION_HOST=$BindHost
 CELLVISION_PORT=$Port
+CELLVISION_INSTANCE_ID=$InstanceId
+CELLVISION_SERVICE_NAME=$ServiceName
 CELLVISION_ALLOW_REMOTE=$remoteValue
 CELLVISION_DEVICE=$Device
 CELLVISION_WORKER_DEVICE=$Device

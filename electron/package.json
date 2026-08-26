@@ -1,6 +1,6 @@
 {
   "name": "cellvision-desktop",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Cell Vision offline production desktop client",
   "main": "main.js",
   "author": "Cell Vision",
