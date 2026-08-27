@@ -120,6 +120,8 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     daily_launcher = (ROOT / "deploy" / "portable" / "start_cellvision_platform.ps1").read_text(encoding="utf-8")
     recovery_launcher = (ROOT / "deploy" / "portable" / "recover_cellvision_projects.ps1").read_text(encoding="utf-8")
     disable_autostart = (ROOT / "deploy" / "portable" / "disable_service_autostart.ps1").read_text(encoding="utf-8")
+    zip_installer = (ROOT / "deploy" / "portable" / "install_cellvision_zip.ps1").read_text(encoding="utf-8")
+    zip_builder = (ROOT / "scripts" / "build_electron_installer.ps1").read_text(encoding="utf-8")
     prepare = (ROOT / "scripts" / "prepare_portable_production_runtime.ps1").read_text(encoding="utf-8")
     setup = (ROOT / "scripts" / "setup_production.ps1").read_text(encoding="utf-8")
 
@@ -166,3 +168,11 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert 'StartMode -ne "Manual"' in disable_autostart
     assert "was not stopped" in disable_autostart
     assert "DISABLE_AUTOSTART_SCRIPT_VALIDATION_OK" in disable_autostart
+    assert "CellVisionDesktopProduction" in zip_installer
+    assert "vc_redist.x64.exe" in zip_installer
+    assert "configure_service.ps1" in zip_installer
+    assert "CommonDesktopDirectory" in zip_installer
+    assert "CELLVISION_ZIP_INSTALL.json" in zip_installer
+    assert 'ValidateSet("nsis", "zip")' in zip_builder
+    assert "npm.cmd run pack:dir" in zip_builder
+    assert "CellVision-Desktop-$version-x64.zip" in zip_builder

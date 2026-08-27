@@ -1,4 +1,4 @@
-# 生产更新状态（更新至 2026-08-25）
+# 生产更新状态（更新至 2026-08-27）
 
 ## 当前发布节点
 
@@ -202,3 +202,13 @@
 5. 本机非破坏性冲突验证：旧 `CellVisionProduction` 保持 Running 并占用8777，旧健康接口无实例标识；空闲端口探测选择8778，符合新桌面版自动回退预期。
 6. 交付安装包：`electron/dist/CellVision-Setup-0.2.3-x64.exe`，386,696,646字节，SHA-256 `8443e21c0a74ba9ca5de7f355aa54edbb5059e608e9ee3c308192b80015a8f86`。
 7. 验证：完整Python测试集、Electron 6项测试、PowerShell 5.1语法解析及 `git diff --check` 均通过；安装载荷已核对包含独立服务名、实例校验和自动端口选择逻辑。Workspace和现有项目数据未修改。
+
+## 2026-08-27 解压目录式 ZIP 安装包
+
+1. 针对 NSIS 首阶段先向 `%TEMP%` 原子解压约1.33GiB、33,000余个文件，生产电脑可能受系统盘空间和安全软件扫描影响长时间无进度的问题，新增直接解压到最终安装目录的 ZIP 交付方式。
+2. ZIP 根目录新增 `Install-CellVision.cmd` / `install_cellvision_zip.ps1`：完整解压后双击一次，继续完成微软签名 VC++ x64 运行库、Workspace 本机用户权限、`CellVisionDesktopProduction` 服务、端口冲突自动切换、Workspace 实例校验、桌面/开始菜单快捷方式及首次启动。
+3. ZIP 不包含 Workspace；同目录解压不会主动删除历史项目。覆盖升级前必须先退出客户端并停止本安装目录的桌面服务，避免运行中的 Python/DLL 文件无法替换；也可解压到新目录后使用客户端历史 Workspace 导入入口。
+4. 新增 ZIP 构建入口 `scripts/build_electron_portable_zip.ps1`，复用当前源码、审核界面、CPU Python/PyTorch、模型和生产脚本构建 `win-unpacked`，再生成标准 ZIP；保留原NSIS构建能力用于需要时回退。
+5. 交付产物：`electron/dist/CellVision-Desktop-0.2.4-x64.zip`，505,748,763字节；SHA-256 `adcf85d443da1c3fab3282fa4bbbf9a95ad6a302aa7a8b9bcdf3128010abdb20`。
+6. 产物验证：ZIP共2,993个目录、33,366个文件，解压大小1,430,841,629字节，完整性测试通过；不含 Workspace；根目录安装入口、服务配置、日常启动、说明文件和内置 Python 均存在；最长相对路径159字符，解压到简短安装目录可兼容Win10传统路径限制。
+7. 使用 ZIP 内实际携带的运行时执行 `configure_service.ps1 -ValidateOnly`，PyTorch 2.11.0+cpu 和 Windows 服务运行库检查通过；安装脚本通过Windows PowerShell语法解析。完整安装行为未在本机执行，避免修改当前已运行的生产服务与 Workspace。

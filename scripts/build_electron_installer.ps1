@@ -1,8 +1,9 @@
-<# Build the one-file Electron/NSIS production installer from a portable runtime. #>
+<# Build the Electron NSIS installer or extracted-folder ZIP from a portable runtime. #>
 [CmdletBinding()]
 param(
     [string]$PortableReleaseRoot = "",
-    [switch]$SkipNpmInstall
+    [switch]$SkipNpmInstall,
+    [ValidateSet("nsis", "zip")][string]$PackageFormat = "nsis"
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,6 +57,8 @@ foreach ($overlay in @(
 
 $portableFiles = @(
     "Configure-CellVision-Service.cmd",
+    "Install-CellVision.cmd",
+    "install_cellvision_zip.ps1",
     "configure_service_launcher.ps1",
     "configure_service.ps1",
     "Start-CellVision.cmd",
@@ -69,7 +72,8 @@ $portableFiles = @(
     "import_cellvision_workspace.ps1",
     "import_cellvision_workspace_launcher.ps1",
     "PROJECT-RECOVERY-README.txt",
-    "PRODUCTION-MAINTENANCE-README.txt"
+    "PRODUCTION-MAINTENANCE-README.txt",
+    "ZIP-INSTALL-README.txt"
 )
 foreach ($name in $portableFiles) {
     $source = Join-Path $repository "deploy\portable\$name"
@@ -96,16 +100,73 @@ if (-not $SkipNpmInstall) {
     if ($LASTEXITCODE -ne 0) { throw "npm ci failed." }
 }
 
-Write-Host "Building the x64 NSIS installer ..." -ForegroundColor Cyan
+if ($PackageFormat -eq "nsis") {
+    Write-Host "Building the x64 NSIS installer ..." -ForegroundColor Cyan
+    Push-Location $electronRoot
+    try {
+        & npm.cmd run pack:win
+        if ($LASTEXITCODE -ne 0) { throw "Electron installer build failed." }
+    } finally {
+        Pop-Location
+    }
+    $installer = Get-ChildItem -LiteralPath (Join-Path $electronRoot "dist") `
+        -Filter "CellVision-Setup-*-x64.exe" -File |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $installer) { throw "Electron builder completed without an installer artifact." }
+    Write-Host "Electron installer ready: $($installer.FullName)" -ForegroundColor Green
+    exit 0
+}
+
+Write-Host "Building the extracted-folder Electron layout ..." -ForegroundColor Cyan
 Push-Location $electronRoot
 try {
-    & npm.cmd run pack:win
-    if ($LASTEXITCODE -ne 0) { throw "Electron installer build failed." }
+    & npm.cmd run pack:dir
+    if ($LASTEXITCODE -ne 0) { throw "Electron directory build failed." }
 } finally {
     Pop-Location
 }
-$installer = Get-ChildItem -LiteralPath (Join-Path $electronRoot "dist") -Filter "CellVision-Setup-*-x64.exe" -File |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-if ($null -eq $installer) { throw "Electron builder completed without an installer artifact." }
-Write-Host "Electron installer ready: $($installer.FullName)" -ForegroundColor Green
+
+$unpackedRoot = Join-Path $electronRoot "dist\win-unpacked"
+foreach ($required in @(
+    (Join-Path $unpackedRoot "Cell Vision.exe"),
+    (Join-Path $unpackedRoot "Install-CellVision.cmd"),
+    (Join-Path $unpackedRoot "install_cellvision_zip.ps1"),
+    (Join-Path $unpackedRoot "Application\Python312\python.exe")
+)) {
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
+        throw "Extracted-folder build is incomplete: $required"
+    }
+}
+
+$version = [string](Get-Content -LiteralPath (Join-Path $electronRoot "package.json") `
+    -Raw -Encoding UTF8 | ConvertFrom-Json).version
+$zipPath = Join-Path $electronRoot "dist\CellVision-Desktop-$version-x64.zip"
+if (Test-Path -LiteralPath $zipPath -PathType Leaf) { Remove-Item -LiteralPath $zipPath -Force }
+
+$sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+if ([string]::IsNullOrWhiteSpace($sevenZip)) {
+    $sevenZip = Get-ChildItem -LiteralPath (Join-Path $env:LOCALAPPDATA "electron-builder\Cache") `
+        -Filter "7za.exe" -File -Recurse -ErrorAction SilentlyContinue |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+if ([string]::IsNullOrWhiteSpace($sevenZip) -or -not (Test-Path -LiteralPath $sevenZip -PathType Leaf)) {
+    throw "7-Zip command line runtime was not found in PATH or the electron-builder cache."
+}
+
+Write-Host "Creating a ZIP that extracts directly into the selected installation folder ..." -ForegroundColor Cyan
+Push-Location $unpackedRoot
+try {
+    & $sevenZip a -tzip -mx=5 -mmt=on $zipPath ".\*"
+    if ($LASTEXITCODE -ne 0) { throw "ZIP creation failed with exit code $LASTEXITCODE." }
+} finally {
+    Pop-Location
+}
+& $sevenZip t $zipPath
+if ($LASTEXITCODE -ne 0) { throw "ZIP integrity verification failed with exit code $LASTEXITCODE." }
+
+$zip = Get-Item -LiteralPath $zipPath
+$hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+Write-Host "Cell Vision extracted-folder ZIP ready: $($zip.FullName)" -ForegroundColor Green
+Write-Host "  Bytes:   $($zip.Length)"
+Write-Host "  SHA-256: $hash"
