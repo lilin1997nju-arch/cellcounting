@@ -129,8 +129,10 @@ def ensure_teaching_features(
     config: dict[str, Any], *, force: bool = False
 ) -> tuple[pd.DataFrame, np.ndarray]:
     import torch
-    from torch import nn
-    from torchvision.models import ResNet18_Weights, resnet18
+    from .pretrained import (
+        load_resnet18_imagenet_extractor,
+        resolve_resnet18_imagenet_checkpoint,
+    )
 
     cache_path, metadata_path, environment_path = _feature_paths(config)
     candidates = teaching_candidate_pool(config).reset_index(drop=True)
@@ -176,10 +178,10 @@ def ensure_teaching_features(
     missing_candidates = candidates.loc[~reuse_mask_array].copy()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    weights = ResNet18_Weights.DEFAULT
-    extractor = resnet18(weights=weights)
-    extractor.fc = nn.Identity()
-    extractor = extractor.eval().to(device)
+    extractor = load_resnet18_imagenet_extractor(
+        resolve_resnet18_imagenet_checkpoint(config),
+        device,
+    )
     means = torch.tensor([0.485, 0.456, 0.406], device=device)[None, :, None, None]
     stds = torch.tensor([0.229, 0.224, 0.225], device=device)[None, :, None, None]
     batch_size = int(

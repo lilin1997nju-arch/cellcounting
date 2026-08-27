@@ -208,11 +208,25 @@ try {
     $models = @(
         @{ Source = Join-Path $repository "artifacts\models\teaching_classifier.pt"; Destination = "models\teaching_classifier.pt" },
         @{ Source = Join-Path $repository "artifacts\models\multiplicity_classifier.pt"; Destination = "models\multiplicity_classifier.pt" },
+        @{
+            Source = Join-Path $repository "artifacts\models\resnet18-f37072fd.pth"
+            Destination = "models\resnet18-f37072fd.pth"
+            Sha256 = "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
+        },
         @{ Source = Join-Path $repository "artifacts\v2\models\latest_instance_segmenter.pt"; Destination = "v2\models\latest_instance_segmenter.pt" }
     )
     foreach ($model in $models) {
         if (-not (Test-Path -LiteralPath $model.Source -PathType Leaf)) {
             throw "Required production checkpoint is missing: $($model.Source)"
+        }
+        if ($model.ContainsKey("Sha256")) {
+            $actualModelSha256 = (Get-FileHash -LiteralPath $model.Source -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actualModelSha256 -ne [string]$model.Sha256) {
+                throw (
+                    "Production checkpoint checksum mismatch: $($model.Source); " +
+                    "expected $($model.Sha256), got $actualModelSha256"
+                )
+            }
         }
         $destination = Join-Path $modelBundle $model.Destination
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null

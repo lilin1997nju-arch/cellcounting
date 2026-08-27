@@ -150,12 +150,20 @@ function Test-ModelBundle {
     $required = @(
         (Join-Path $Root "models\teaching_classifier.pt"),
         (Join-Path $Root "models\multiplicity_classifier.pt"),
+        (Join-Path $Root "models\resnet18-f37072fd.pth"),
         (Join-Path $Root "v2\models\latest_instance_segmenter.pt")
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($missing.Count -gt 0) {
         Write-Warning "Missing production model files:"
         $missing | ForEach-Object { Write-Warning "  $_" }
+        return $false
+    }
+    $resnet = Join-Path $Root "models\resnet18-f37072fd.pth"
+    $expectedResnetSha256 = "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
+    $actualResnetSha256 = (Get-FileHash -LiteralPath $resnet -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualResnetSha256 -ne $expectedResnetSha256) {
+        Write-Warning "ResNet18 ImageNet weight checksum mismatch: $resnet"
         return $false
     }
     return $true
@@ -291,7 +299,7 @@ if ($runtime.selected_device -ne "cpu" -and $runtime.selected_device -ne "cuda")
 
 $modelBundleReady = Test-ModelBundle -Root $ModelRoot
 if (-not $modelBundleReady -and -not $SkipModelCheck) {
-    throw "Production model bundle is incomplete. Copy the three checkpoint files into $ModelRoot or rerun with -SkipModelCheck."
+    throw "Production model bundle is incomplete. Copy the four checkpoint files into $ModelRoot or rerun with -SkipModelCheck."
 }
 
 $manifestParent = Split-Path -Parent $Manifest

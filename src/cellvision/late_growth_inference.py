@@ -13,7 +13,6 @@ import torch
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 from scipy.spatial import cKDTree
-from torchvision.models import ResNet18_Weights, resnet18
 
 from .config import artifact_path
 from .dense_candidates import detect_dynamic_wall_inner_fraction
@@ -21,6 +20,10 @@ from .decode import read_mask
 from .registration import phase_correlation_shift
 from .v2_instance_dataset import _crop, _seed_heatmap, _wall_prior
 from .models.v2_instance_segmenter import SeededInstanceUNet
+from .pretrained import (
+    RESNET18_IMAGENET_FILENAME,
+    load_resnet18_imagenet_extractor,
+)
 
 
 CELL_LABELS = {"single", "touching_doublet", "cluster_3plus"}
@@ -194,7 +197,13 @@ def _registration_shift(reference_path: str, moving_path: str) -> tuple[float, f
 
 
 class _MorphologyPredictor:
-    def __init__(self, checkpoint_path: Path, crop_size: int, device: torch.device):
+    def __init__(
+        self,
+        checkpoint_path: Path,
+        backbone_path: Path,
+        crop_size: int,
+        device: torch.device,
+    ):
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         self.device = device
         self.crop_size = crop_size
@@ -208,9 +217,7 @@ class _MorphologyPredictor:
         self.training_features = checkpoint["training_features"].float().to(device)
         self.target_classes = checkpoint["target_classes"].long().to(device)
         self.knn_blend = float(checkpoint.get("global_knn_blend", 0.30))
-        extractor = resnet18(weights=ResNet18_Weights.DEFAULT)
-        extractor.fc = torch.nn.Identity()
-        self.extractor = extractor.eval().to(device)
+        self.extractor = load_resnet18_imagenet_extractor(backbone_path, device)
         self.means = torch.tensor([0.485, 0.456, 0.406], device=device)[None, :, None, None]
         self.stds = torch.tensor([0.229, 0.224, 0.225], device=device)[None, :, None, None]
 
@@ -373,6 +380,7 @@ def _infer_late_growth_legacy(
     print(f"late growth runtime device={device}; loading morphology model", flush=True)
     morphology = _MorphologyPredictor(
         _model_path(config, "models", "teaching_classifier.pt"),
+        _model_path(config, "models", RESNET18_IMAGENET_FILENAME),
         int(config.get("teaching", {}).get("crop_size_px", 128)),
         device,
     )

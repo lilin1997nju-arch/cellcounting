@@ -212,3 +212,12 @@
 5. 交付产物：`electron/dist/CellVision-Desktop-0.2.4-x64.zip`，505,748,763字节；SHA-256 `adcf85d443da1c3fab3282fa4bbbf9a95ad6a302aa7a8b9bcdf3128010abdb20`。
 6. 产物验证：ZIP共2,993个目录、33,366个文件，解压大小1,430,841,629字节，完整性测试通过；不含 Workspace；根目录安装入口、服务配置、日常启动、说明文件和内置 Python 均存在；最长相对路径159字符，解压到简短安装目录可兼容Win10传统路径限制。
 7. 使用 ZIP 内实际携带的运行时执行 `configure_service.ps1 -ValidateOnly`，PyTorch 2.11.0+cpu 和 Windows 服务运行库检查通过；安装脚本通过Windows PowerShell语法解析。完整安装行为未在本机执行，避免修改当前已运行的生产服务与 Workspace。
+
+## 2026-08-27 离线 ResNet18 依赖修复
+
+1. 定位生产计算失败原因为 TorchVision 的 `ResNet18_Weights.DEFAULT` 在首次使用时仍会访问 `download.pytorch.org`；开发电脑缓存中已有权重，因此此前打包与本地验收未暴露该隐式联网依赖。生产电脑无法完成证书链验证时即报 `CERTIFICATE_VERIFY_FAILED`。
+2. 当前特征提取流程及旧版形态分类兼容流程均改为只从 `ModelBundle/models/resnet18-f37072fd.pth` 读取，不再调用 TorchVision 下载接口；缺失或内容不符时立即给出明确的本地模型错误，不通过关闭 HTTPS 证书校验绕过。
+3. 构建、首次配置和日常启动均将 ResNet18 纳入第四个必需模型文件，并固定校验 SHA-256 `f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec`；构建阶段使用包内 Python 实际加载权重，防止安装包漏带或携带错误文件。
+4. Electron 客户端版本升级至0.2.5。交付产物：`electron/dist/CellVision-Desktop-0.2.5-x64.zip`，549,209,018字节；SHA-256 `cae8a00464c31a0d8c4887669d0aff65b3bc537e034f482500dbebe93c2f3fc2`。
+5. 产物验证：ZIP全量完整性测试通过，共2,993个目录、33,369个文件；包内权重大小46,830,571字节且哈希匹配；使用包内 Python 离线加载得到 ResNet18/Identity 特征提取器；`configure_service.ps1 -ValidateOnly`通过；ZIP不含Workspace。
+6. 完整 Python 测试269项、Electron测试6项通过；新增测试会阻止推理源码重新引入 `ResNet18_Weights.DEFAULT` 或 `load_state_dict_from_url`。

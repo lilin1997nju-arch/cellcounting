@@ -53,12 +53,19 @@ function Test-ModelBundle {
     $required = @(
         (Join-Path $Root "models\teaching_classifier.pt"),
         (Join-Path $Root "models\multiplicity_classifier.pt"),
+        (Join-Path $Root "models\resnet18-f37072fd.pth"),
         (Join-Path $Root "v2\models\latest_instance_segmenter.pt")
     )
     $missing = @($required | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) })
     if ($missing.Count -gt 0) {
         $message = "Missing production model files:`n" + (($missing | ForEach-Object { "  $_" }) -join "`n")
         throw $message
+    }
+    $resnet = Join-Path $Root "models\resnet18-f37072fd.pth"
+    $expectedResnetSha256 = "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
+    $actualResnetSha256 = (Get-FileHash -LiteralPath $resnet -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actualResnetSha256 -ne $expectedResnetSha256) {
+        throw "ResNet18 ImageNet weight checksum mismatch: $resnet"
     }
 }
 

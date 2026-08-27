@@ -55,6 +55,34 @@ foreach ($overlay in @(
     Copy-Item -LiteralPath $overlay.Source -Destination $overlay.Target -Recurse -Force
 }
 
+$resnetFilename = "resnet18-f37072fd.pth"
+$resnetSha256 = "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
+$resnetSource = Join-Path $repository "artifacts\models\$resnetFilename"
+if (-not (Test-Path -LiteralPath $resnetSource -PathType Leaf)) {
+    throw "Required offline ResNet18 weight is missing: $resnetSource"
+}
+$actualResnetSha256 = (Get-FileHash -LiteralPath $resnetSource -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actualResnetSha256 -ne $resnetSha256) {
+    throw "Offline ResNet18 weight checksum mismatch: expected $resnetSha256, got $actualResnetSha256"
+}
+$resnetDestination = Join-Path $payloadApplication "ModelBundle\models\$resnetFilename"
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $resnetDestination) | Out-Null
+Copy-Item -LiteralPath $resnetSource -Destination $resnetDestination -Force
+$payloadPython = Join-Path $payloadApplication "Python312\python.exe"
+$previousPythonPath = $env:PYTHONPATH
+try {
+    $env:PYTHONPATH = Join-Path $payloadApplication "src"
+    & $payloadPython -c (
+        "import sys, torch; " +
+        "from cellvision.pretrained import load_resnet18_imagenet_extractor; " +
+        "model = load_resnet18_imagenet_extractor(sys.argv[1], torch.device('cpu')); " +
+        "print(type(model).__name__)"
+    ) $resnetDestination
+    if ($LASTEXITCODE -ne 0) { throw "Bundled offline ResNet18 weight could not be loaded." }
+} finally {
+    $env:PYTHONPATH = $previousPythonPath
+}
+
 $portableFiles = @(
     "Configure-CellVision-Service.cmd",
     "Install-CellVision.cmd",
@@ -132,7 +160,8 @@ foreach ($required in @(
     (Join-Path $unpackedRoot "Cell Vision.exe"),
     (Join-Path $unpackedRoot "Install-CellVision.cmd"),
     (Join-Path $unpackedRoot "install_cellvision_zip.ps1"),
-    (Join-Path $unpackedRoot "Application\Python312\python.exe")
+    (Join-Path $unpackedRoot "Application\Python312\python.exe"),
+    (Join-Path $unpackedRoot "Application\ModelBundle\models\resnet18-f37072fd.pth")
 )) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Extracted-folder build is incomplete: $required"

@@ -47,6 +47,8 @@ def test_offline_release_builder_pins_git_and_bundles_runtime_assets():
     assert "Get-AssetContract" in builder
     assert "teaching_classifier.pt" in builder
     assert "multiplicity_classifier.pt" in builder
+    assert "resnet18-f37072fd.pth" in builder
+    assert "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec" in builder
     assert "latest_instance_segmenter.pt" in builder
     assert "latest_temporal_evidence.pt" not in builder
 
@@ -100,7 +102,7 @@ def test_single_file_windows_installer_wraps_existing_gui_release():
     assert 'SINGLE_FILE_INSTALLER_VALIDATION_OK' in builder
 
 
-def test_offline_setup_uses_no_index_and_three_model_contract():
+def test_offline_setup_uses_no_index_and_four_model_contract():
     setup = (ROOT / "scripts" / "setup_production.ps1").read_text(encoding="utf-8")
     start = (ROOT / "scripts" / "start_production.ps1").read_text(encoding="utf-8")
 
@@ -109,6 +111,8 @@ def test_offline_setup_uses_no_index_and_three_model_contract():
     for script in (setup, start):
         assert "teaching_classifier.pt" in script
         assert "multiplicity_classifier.pt" in script
+        assert "resnet18-f37072fd.pth" in script
+        assert "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec" in script
         assert "latest_instance_segmenter.pt" in script
         assert "latest_temporal_evidence.pt" not in script
 
@@ -174,5 +178,7 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert "CommonDesktopDirectory" in zip_installer
     assert "CELLVISION_ZIP_INSTALL.json" in zip_installer
     assert 'ValidateSet("nsis", "zip")' in zip_builder
+    assert "resnet18-f37072fd.pth" in zip_builder
+    assert "Bundled offline ResNet18 weight could not be loaded" in zip_builder
     assert "npm.cmd run pack:dir" in zip_builder
     assert "CellVision-Desktop-$version-x64.zip" in zip_builder
