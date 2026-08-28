@@ -12,6 +12,10 @@ $workspaceRoot = Join-Path $deploymentRoot "Workspace"
 $desktopExecutable = Join-Path $deploymentRoot "Cell Vision.exe"
 $configureScript = Join-Path $deploymentRoot "configure_service.ps1"
 $redistributable = Join-Path $deploymentRoot "vc_redist.x64.exe"
+$uninstallCommand = Join-Path $deploymentRoot "Uninstall-CellVision.cmd"
+$versionPath = Join-Path $deploymentRoot "CELLVISION_DESKTOP_VERSION.txt"
+$packageManifest = Join-Path $deploymentRoot "CELLVISION_PACKAGE_FILES.txt"
+$uninstallKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CellVisionDesktopProduction"
 
 function Test-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -50,6 +54,9 @@ foreach ($required in @(
     $desktopExecutable,
     $configureScript,
     $redistributable,
+    $uninstallCommand,
+    $versionPath,
+    $packageManifest,
     (Join-Path $applicationRoot "Python312\python.exe"),
     (Join-Path $applicationRoot "ModelBundle")
 )) {
@@ -89,8 +96,9 @@ try {
         throw "Microsoft Visual C++ runtime installation failed with exit code $($runtimeProcess.ExitCode)."
     }
 
-    Write-Host "Configuring the desktop service and selecting an available local port ..." -ForegroundColor Cyan
-    & $configureScript
+    Write-Host "Configuring the CPU desktop service and selecting an available local port ..." -ForegroundColor Cyan
+    Write-Host "The CPU package skips NVIDIA/WMI video-controller detection on Windows 10." -ForegroundColor DarkGray
+    & $configureScript -Device cpu
     if ($LASTEXITCODE -ne 0) { throw "Cell Vision service configuration failed." }
 
     Write-Host "Creating desktop and Start Menu shortcuts ..." -ForegroundColor Cyan
@@ -99,9 +107,23 @@ try {
     New-CellVisionShortcut -ShortcutPath (Join-Path $commonDesktop "Cell Vision.lnk")
     New-CellVisionShortcut -ShortcutPath (Join-Path $commonPrograms "Cell Vision\Cell Vision.lnk")
 
+    $desktopVersion = (Get-Content -LiteralPath $versionPath -Raw -Encoding UTF8).Trim()
+    Write-Host "Registering the uninstall entry while preserving Workspace by default ..." -ForegroundColor Cyan
+    New-Item -Path $uninstallKey -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name DisplayName -Value "Cell Vision" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name DisplayVersion -Value $desktopVersion -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name Publisher -Value "Cell Vision" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name InstallLocation -Value $deploymentRoot -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name DisplayIcon -Value "$desktopExecutable,0" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name UninstallString `
+        -Value ('cmd.exe /d /c ""' + $uninstallCommand + '""') -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name NoModify -Value 1 -PropertyType DWord -Force | Out-Null
+    New-ItemProperty -Path $uninstallKey -Name NoRepair -Value 1 -PropertyType DWord -Force | Out-Null
+
     $installationRecord = [ordered]@{
         format = "cellvision-extracted-zip"
         version = 1
+        application_version = $desktopVersion
         installed_at = (Get-Date).ToUniversalTime().ToString("o")
         deployment_root = $deploymentRoot
         workspace = $workspaceRoot

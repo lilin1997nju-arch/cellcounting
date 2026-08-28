@@ -86,6 +86,9 @@ try {
 $portableFiles = @(
     "Configure-CellVision-Service.cmd",
     "Install-CellVision.cmd",
+    "Uninstall-CellVision.cmd",
+    "uninstall_cellvision.ps1",
+    "uninstall_cellvision_cleanup.ps1",
     "install_cellvision_zip.ps1",
     "configure_service_launcher.ps1",
     "configure_service.ps1",
@@ -108,6 +111,13 @@ foreach ($name in $portableFiles) {
     if (-not (Test-Path -LiteralPath $source -PathType Leaf)) { throw "Missing portable installer file: $source" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $payloadFiles $name) -Force
 }
+$desktopVersion = [string](Get-Content -LiteralPath (Join-Path $electronRoot "package.json") `
+    -Raw -Encoding UTF8 | ConvertFrom-Json).version
+[IO.File]::WriteAllText(
+    (Join-Path $payloadFiles "CELLVISION_DESKTOP_VERSION.txt"),
+    ($desktopVersion + [Environment]::NewLine),
+    (New-Object Text.UTF8Encoding($false))
+)
 
 $cacheRoot = Join-Path $repository "artifacts\cache"
 New-Item -ItemType Directory -Force -Path $cacheRoot | Out-Null
@@ -159,6 +169,10 @@ $unpackedRoot = Join-Path $electronRoot "dist\win-unpacked"
 foreach ($required in @(
     (Join-Path $unpackedRoot "Cell Vision.exe"),
     (Join-Path $unpackedRoot "Install-CellVision.cmd"),
+    (Join-Path $unpackedRoot "Uninstall-CellVision.cmd"),
+    (Join-Path $unpackedRoot "uninstall_cellvision.ps1"),
+    (Join-Path $unpackedRoot "uninstall_cellvision_cleanup.ps1"),
+    (Join-Path $unpackedRoot "CELLVISION_DESKTOP_VERSION.txt"),
     (Join-Path $unpackedRoot "install_cellvision_zip.ps1"),
     (Join-Path $unpackedRoot "Application\Python312\python.exe"),
     (Join-Path $unpackedRoot "Application\ModelBundle\models\resnet18-f37072fd.pth")
@@ -168,9 +182,17 @@ foreach ($required in @(
     }
 }
 
-$version = [string](Get-Content -LiteralPath (Join-Path $electronRoot "package.json") `
-    -Raw -Encoding UTF8 | ConvertFrom-Json).version
-$zipPath = Join-Path $electronRoot "dist\CellVision-Desktop-$version-x64.zip"
+$manifestPath = Join-Path $unpackedRoot "CELLVISION_PACKAGE_FILES.txt"
+if (Test-Path -LiteralPath $manifestPath -PathType Leaf) { Remove-Item -LiteralPath $manifestPath -Force }
+$manifestEntries = Get-ChildItem -LiteralPath $unpackedRoot -File -Recurse -Force |
+    ForEach-Object {
+        $_.FullName.Substring($unpackedRoot.Length).TrimStart("\").Replace("\", "/")
+    } |
+    Where-Object { $_ -notmatch '^(?i:Workspace)/' } |
+    Sort-Object -Unique
+[IO.File]::WriteAllLines($manifestPath, $manifestEntries, (New-Object Text.UTF8Encoding($false)))
+
+$zipPath = Join-Path $electronRoot "dist\CellVision-Desktop-$desktopVersion-x64.zip"
 if (Test-Path -LiteralPath $zipPath -PathType Leaf) { Remove-Item -LiteralPath $zipPath -Force }
 
 $sevenZip = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source

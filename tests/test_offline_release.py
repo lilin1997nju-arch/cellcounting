@@ -131,6 +131,8 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
 
     assert 'Join-Path $deploymentRoot "Application"' in configure
     assert 'Join-Path $deploymentRoot "Workspace"' in configure
+    assert "Checking the bundled Python executable" in configure
+    assert "Running the full Cell Vision/PyTorch validation" in configure
     assert 'Join-Path $workspaceRoot "Projects"' in configure
     assert "*S-1-5-11:(OI)(CI)M" not in configure
     assert "icacls.exe" not in configure
@@ -163,6 +165,12 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert 'Filter "pywintypes*.dll"' in prepare
     assert "UseBasePythonRuntime" in setup
     assert "SkipDependencyInstall" in setup
+    assert 'if ($Device -eq "cpu")' in setup
+    assert "skipping NVIDIA and WMI video-controller probes" in setup
+    assert "OperationTimeoutSec 10" in setup
+    assert "runtime loading exceeded 300 seconds" in setup
+    assert "Windows security scanning can make the first load slower" in setup
+    assert "Checking the four bundled production model files" in setup
     assert 'if (-not $SkipDependencyInstall -and -not $Offline' in setup
     assert "Text.UTF8Encoding($false)" in setup
     assert "Normalized legacy UTF-8 BOM in project manifest" in setup
@@ -175,10 +183,20 @@ def test_portable_production_layout_keeps_application_and_workspace_together():
     assert "CellVisionDesktopProduction" in zip_installer
     assert "vc_redist.x64.exe" in zip_installer
     assert "configure_service.ps1" in zip_installer
+    assert "& $configureScript -Device cpu" in zip_installer
+    assert '[ValidateSet("auto", "cpu", "cuda")][string]$Device = "cpu"' in configure
     assert "CommonDesktopDirectory" in zip_installer
     assert "CELLVISION_ZIP_INSTALL.json" in zip_installer
+    assert "CellVisionDesktopProduction" in zip_installer
+    assert "UninstallString" in zip_installer
+    assert "Uninstall-CellVision.cmd" in zip_installer
     assert 'ValidateSet("nsis", "zip")' in zip_builder
+    assert '"Uninstall-CellVision.cmd"' in zip_builder
+    assert '"uninstall_cellvision.ps1"' in zip_builder
+    assert '"uninstall_cellvision_cleanup.ps1"' in zip_builder
+    assert "CELLVISION_PACKAGE_FILES.txt" in zip_builder
+    assert "CELLVISION_DESKTOP_VERSION.txt" in zip_builder
     assert "resnet18-f37072fd.pth" in zip_builder
     assert "Bundled offline ResNet18 weight could not be loaded" in zip_builder
     assert "npm.cmd run pack:dir" in zip_builder
-    assert "CellVision-Desktop-$version-x64.zip" in zip_builder
+    assert "CellVision-Desktop-$desktopVersion-x64.zip" in zip_builder

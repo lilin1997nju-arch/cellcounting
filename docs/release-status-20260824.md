@@ -221,3 +221,15 @@
 4. Electron 客户端版本升级至0.2.5。交付产物：`electron/dist/CellVision-Desktop-0.2.5-x64.zip`，549,209,018字节；SHA-256 `cae8a00464c31a0d8c4887669d0aff65b3bc537e034f482500dbebe93c2f3fc2`。
 5. 产物验证：ZIP全量完整性测试通过，共2,993个目录、33,369个文件；包内权重大小46,830,571字节且哈希匹配；使用包内 Python 离线加载得到 ResNet18/Identity 特征提取器；`configure_service.ps1 -ValidateOnly`通过；ZIP不含Workspace。
 6. 完整 Python 测试269项、Electron测试6项通过；新增测试会阻止推理源码重新引入 `ResNet18_Weights.DEFAULT` 或 `load_state_dict_from_url`。
+
+## 2026-08-28 Win10 CPU安装诊断与安全卸载
+
+1. Electron客户端版本升级至0.2.6。CPU安装入口不再在服务配置开头执行无进度的完整 PyTorch 组合导入；先快速验证包内 Python，再明确以CPU模式配置，跳过生产电脑无用且可能被WMI拖慢的NVIDIA显卡查询。
+2. 实际 Cell Vision/PyTorch CPU运行时探测增加独立进程、10秒进度提示和300秒上限；Windows PowerShell 5.1下显式保留进程句柄以可靠读取退出码。若首轮被Windows安全软件扫描拖慢，控制台会持续显示状态而非停在 `Checking portable runtime`。
+3. ZIP新增 `Uninstall-CellVision.cmd`，并在安装时注册到Windows“设置 → 应用”：
+   - 只停止和删除路径确实属于当前目录的 `CellVisionDesktopProduction` 服务；同名服务指向其他安装目录时拒绝修改；
+   - 删除当前目录的桌面/开始菜单快捷方式及包清单内程序文件；
+   - 默认且强制保留 `Workspace`、历史项目和卸载日志，不提供自动删除项目数据选项。
+4. 构建阶段生成 `CELLVISION_PACKAGE_FILES.txt` 和 `CELLVISION_DESKTOP_VERSION.txt`，卸载清理逐项验证相对路径不得越出安装目录，递归清理仅限已验证的 `Application` 子目录。
+5. 交付产物：`electron/dist/CellVision-Desktop-0.2.6-x64.zip`，549,416,315字节；SHA-256 `58169b238b3770df3ed206c04c454b210c1fd10226799168a7f3752d74f08f65`。
+6. 产物验证：ZIP全量完整性测试通过，共2,993个目录、33,374个文件，解压大小1,480,642,911字节；不含Workspace；包内CPU运行时返回PyTorch 2.11.0+cpu，服务配置只读验证及PowerShell语法解析通过。隔离卸载演练确认程序文件删除而模拟历史项目保留；完整Python测试271项、Electron测试6项通过。

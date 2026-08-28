@@ -2,7 +2,7 @@
 [CmdletBinding()]
 param(
     [int]$Port = 0,
-    [ValidateSet("auto", "cpu", "cuda")][string]$Device = "auto",
+    [ValidateSet("auto", "cpu", "cuda")][string]$Device = "cpu",
     [switch]$RepairService,
     [switch]$ValidateOnly
 )
@@ -34,10 +34,13 @@ if ($null -eq $serviceRuntimeDll) {
     throw "Portable Windows service runtime is incomplete: pywintypes DLL is missing beside python.exe."
 }
 
-Write-Host "Checking the portable Cell Vision runtime ..." -ForegroundColor Cyan
-& $python -c "import cellvision, fastapi, torch, win32serviceutil; print(torch.__version__)"
-if ($LASTEXITCODE -ne 0) { throw "The portable Python runtime is incomplete." }
+Write-Host "Checking the bundled Python executable ..." -ForegroundColor Cyan
+& $python -I -c "import sys; print(sys.version.split()[0])"
+if ($LASTEXITCODE -ne 0) { throw "The bundled Python executable could not start." }
 if ($ValidateOnly) {
+    Write-Host "Running the full Cell Vision/PyTorch validation ..." -ForegroundColor Cyan
+    & $python -u -c "import cellvision, fastapi, torch, win32serviceutil; print(torch.__version__, flush=True)"
+    if ($LASTEXITCODE -ne 0) { throw "The portable Python runtime is incomplete." }
     Write-Output "PORTABLE_SERVICE_CONFIGURATION_VALIDATION_OK"
     exit 0
 }
@@ -136,6 +139,7 @@ if ($LASTEXITCODE -ne 0) { throw "Unable to back up project metadata before serv
 Write-Host $backupOutput -ForegroundColor DarkGray
 
 $setup = Join-Path $applicationRoot "scripts\setup_production.ps1"
+Write-Host "Preparing the bundled CPU runtime; GPU/WMI detection is disabled for this package ..." -ForegroundColor Cyan
 $previousPipNoIndex = $env:PIP_NO_INDEX
 $previousPipDisableVersionCheck = $env:PIP_DISABLE_PIP_VERSION_CHECK
 try {

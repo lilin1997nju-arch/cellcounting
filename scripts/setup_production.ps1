@@ -125,11 +125,55 @@ function Install-TorchSupport {
 
 function Get-RuntimeInfo {
     param([ValidateSet("auto", "cpu", "cuda")][string]$RequestedDevice = "auto")
-    $output = & $script:PythonPath -m cellvision runtime-info --device $RequestedDevice 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to probe the installed Cell Vision runtime: $($output -join "`n")"
+    $probeId = [guid]::NewGuid().ToString("N")
+    $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) "cellvision-runtime-$probeId.out"
+    $stderrPath = Join-Path ([IO.Path]::GetTempPath()) "cellvision-runtime-$probeId.err"
+    $process = $null
+    $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        $process = Start-Process -FilePath $script:PythonPath -ArgumentList @(
+            "-u", "-m", "cellvision", "runtime-info", "--device", $RequestedDevice
+        ) -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+            -PassThru -WindowStyle Hidden
+        # Windows PowerShell 5.1 only retains ExitCode reliably when the native
+        # process handle is materialized before the process exits.
+        $null = $process.Handle
+        $lastNotice = -10
+        while (-not $process.WaitForExit(1000)) {
+            $elapsed = [int]$stopwatch.Elapsed.TotalSeconds
+            if (($elapsed - $lastNotice) -ge 10) {
+                Write-Host (
+                    "Loading the Cell Vision/PyTorch CPU runtime: $elapsed seconds. " +
+                    "Windows security scanning can make the first load slower."
+                ) -ForegroundColor DarkYellow
+                $lastNotice = $elapsed
+            }
+            if ($elapsed -ge 300) {
+                try { $process.Kill() } catch {}
+                throw (
+                    "Cell Vision/PyTorch runtime loading exceeded 300 seconds. " +
+                    "Unblock the ZIP and ask IT to allow-list the Application folder before retrying."
+                )
+            }
+        }
+        $process.WaitForExit()
+        $stdout = if (Test-Path -LiteralPath $stdoutPath) {
+            Get-Content -LiteralPath $stdoutPath -Raw -Encoding UTF8
+        } else { "" }
+        $stderr = if (Test-Path -LiteralPath $stderrPath) {
+            Get-Content -LiteralPath $stderrPath -Raw -Encoding UTF8
+        } else { "" }
+        if ($process.ExitCode -ne 0) {
+            throw "Unable to probe the installed Cell Vision runtime: $stderr$stdout"
+        }
+        Write-Host (
+            "Cell Vision/PyTorch runtime loaded in $([int]$stopwatch.Elapsed.TotalSeconds) seconds."
+        ) -ForegroundColor Green
+        return ($stdout | ConvertFrom-Json)
+    } finally {
+        $stopwatch.Stop()
+        Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
     }
-    return (($output -join "`n") | ConvertFrom-Json)
 }
 
 function Install-ProjectEditable {
@@ -245,21 +289,32 @@ if (-not $SkipDependencyInstall) {
     Invoke-Python (@("-m", "pip", "install", "--upgrade") + $pipSource + @("-r", (Join-Path $InstallRoot "requirements-production.txt")))
 }
 
-$nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
 $nvidiaUsable = $false
-if ($null -ne $nvidiaSmi) {
-    $probe = & $nvidiaSmi.Source --query-gpu=name,driver_version --format=csv,noheader 2>$null
-    $nvidiaUsable = ($LASTEXITCODE -eq 0 -and @($probe).Count -gt 0)
+$nvidiaAdapter = $null
+if ($Device -eq "cpu") {
+    Write-Host "CPU runtime selected; skipping NVIDIA and WMI video-controller probes." -ForegroundColor DarkGray
+} else {
+    Write-Host "Checking for an NVIDIA runtime (WMI timeout: 10 seconds) ..." -ForegroundColor Cyan
+    $nvidiaSmi = Get-Command nvidia-smi -ErrorAction SilentlyContinue
+    if ($null -ne $nvidiaSmi) {
+        $probe = & $nvidiaSmi.Source --query-gpu=name,driver_version --format=csv,noheader 2>$null
+        $nvidiaUsable = ($LASTEXITCODE -eq 0 -and @($probe).Count -gt 0)
+    }
+    try {
+        $nvidiaAdapter = Get-CimInstance Win32_VideoController -OperationTimeoutSec 10 -ErrorAction Stop |
+            Where-Object { $_.Name -match "NVIDIA" } |
+            Select-Object -First 1
+    } catch {
+        Write-Warning "Video-controller query was skipped after a WMI error or timeout: $($_.Exception.Message)"
+    }
 }
-$nvidiaAdapter = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match "NVIDIA" } |
-    Select-Object -First 1
 $nvidiaPresent = $nvidiaUsable -or ($null -ne $nvidiaAdapter)
 $tryCuda = ($Device -eq "cuda") -or ($Device -eq "auto" -and $nvidiaPresent)
 $runtime = $null
 $installedWheel = "cpu"
 
 if ($SkipDependencyInstall) {
+    Write-Host "Probing the bundled Cell Vision runtime for device '$Device' ..." -ForegroundColor Cyan
     $runtime = Get-RuntimeInfo -RequestedDevice $Device
     $installedWheel = if ([string]$runtime.torch_version -match "\+(.+)$") { $matches[1] } else { "cpu" }
 } elseif ($Offline) {
@@ -297,6 +352,7 @@ if ($runtime.selected_device -ne "cpu" -and $runtime.selected_device -ne "cuda")
     throw "The installed runtime did not select CPU or CUDA: $($runtime | ConvertTo-Json -Compress)"
 }
 
+Write-Host "Checking the four bundled production model files ..." -ForegroundColor Cyan
 $modelBundleReady = Test-ModelBundle -Root $ModelRoot
 if (-not $modelBundleReady -and -not $SkipModelCheck) {
     throw "Production model bundle is incomplete. Copy the four checkpoint files into $ModelRoot or rerun with -SkipModelCheck."
@@ -336,6 +392,7 @@ if ($manifestBytes.Length -ge 3 -and $manifestBytes[0] -eq 0xEF -and `
 }
 
 $envPath = Join-Path $InstallRoot ".env.production"
+Write-Host "Writing the production environment configuration ..." -ForegroundColor Cyan
 if (Test-Path -LiteralPath $envPath -PathType Leaf) {
     $backupPath = "$envPath.bak-$(Get-Date -Format yyyyMMdd-HHmmss)"
     Copy-Item -LiteralPath $envPath -Destination $backupPath -Force
